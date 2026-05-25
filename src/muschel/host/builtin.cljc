@@ -53,13 +53,27 @@
 
 (defn- invoke-builtin!
   "Run a builtin fn synchronously, write its stdout/stderr to the
-   sinks, return a wait-fn that yields the exit code."
-  [fallback-host builtin-fn opts fs]
+   sinks, return a wait-fn that yields the exit code.
+
+   Binds muschel.builtins.posix/*host* / *session* / *depth* around
+   the call so builtins that need to dispatch recursively (e.g. `sh`
+   re-running its -c script, or `find -exec`) can re-enter through
+   the same gates."
+  [self fallback-host builtin-fn opts fs]
+  (require 'muschel.builtins.posix)
   (let [argv (argv-of opts)
         env  (build-env opts fs)
+        host-var    (resolve 'muschel.builtins.posix/*host*)
+        session-var (resolve 'muschel.builtins.posix/*session*)
+        depth-var   (resolve 'muschel.builtins.posix/*depth*)
         {:keys [stdout stderr exit]}
         (try
-          (builtin-fn argv fs env)
+          (push-thread-bindings
+            {host-var    self
+             session-var (:session opts)
+             depth-var   (or @depth-var 0)})
+          (try (builtin-fn argv fs env)
+               (finally (pop-thread-bindings)))
           (catch Throwable t
             {:stdout ""
              :stderr (str (:cmd opts) ": " (.getMessage t) "\n")
@@ -101,12 +115,12 @@
   (-make-pipe        [_]        (host/-make-pipe fallback-host))
 
   ;; ---- spawn — the override ----
-  (-spawn [_ opts]
+  (-spawn [this opts]
     (let [cmd (:cmd opts)]
       (cond
         ;; Built-in: invoke in-process against the FS.
         (contains? builtins cmd)
-        (invoke-builtin! fallback-host (get builtins cmd) opts fs)
+        (invoke-builtin! this fallback-host (get builtins cmd) opts fs)
 
         ;; Explicitly allowlisted system tool: delegate.
         (contains? fallback-allowlist cmd)

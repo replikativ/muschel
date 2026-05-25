@@ -135,3 +135,38 @@
 (deftest wc-multiple-files-total
   (let [r (posix/wc ["wc" "-l" "a.txt" "sub/b.txt"] (make-fs) {})]
     (is (.contains ^String (:stdout r) "total"))))
+
+;; ============================================================================
+;; stat
+;; ============================================================================
+
+(deftest stat-prints-metadata
+  (let [r (posix/stat ["stat" "a.txt"] (make-fs) {})]
+    (is (= 0 (:exit r)))
+    (is (re-find #"file a\.txt" (:stdout r)))))
+
+(deftest stat-missing
+  (let [r (posix/stat ["stat" "no-such"] (make-fs) {})]
+    (is (= 1 (:exit r)))
+    (is (re-find #"cannot stat" (:stderr r)))))
+
+;; ============================================================================
+;; sort / uniq
+;; ============================================================================
+
+(deftest sort-basic
+  (let [fs (vfs/make {"/work/lines.txt" "banana\napple\ncherry"} {:cwd "/work"})
+        r  (posix/sort-fn ["sort" "lines.txt"] fs {})]
+    (is (= "apple\nbanana\ncherry\n" (:stdout r)))))
+
+(deftest sort-r-numeric
+  (let [fs (vfs/make {"/work/nums.txt" "10\n2\n30\n1"} {:cwd "/work"})
+        r  (posix/sort-fn ["sort" "-nr" "nums.txt"] fs {})]
+    (is (= "30\n10\n2\n1\n" (:stdout r)))))
+
+(deftest uniq-c
+  (let [fs (vfs/make {"/work/dup.txt" "a\na\nb\nb\nb\nc"} {:cwd "/work"})
+        r  (posix/uniq ["uniq" "-c" "dup.txt"] fs {})]
+    (is (re-find #"2 a" (:stdout r)))
+    (is (re-find #"3 b" (:stdout r)))
+    (is (re-find #"1 c" (:stdout r)))))

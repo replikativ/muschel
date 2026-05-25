@@ -396,16 +396,191 @@
      :exit (if @any-err? 1 0)}))
 
 ;; ============================================================================
+;; sh / bash — recursive shell-of-our-own-shell
+;;
+;; muschel IS a bash-compatible parser+executor. So `bash -c "…"` and
+;; friends can dispatch back into our own machinery instead of execing
+;; a system shell. Every command in the inner script hits the same
+;; builtins / allowlist / permit gate as any other command.
+;;
+;; Bounded recursion depth so a confused or malicious script can't
+;; blow the stack via `bash -c "bash -c '...'"` chains.
+;; ============================================================================
+
+(defn sh
+  "Builtin sh / bash. Supports -c SCRIPT — the only mode we need.
+   Parses SCRIPT with muschel.parse and runs it through the same
+   host the outer invocation is on."
+  [argv _fs env]
+  (let [[flags pos] (parse-flags argv #{"c" "i" "l" "s"})]
+    (cond
+      (>= *depth* max-shell-depth)
+      (err (str "sh: too many nested shell invocations (depth >= "
+                max-shell-depth ")")
+           2)
+
+      (and (flags "c") (seq pos))
+      (let [script (first pos)
+            host   *host*]
+        (if-not host
+          (err "sh: no host available for nested dispatch" 1)
+          (let [_         (require 'muschel.parse 'muschel.exec 'muschel.env)
+                parse-fn  (resolve 'muschel.parse/parse)
+                run-fn    (resolve 'muschel.exec/run-and-capture)
+                new-env   (resolve 'muschel.env/new-env)
+                e0        (or env (new-env))
+                ast       (parse-fn script)
+                result    (binding [*depth* (inc *depth*)]
+                            (run-fn e0 ast
+                                    (cond-> {:host host}
+                                      *session* (assoc :session *session*))))]
+            {:stdout (or (:stdout result) "")
+             :stderr (or (:stderr result) "")
+             :exit   (or (:exit result) 0)})))
+
+      (and (flags "c") (empty? pos))
+      (err "sh: -c: option requires an argument" 2)
+
+      :else
+      (err "sh: only -c SCRIPT mode is supported in muschel builtins" 2))))
+
+;; ============================================================================
+;; stat — file metadata as text
+;; ============================================================================
+
+(defn stat
+  "POSIX-ish stat. Prints `<size> <type> <name>` per file. Multiple
+   files allowed."
+  [argv fs _env]
+  (let [files (rest argv)
+        stderr (volatile! "")
+        any-err? (volatile! false)
+        lines
+        (mapv (fn [f]
+                (if-let [s (fs/stat fs f)]
+                  (format "%10d %s %s" (:size s) (name (or (:type s) :unknown)) f)
+                  (do
+                    (vswap! stderr str "stat: cannot stat '" f "': No such file or directory\n")
+                    (vreset! any-err? true)
+                    nil)))
+              files)
+        valid (remove nil? lines)]
+    {:stdout (str (str/join "\n" valid) (when (seq valid) "\n"))
+     :stderr @stderr
+     :exit (if @any-err? 1 0)}))
+
+;; ============================================================================
+;; which — is a command available?
+;; ============================================================================
+
+(defn which
+  "Report which names are builtins or allowlisted-fallback. Reads
+   the dispatch registry off *host*; without one, says nothing is
+   available."
+  [argv _fs _env]
+  (let [names (rest argv)
+        host  *host*
+        registry (when host
+                   (set (concat (keys (or (:builtins host) {}))
+                                (or (:fallback-allowlist host) #{}))))
+        stderr (volatile! "")
+        any-err? (volatile! false)
+        lines
+        (mapv (fn [n]
+                (if (and registry (contains? registry n))
+                  (str "(muschel) " n)
+                  (do (vswap! stderr str "which: no " n " in muschel registry\n")
+                      (vreset! any-err? true)
+                      nil)))
+              names)
+        valid (remove nil? lines)]
+    {:stdout (str (str/join "\n" valid) (when (seq valid) "\n"))
+     :stderr @stderr
+     :exit (if @any-err? 1 0)}))
+
+;; ============================================================================
+;; sort / uniq — line-oriented transforms
+;; ============================================================================
+
+(defn- gather-input
+  "Concatenate file contents. v1 doesn't thread stdin into builtins;
+   '-' returns empty. Returns [content err? stderr]."
+  [files fs cmd]
+  (let [stderr (volatile! "")
+        any-err? (volatile! false)
+        parts
+        (mapv (fn [f]
+                (if (= "-" f)
+                  ""
+                  (or (fs/read-file fs f)
+                      (do (vswap! stderr str cmd ": " f ": No such file or directory\n")
+                          (vreset! any-err? true)
+                          ""))))
+              (if (seq files) files ["-"]))]
+    [(str/join "" parts) @any-err? @stderr]))
+
+(defn sort-fn
+  "POSIX sort, subset: -r reverse, -n numeric, -u unique."
+  [argv fs _env]
+  (let [[flags pos] (parse-flags argv #{"r" "n" "u" "f"})
+        [content err? stderr] (gather-input pos fs "sort")
+        lines (str/split-lines content)
+        compared (if (flags "n")
+                   (sort-by #(or (try (Long/parseLong (str/trim %))
+                                      (catch Exception _ Long/MAX_VALUE))
+                                 Long/MAX_VALUE)
+                            lines)
+                   (sort lines))
+        compared (if (flags "r") (reverse compared) compared)
+        compared (if (flags "u") (distinct compared) compared)]
+    {:stdout (str (str/join "\n" compared)
+                  (when (seq compared) "\n"))
+     :stderr stderr
+     :exit (if err? 1 0)}))
+
+(defn uniq
+  "POSIX uniq, subset: -c count, -d only-dupes, -u only-uniques.
+   Adjacent only (matches GNU)."
+  [argv fs _env]
+  (let [[flags pos] (parse-flags argv #{"c" "d" "u" "i"})
+        [content err? stderr] (gather-input pos fs "uniq")
+        lines (str/split-lines content)
+        grouped (->> lines
+                     (partition-by identity)
+                     (map (fn [grp]
+                            {:line (first grp) :n (count grp)})))
+        filtered (cond
+                   (flags "d") (filter #(> (:n %) 1) grouped)
+                   (flags "u") (filter #(= 1 (:n %)) grouped)
+                   :else grouped)
+        rendered (mapv (fn [{:keys [line n]}]
+                         (if (flags "c")
+                           (format "%7d %s" n line)
+                           line))
+                       filtered)]
+    {:stdout (str (str/join "\n" rendered)
+                  (when (seq rendered) "\n"))
+     :stderr stderr
+     :exit (if err? 1 0)}))
+
+;; ============================================================================
 ;; Registry — the canonical builtin map
 ;; ============================================================================
 
 (def standard-read-only
   "All read-only builtins shipping in v1. Suitable as :builtins for
    muschel.host.builtin/make."
-  {"pwd"  pwd
-   "echo" echo
-   "ls"   ls
-   "cat"  cat
-   "head" head
-   "tail" tail
-   "wc"   wc})
+  {"pwd"   pwd
+   "echo"  echo
+   "ls"    ls
+   "cat"   cat
+   "head"  head
+   "tail"  tail
+   "wc"    wc
+   "stat"  stat
+   "which" which
+   "sort"  sort-fn
+   "uniq"  uniq
+   "sh"    sh
+   "bash"  sh
+   "dash"  sh})
