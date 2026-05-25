@@ -92,7 +92,10 @@
 
   (-read-file [this path]
     (when-let [bs (fs/-read-bytes this path)]
-      (if (string? bs) bs (String. ^bytes bs "UTF-8"))))
+      (if (string? bs)
+        bs
+        #?(:clj  (String. ^bytes bs "UTF-8")
+           :cljs (str bs)))))
 
   (-read-bytes [this path]
     (when-let [resolved (fs/-resolve this path)]

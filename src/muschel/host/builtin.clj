@@ -45,11 +45,18 @@
   (into [(:cmd opts)] (or (:args opts) [])))
 
 (defn- build-env
-  "Minimal env value for builtin fns. Carries :cwd from :dir and any
-   :extra-env. Builtins that need env vars look in :vars."
-  [{:keys [dir extra-env]} fallback-fs]
-  {:cwd  (or dir (fs/cwd fallback-fs))
-   :vars (or extra-env {})})
+  "Minimal env value for builtin fns. Carries :cwd from :dir, any
+   :extra-env vars under :vars, and the resolved :stdin string for
+   builtins that read from it (grep/cat with no file args, tr, cut,
+   xargs, …). We resolve :in eagerly via the fallback host's
+   -read-all-string — fine for the bounded inputs builtins handle."
+  [{:keys [dir extra-env in]} fallback-host fallback-fs]
+  (let [stdin (when in
+                (try (host/-read-all-string fallback-host in)
+                     (catch Throwable _ nil)))]
+    (cond-> {:cwd  (or dir (fs/cwd fallback-fs))
+             :vars (or extra-env {})}
+      stdin (assoc :stdin stdin))))
 
 (defn- invoke-builtin!
   "Run a builtin fn synchronously, write its stdout/stderr to the
@@ -62,7 +69,7 @@
   [self fallback-host builtin-fn opts fs]
   (require 'muschel.builtins.posix)
   (let [argv (argv-of opts)
-        env  (build-env opts fs)
+        env  (build-env opts fallback-host fs)
         host-var    (resolve 'muschel.builtins.posix/*host*)
         session-var (resolve 'muschel.builtins.posix/*session*)
         depth-var   (resolve 'muschel.builtins.posix/*depth*)

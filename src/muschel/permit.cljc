@@ -26,8 +26,18 @@
        glob (`*` `?` `[abc]`). Practical for `Bash(git *)` style rules.
 
    - `{:kind :argv-vec :vec [\"git\" \"status\"]}`
-       Exact prefix match. Vec elements can also be SETS to denote
-       alternatives, e.g. `[\"git\" #{\"status\" \"diff\" \"log\"}]`.
+       Exact PREFIX match. Vec elements can be strings or SETS, e.g.
+       `[\"git\" #{\"status\" \"diff\" \"log\"}]`. A rule of length N
+       matches any argv ≥ N elements whose first N agree.
+
+   - `{:kind :argv-shape :shape [\"git\" \"push\"]}`
+       Exact SHAPE match (length matters). Use this to allow `git push`
+       while denying `git push --force` — under `:argv-vec` the longer
+       form is a prefix-match for the same rule. Each shape element is:
+       a string (must equal), a set (must be member), `:*` (any single
+       arg), `:**` (zero-or-more args, only as the last element), or a
+       regex (`re-find` must match). Length must match exactly unless
+       the last element is `:**`.
 
    - `{:kind :ast-pred :pred (fn [call-node] ...)}`
        Full predicate over the AST node. Escape hatch for anything the
@@ -113,17 +123,49 @@
           rx (re-pattern (str "^" (expand/glob->regex glob) "$"))]
       (boolean (re-find rx s)))))
 
+(defn- shape-elt-matches?
+  "True if shape element `el` matches a single argv element `a` (which
+   may be nil for dynamic words)."
+  [el a]
+  (cond
+    (nil? a) false                ; dynamic argv element — only :* / :** match
+    (= :* el) true
+    (string? el) (= el a)
+    (set? el) (contains? el a)
+    #?(:clj (instance? java.util.regex.Pattern el)
+       :cljs (regexp? el))
+    (boolean (re-find el a))
+    :else false))
+
+(defn- argv-matches-shape?
+  "Exact-shape match. Last element `:**` makes the tail open-ended;
+   otherwise lengths must agree. `:*` (or a string / set / regex) matches
+   one slot."
+  [argv shape]
+  (let [open? (= :** (last shape))
+        head  (if open? (butlast shape) shape)
+        head-cnt (count head)
+        argv-cnt (count argv)]
+    (cond
+      open? (and (>= argv-cnt head-cnt)
+                 (every? true?
+                         (map shape-elt-matches? head (take head-cnt argv))))
+      :else (and (= head-cnt argv-cnt)
+                 (every? true?
+                         (map shape-elt-matches? head argv))))))
+
 (defn rule-matches?
   "True if `rule`'s pattern matches `call`."
   [rule call]
-  (let [{:keys [kind name vec glob pred]} (:pattern rule)
+  (let [{:keys [kind name vec glob shape pred]} (:pattern rule)
         cmd-name (call->cmd-name call)
         argv (call->argv call)]
     (case kind
-      :cmd-name  (= name cmd-name)
-      :argv-glob (argv-matches-glob? argv glob)
-      :argv-vec  (argv-matches-vec? argv vec)
-      :ast-pred  (try (boolean (pred call)) (catch #?(:clj Throwable :cljs :default) _ false))
+      :cmd-name   (= name cmd-name)
+      :argv-glob  (argv-matches-glob? argv glob)
+      :argv-vec   (argv-matches-vec? argv vec)
+      :argv-shape (argv-matches-shape? argv shape)
+      :ast-pred   (try (boolean (pred call)) (catch #?(:clj Throwable :cljs :default) _ false))
       false)))
 
 ;; ============================================================================
@@ -291,8 +333,8 @@
     (not (map? (:pattern rule)))
     "rule :pattern must be a map"
 
-    (not (#{:cmd-name :argv-glob :argv-vec :ast-pred}
+    (not (#{:cmd-name :argv-glob :argv-vec :argv-shape :ast-pred}
           (:kind (:pattern rule))))
-    "rule :pattern :kind must be :cmd-name :argv-glob :argv-vec or :ast-pred"
+    "rule :pattern :kind must be :cmd-name :argv-glob :argv-vec :argv-shape or :ast-pred"
 
     :else nil))

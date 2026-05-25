@@ -78,6 +78,49 @@
     (is (= :allow (:decision (check "npm test" {:rulesets rs}))))
     (is (not= :allow (:decision (check "yarn install" {:rulesets rs}))))))
 
+(deftest argv-shape-exact-length
+  ;; Shape matches exact length only — `git push X` doesn't match
+  ;; `["git" "push"]`. This is the key difference from :argv-vec.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape :shape ["git" "push"]}
+              :action :allow}]]]
+    (is (= :allow (:decision (check "git push" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "git push --force" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "git status" {:rulesets rs}))))))
+
+(deftest argv-shape-allow-push-deny-force
+  ;; The headline use case: allow `git push` but deny `git push --force`.
+  ;; Layer broad-allow with specific-deny under last-match-wins.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape :shape ["git" "push" :**]}
+              :action :allow}
+             {:tool :bash :pattern {:kind :argv-shape
+                                    :shape ["git" "push" #{"--force" "-f"} :**]}
+              :action :deny}]]]
+    (is (= :allow (:decision (check "git push"          {:rulesets rs}))))
+    (is (= :allow (:decision (check "git push origin"   {:rulesets rs}))))
+    (is (= :deny  (:decision (check "git push --force"  {:rulesets rs}))))
+    (is (= :deny  (:decision (check "git push -f main"  {:rulesets rs}))))))
+
+(deftest argv-shape-wildcards
+  ;; :* matches exactly one slot; :** matches the rest.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape :shape ["mv" :* :*]}
+              :action :allow}
+             {:tool :bash :pattern {:kind :argv-shape :shape ["touch" :**]}
+              :action :allow}]]]
+    (is (= :allow (:decision (check "mv a b" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "mv a" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "mv a b c" {:rulesets rs}))))
+    (is (= :allow (:decision (check "touch" {:rulesets rs}))))
+    (is (= :allow (:decision (check "touch a" {:rulesets rs}))))
+    (is (= :allow (:decision (check "touch a b c" {:rulesets rs}))))))
+
+(deftest argv-shape-regex
+  ;; A regex slot matches if re-find returns truthy.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape
+                                    :shape ["docker" "run" #"^[a-z]+:[\d.]+$"]}
+              :action :allow}]]]
+    (is (= :allow (:decision (check "docker run nginx:1.27" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "docker run nginx:latest-evil" {:rulesets rs}))))))
+
 (deftest ast-pred-matcher
   ;; Allow any call whose first arg starts with "git" (a fake-prefix pred)
   (let [rs [[{:tool :bash
