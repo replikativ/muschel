@@ -296,17 +296,15 @@
 
             :else
             (let [env' (env/cd env target)
-                  ;; Verify the resolved cwd actually exists + is a dir.
                   fi (host/file-info (:host opts) (:cwd env'))]
               (cond
-                (not (:exists? fi))
+                ;; mvdan/sh's cd uses "no such file or directory" for
+                ;; BOTH missing paths and non-directory paths (matches
+                ;; what bash on Linux often prints via the chdir(2)
+                ;; ENOENT/ENOTDIR -> "no such file or directory" line).
+                (or (not (:exists? fi)) (not (:dir? fi)))
                 (do (write-line opts :err
                                 (str "cd: no such file or directory: \""
-                                     target "\"\n"))
-                    (env/record-exit env 1))
-                (not (:dir? fi))
-                (do (write-line opts :err
-                                (str "cd: not a directory: \""
                                      target "\"\n"))
                     (env/record-exit env 1))
                 :else (env/record-exit env' 0)))))
@@ -448,10 +446,7 @@
                 ;; No `o` — just validate short flags.
                 (if-let [bad (some #(when-not (set-short-flags %) %) cs)]
                   (assoc st :bad-flag bad)
-                  (recur (rest in) (update st :leftover conj a)))))))
-        bad-long (some (fn [[op v]]
-                         (when-not (set-long-options v) v))
-                       opt-pairs)]
+                  (recur (rest in) (update st :leftover conj a)))))))]
     (cond
       bad-flag
       (do (write-line opts :err (str "set: invalid option: \"-" (str bad-flag) "\"\n"))
@@ -1370,25 +1365,30 @@
 
 (defn- test-primary-2
   "Two-arg form: unary op + value. Returns true/false, or :unknown
-   if the op isn't recognised (caller treats as non-test args)."
+   if the op isn't recognised (caller treats as non-test args).
+   File tests on an EMPTY path return false (bash quirk)."
   [env [op v] opts]
   (let [h (:host opts)
-        info (fn [p] (host/file-info h (resolve-path env p)))]
-    (case op
-      "-e" (boolean (:exists?  (info v)))
-      "-f" (boolean (:file?    (info v)))
-      "-d" (boolean (:dir?     (info v)))
-      "-r" (boolean (:readable? (info v)))
-      "-w" (boolean (:writable? (info v)))
-      "-x" (boolean (:executable? (info v)))
-      "-s" (let [i (info v)] (boolean (and (:exists? i) (pos? (or (:size i) 0)))))
-      ("-L" "-h") (boolean (:symlink? (info v)))
-      "-z" (= "" v)
-      "-n" (not= "" v)
-      "-v" (env/has-value? env v)
-      "-o" (boolean (env/option env (keyword v)))
-      ("-b" "-c" "-g" "-k" "-p" "-S" "-u" "-N" "-O" "-G" "-t") false
-      :unknown)))
+        info (fn [p] (host/file-info h (resolve-path env p)))
+        file-op? (#{"-e" "-f" "-d" "-r" "-w" "-x" "-s" "-L" "-h"} op)]
+    (cond
+      (and file-op? (or (nil? v) (= "" v))) false
+      :else
+      (case op
+        "-e" (boolean (:exists?  (info v)))
+        "-f" (boolean (:file?    (info v)))
+        "-d" (boolean (:dir?     (info v)))
+        "-r" (boolean (:readable? (info v)))
+        "-w" (boolean (:writable? (info v)))
+        "-x" (boolean (:executable? (info v)))
+        "-s" (let [i (info v)] (boolean (and (:exists? i) (pos? (or (:size i) 0)))))
+        ("-L" "-h") (boolean (:symlink? (info v)))
+        "-z" (= "" v)
+        "-n" (not= "" v)
+        "-v" (env/has-value? env v)
+        "-o" (boolean (env/option env (keyword v)))
+        ("-b" "-c" "-g" "-k" "-p" "-S" "-u" "-N" "-O" "-G" "-t") false
+        :unknown))))
 
 (defn- test-primary-3
   "Three-arg form: a OP b. Returns true/false, or :unknown."
@@ -1535,18 +1535,32 @@
           (some #(when (= pid (:pid %)) %) jobs))))))
 
 (defn- builtin-wait
+  "POSIX `wait [pid|%jobid ...]`. With no args, waits for ALL bg jobs
+   and exits 0 — bash semantics. Waiting for a specific pid returns
+   that job's exit (127 if not a child)."
   [env args opts]
-  ;; `wait`           — wait for all bg jobs
-  ;; `wait <pid>`     — wait for given pid
-  ;; `wait %<job-id>` — wait for that job
-  (if-let [s (:session opts)]
-    (let [targets (if (empty? args)
-                    (session/-jobs s)
-                    (keep #(find-job s %) args))]
-      (let [last-exit (reduce (fn [_ j] (session/await-job j))
-                              0 targets)]
-        (env/record-exit env last-exit)))
-    (env/record-exit env 0)))
+  (cond
+    (not (:session opts))
+    (env/record-exit env 0)
+
+    ;; No args → wait for all, always return 0
+    (empty? args)
+    (let [s (:session opts)]
+      (doseq [j (session/-jobs s)] (session/await-job j))
+      (env/record-exit env 0))
+
+    :else
+    (let [s (:session opts)
+          {found-jobs true bad-args false}
+          (group-by #(some? (find-job s %)) args)
+          last-exit (reduce (fn [_ a] (session/await-job (find-job s a)))
+                            0 found-jobs)]
+      (doseq [bad bad-args]
+        (write-line opts :err
+                    (str "wait: pid " bad " is not a child of this shell\n")))
+      (env/record-exit env (cond
+                             (seq bad-args) 1
+                             :else last-exit)))))
 
 (defn- builtin-jobs
   [env _args opts]
@@ -1700,12 +1714,14 @@
   "Execute a :call AST (assigns + args). If args resolves to no
    command, naked assignments mutate env permanently."
   [env call opts]
-  (let [;; Expand args first (env may mutate from $X cmd-subst etc.)
-        ;; env1's :last-exit is the exit of the LAST cmd-subst that
-        ;; ran during expansion — bash propagates this when the call
-        ;; resolves to an empty command (e.g. `$(false)` alone).
+  (let [;; Track whether expansion runs a cmd-subst; if it does,
+        ;; env1's :last-exit reflects that AND we should propagate
+        ;; on `$(false)`-style empty-call lines. Otherwise the call's
+        ;; exit is 0 (or, for a naked assignment, 0).
+        prev-exit (:last-exit env)
         [env1 fields] (expand-words env (:args call) opts)
-        cmd-subst-exit (:last-exit env1)
+        cmd-subst-exit (when (not= prev-exit (:last-exit env1))
+                         (:last-exit env1))
         fields (if (and (= 1 (count fields)) (= "" (first fields)))
                  []
                  fields)]
@@ -1716,25 +1732,30 @@
       ;; args that all expanded away (e.g. `$(false)`), bash propagates
       ;; the LAST cmd-subst's exit; otherwise we record 0.
       (empty? fields)
-      (let [[env' readonly-err?]
+      (let [[env' readonly-err? last-cs-exit]
             (reduce
-             (fn [[env err?] as]
+             (fn [[env err? cs-exit] as]
                (cond
-                 err? [env err?]
+                 err? [env err? cs-exit]
                  (env/readonly? env (:name as))
                  (do (write-line opts :err (str (:name as) ": readonly variable\n"))
-                     [env true])
+                     [env true cs-exit])
                  :else
-                 (let [[env' val] (expand-assign env (:value as) opts)
+                 (let [prev (:last-exit env)
+                       [env' val] (expand-assign env (:value as) opts)
                        final     (if (:append? as)
                                    (str (env/get-var env' (:name as)) val)
-                                   val)]
-                   [(env/set-var env' (:name as) final) false])))
-             [env1 false] (:assigns call))
+                                   val)
+                       ;; Track cmd-subst exit ONLY when expansion
+                       ;; actually changed last-exit (cmd-subst ran).
+                       new-cs (when (not= prev (:last-exit env'))
+                                (:last-exit env'))]
+                   [(env/set-var env' (:name as) final) false (or new-cs cs-exit)])))
+             [env1 false cmd-subst-exit] (:assigns call))
             had-args? (seq (:args call))]
         (env/record-exit env' (cond readonly-err? 1
                                     had-args?    (or cmd-subst-exit 0)
-                                    :else        0)))
+                                    :else        (or last-cs-exit 0))))
 
       :else
       (let [name (first fields)
@@ -1893,11 +1914,11 @@
           stmts))
         results (mapv #(host/await-async h %) tasks)
         ;; Per POSIX (and default bash), pipeline exit = last cmd's exit.
-        ;; pipefail option uses leftmost non-zero.
+        ;; pipefail uses the RIGHTMOST non-zero (bash semantics).
         last-exit (or (:last-exit (last results)) 0)
         final-exit (if (env/option env :pipefail)
-                     (or (some #(when (and % (not (zero? %))) %)
-                               (map :last-exit results))
+                     (or (last (filter #(and % (not (zero? %)))
+                                       (map :last-exit results)))
                          last-exit)
                      last-exit)]
     (env/record-exit env final-exit)))
