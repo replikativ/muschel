@@ -153,7 +153,7 @@
 ;;      \"\\\"shouldnotexist\\\": executable file not found in $PATH\")
 ;;   - arg-validation messages differ (`cd a b`, `exit 1 2`)
 ;;   - some edge-case bash semantics (`$?` after backgrounded false)
-(def ^:private failure-budget 215)
+(def ^:private failure-budget 205)
 
 (defn- run-case-rich
   "Like run-case but returns {:result … :got … :want …} for analysis."

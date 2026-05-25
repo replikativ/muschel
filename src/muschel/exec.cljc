@@ -123,10 +123,9 @@
        (try
          (let [[env' v] (arith/evaluate env expr)]
            [env' v])
-         (catch #?(:clj clojure.lang.ExceptionInfo
-                   :cljs ExceptionInfo) e
+         (catch #?(:clj Throwable :cljs :default) e
            (host/write-string! h (:err base-opts)
-                               (str (.getMessage e) "\n"))
+                               (str (or (.getMessage e) (str e)) "\n"))
            [(env/record-exit env 1) 0])))}))
 
 (defn- expand-words [env words opts]
@@ -1058,9 +1057,9 @@
                   (try
                     (let [[env' v] (arith/evaluate env expr)]
                       [env' v err?])
-                    (catch #?(:clj clojure.lang.ExceptionInfo
-                              :cljs ExceptionInfo) e
-                      (write-line opts :err (str (.getMessage e) "\n"))
+                    (catch #?(:clj Throwable :cljs :default) e
+                      (write-line opts :err (str (or (.getMessage e)
+                                                     (str e)) "\n"))
                       [env 0 true])))
                 [env 0 false]
                 args)]
@@ -1449,19 +1448,26 @@
 
 (defn- run-binary [env binary opts]
   (case (:op binary)
-    ;; bash quirk: errexit is suppressed for the LEFT of `&&`/`||` and
-    ;; for the whole construct when it appears in protected context;
-    ;; the right side runs at the same protection level as the parent.
+    ;; bash: non-final operands of `&&`/`||` are errexit-protected.
+    ;; The chain as a whole only trips errexit if the FINAL operand
+    ;; ran AND was unprotected (i.e. parent didn't protect us). If
+    ;; the chain short-circuits before reaching the final, no trip.
+    ;;
+    ;; We mark the binary stmt as :errexit-protected? so exec-stmt-body
+    ;; doesn't arm post-hoc; whether the final operand armed is its
+    ;; own concern (and stays in env).
     :and
-    (let [env' (exec-stmt env (:left binary)
-                          (assoc opts :errexit-protected? true))]
+    (let [env' (-> (exec-stmt env (:left binary)
+                              (assoc opts :errexit-protected? true))
+                   (dissoc :errexit-armed?))]
       (if (zero? (:last-exit env'))
         (exec-stmt env' (:right binary) opts)
         env'))
 
     :or
-    (let [env' (exec-stmt env (:left binary)
-                          (assoc opts :errexit-protected? true))]
+    (let [env' (-> (exec-stmt env (:left binary)
+                              (assoc opts :errexit-protected? true))
+                   (dissoc :errexit-armed?))]
       (if (zero? (:last-exit env'))
         env'
         (exec-stmt env' (:right binary) opts)))
@@ -1763,13 +1769,13 @@
     :arith-cmd
     ;; ((expr)) — evaluate; exit status is 0 if result is nonzero, 1
     ;; if zero. Runtime arith errors (`((3/0))`) print to stderr and
-    ;; exit 1, matching bash.
+    ;; exit 1, matching bash. Catch both ExceptionInfo (our raised)
+    ;; and ArithmeticException (raw JVM div-by-zero).
     (try
       (let [[env' v] (arith/evaluate env (:expr cmd))]
         (env/record-exit env' (if (zero? v) 1 0)))
-      (catch #?(:clj clojure.lang.ExceptionInfo
-                :cljs ExceptionInfo) e
-        (write-line opts :err (str (.getMessage e) "\n"))
+      (catch #?(:clj Throwable :cljs :default) e
+        (write-line opts :err (str (or (.getMessage e) (str e)) "\n"))
         (env/record-exit env 1)))
 
     :c-for
@@ -1867,9 +1873,23 @@
                        (do (write-line opts-r :err (str (:msg (ex-data e)) "\n"))
                            (-> env-r (env/record-exit 1) (assoc :exiting? true)))
                        (throw e))))]
-        (if (:neg? stmt)
-          (env/record-exit env' (if (zero? (:last-exit env')) 1 0))
-          env'))
+        (let [env' (if (:neg? stmt)
+                     (env/record-exit env' (if (zero? (:last-exit env')) 1 0))
+                     env')
+              ;; `&&`/`||` chains handle their own arming through
+              ;; recursive exec-stmt of the final operand — auto-
+              ;; arming at the binary stmt level would double-count
+              ;; (and arm short-circuit cases that shouldn't trip).
+              cmd-type (:type cmd)
+              binary-and-or? (and (= :binary cmd-type)
+                                  (#{:and :or} (:op cmd)))]
+          (cond-> env'
+            (and (env/option env' :errexit)
+                 (not (zero? (or (:last-exit env') 0)))
+                 (not (:errexit-protected? opts))
+                 (not (:neg? stmt))
+                 (not binary-and-or?))
+            (assoc :errexit-armed? true))))
       (finally
         (close!)))))
 
@@ -1927,27 +1947,26 @@
       (pos? (or (:break-enclosing env) 0))
       (pos? (or (:continue-enclosing env) 0))))
 
-(defn- errexit-trip?
-  "True when `set -e` (errexit) is on AND the last stmt produced a
-   non-zero exit AND we're NOT in an errexit-protected context (the
-   condition of `if`/`while`/`until`, a non-final part of `&&`/`||`,
-   inside a `[[ ]]` or `[ ]`, or after a `!`-negated stmt).
+(defn exec-stmts
+  "Run statements in sequence, threading env through.
 
-   bash semantics: only SIMPLE commands trip; `set -e; if false; …`
-   does NOT exit. The protected-context flag is set by callers
-   (run-if cond, run-binary left side, etc.) via opts."
-  [env opts]
-  (and (env/option env :errexit)
-       (not (zero? (or (:last-exit env) 0)))
-       (not (:errexit-protected? opts))))
-
-(defn exec-stmts [env stmts opts]
+   `set -e` (errexit) handling: a stmt that ARMS errexit (an
+   unprotected non-zero exit) makes the loop bail out. Protected
+   contexts (`if` / `while` / `until` cond, `&&` / `||` non-final
+   operand, `!`-negated, opts `:errexit-protected? true`) suppress
+   the arming via the env's `:errexit-armed?` flag, which is set by
+   exec-stmt-body and read+cleared here."
+  [env stmts opts]
   (reduce (fn [env st]
             (cond
               (stop-propagating? env) (reduced env)
-              (errexit-trip? env opts)
-              (reduced (assoc env :exiting? true))
-              :else (exec-stmt env st opts)))
+              :else
+              (let [env' (exec-stmt env st opts)]
+                (if (and (env/option env' :errexit)
+                         (:errexit-armed? env'))
+                  (reduced (-> env' (dissoc :errexit-armed?)
+                               (assoc :exiting? true)))
+                  (dissoc env' :errexit-armed?)))))
           env
           stmts))
 

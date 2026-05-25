@@ -283,7 +283,11 @@
               (= :and (:type t))
               (= :or (:type t))
               (= :rparen (:type t))
-              (closing-reserved? t)
+              ;; Reserved words (`done`, `fi`, `esac`, ...) are
+              ;; keywords only at command-start. Once we've consumed
+              ;; a non-assignment word, subsequent reserveds are
+              ;; ordinary string arguments — `echo done` should pass.
+              (and (closing-reserved? t) (not @saw-nonassign?))
               (and (word-token? t)
                    (= "}" (pure-lit-string? t))
                    @saw-nonassign?))
@@ -341,20 +345,21 @@
           :else nil)))
     ;; Build the result.
     (cond
-      ;; Test bracket: first arg is `[` or `[[`
+      ;; Test bracket: first arg is `[` or `[[`. Only convert when we
+      ;; ACTUALLY found a closing `]` / `]]`; otherwise leave as a
+      ;; regular :call (the `[` / `test` builtin will run + error at
+      ;; runtime, which matches bash's behavior when given malformed
+      ;; test args).
       (and (clojure.core/empty? @assigns)
            (pos? (count @args))
-           (#{"[" "[["} (pure-lit-string? (first @args))))
+           (#{"[" "[["} (pure-lit-string? (first @args)))
+           (let [bracket (pure-lit-string? (first @args))
+                 close (if (= "[" bracket) "]" "]]")
+                 last-w (last (rest @args))]
+             (= close (pure-lit-string? last-w))))
       (let [bracket (pure-lit-string? (first @args))
-            close   (if (= "[" bracket) "]" "]]")
-            inner   (rest @args)
-            last-w  (last inner)
+            inner (rest @args)
             inner-words (vec (butlast inner))]
-        (when-not (= close (pure-lit-string? last-w))
-          (parse-error! p (str "syntax error near unexpected token `"
-                               (pure-lit-string? last-w) "'")
-                        last-w
-                        {:hint (str "missing closing `" close "` for test bracket")}))
         (cond-> {:type :test-bracket
                  :form (if (= "[" bracket) :single :double)
                  :args inner-words

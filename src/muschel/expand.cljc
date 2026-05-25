@@ -324,10 +324,13 @@
 
 (defn- translate-bracket-body
   "Inside `[...]` of a glob: expand POSIX classes `[:digit:]` etc and
-   regex-escape `]` if needed. Leading `!` already stripped + `^`
-   substituted by the caller."
+   regex-escape characters Java treats specially inside a char class
+   (`[` for nested-class intersection, `&` for intersection, `\\` for
+   escape). Leading `!` already stripped + `^` substituted by the
+   caller."
   [^String body]
-  (let [n (count body)]
+  (let [n (count body)
+        esc? #{\[ \\ \&}]
     (loop [i 0 acc []]
       (if (>= i n)
         (apply str acc)
@@ -343,8 +346,13 @@
             (if rgx
               (recur (+ close 2) (conj acc rgx))
               (recur (inc i) (conj acc (str (.charAt body i))))))
+
           :else
-          (recur (inc i) (conj acc (str (.charAt body i)))))))))
+          (let [c (.charAt body i)]
+            (recur (inc i)
+                   (if (esc? c)
+                     (conj acc "\\" (str c))
+                     (conj acc (str c))))))))))
 
 (defn glob->regex
   "Translate a bash glob pattern (`*` `?` `[abc]` `[!abc]`,
@@ -359,21 +367,22 @@
           (case c
             \* (recur (inc i) (conj acc ".*"))
             \? (recur (inc i) (conj acc "."))
-            \[ (let [;; Find the closing `]`. bash quirk: a `]` as the
-                     ;; FIRST char of the class body is literal — start
-                     ;; looking from i+2 in that case (and also for `!]`
-                     ;; / `^]`). Empty `[]` is a literal `[]`.
-                     skip (cond
-                            (>= (inc i) n) 1
-                            (= \] (.charAt pat (inc i))) 2
-                            (and (>= (+ i 2) n) (= \] (.charAt pat (inc i)))) 2
-                            (and (#{\! \^} (.charAt pat (inc i)))
-                                 (< (+ i 2) n)
-                                 (= \] (.charAt pat (+ i 2))))
-                            3
-                            :else 1)
-                     end (.indexOf pat "]" (+ i skip))]
-                 (if (or (neg? end) (= 1 skip))
+            \[ (let [;; Where to start looking for closing `]`. bash
+                     ;; quirk: a `]` as the FIRST char of the class
+                     ;; body is literal — skip it. Same for `!]` / `^]`.
+                     ;; This is for finding `]` (start position), NOT a
+                     ;; minimum-length guard.
+                     search-from
+                     (cond
+                       (>= (inc i) n) (inc i)
+                       (= \] (.charAt pat (inc i))) (+ i 2)
+                       (and (#{\! \^} (.charAt pat (inc i)))
+                            (< (+ i 2) n)
+                            (= \] (.charAt pat (+ i 2))))
+                       (+ i 3)
+                       :else (+ i 2))
+                     end (.indexOf pat "]" search-from)]
+                 (if (neg? end)
                    (recur (inc i) (conj acc "\\["))
                    (let [raw (subs pat (inc i) end)
                          raw (if (str/starts-with? raw "!")
@@ -527,15 +536,18 @@
             ;; ${var:OFFSET[:LENGTH]} substring. bash quirk: a negative
             ;; offset must be written with a leading space (`${a: -1}`)
             ;; to avoid colliding with the `${var:-default}` syntax —
-            ;; we trim here so " -1" parses as -1.
+            ;; we trim here so " -1" parses as -1. Empty operands
+            ;; default to 0 (`${a::2}` = `${a:0:2}`).
             (let [body (subs rest 1)
-                  cc (.indexOf body ":")]
+                  cc (.indexOf body ":")
+                  pi (fn [s] (let [s (str/trim (or s ""))]
+                               (if (empty? s) 0 (parse-int* s))))]
               (if (neg? cc)
                 {:op :substring :name name
-                 :offset (parse-int* (str/trim body)) :length nil}
+                 :offset (pi body) :length nil}
                 {:op :substring :name name
-                 :offset (parse-int* (str/trim (subs body 0 cc)))
-                 :length (parse-int* (str/trim (subs body (inc cc))))}))
+                 :offset (pi (subs body 0 cc))
+                 :length (pi (subs body (inc cc)))}))
 
             ;; ${var^^[pat]} / ${var^[pat]} — uppercase all / first
             ;; ${var,,[pat]} / ${var,[pat]} — lowercase all / first
@@ -823,21 +835,41 @@
 (defn- expand-string-in-env
   "Expand a raw bash word-text-source (e.g. the `word` part of
    `${VAR:-word}`). Re-lexes the source as a single word and runs
-   expansion. Returns a string (joined, no word splitting)."
+   expansion. Returns a string (joined, no word splitting).
+
+   Whitespace between words is PRESERVED — bash's `${var/pat/repl}`
+   keeps `a  b` (two spaces) as-is in the replacement. We do this by
+   walking the raw source for whitespace and only consulting the
+   tokenizer for `$`-led expansions."
   [env src opts]
   (when (and (string? src) (pos? (count src)))
     (let [tokens (lex/tokenize src)
-          word-toks (filter #(= :word (:type %)) tokens)
-          frags (mapcat (fn [t]
-                          (let [[_ fs]
-                                (reduce (fn [[env acc] sub]
-                                          (let [[env' fs] (expand-part env sub opts)]
-                                            [env' (into acc fs)]))
-                                        [env []]
-                                        (:parts t))]
-                            fs))
-                        word-toks)]
-      (apply str (map :s frags)))))
+          ;; Sort tokens by source offset so we can interleave them
+          ;; with the original whitespace.
+          word-toks (->> tokens
+                         (filter #(= :word (:type %)))
+                         (sort-by :offset))]
+      (loop [acc [] pos 0 toks word-toks env env]
+        (cond
+          (empty? toks)
+          ;; Append any trailing whitespace.
+          (apply str (conj acc (subs src pos)))
+
+          :else
+          (let [t (first toks)
+                t-off (or (:offset t) pos)
+                gap (subs src pos t-off)
+                [env' fs]
+                (reduce (fn [[env acc] sub]
+                          (let [[env' fs] (expand-part env sub opts)]
+                            [env' (into acc fs)]))
+                        [env []]
+                        (:parts t))
+                t-end (or (:end-offset t) (+ t-off (count gap)))]
+            (recur (-> acc (conj gap) (into (map :s fs)))
+                   t-end
+                   (rest toks)
+                   env')))))))
 
 ;; ============================================================================
 ;; Word splitting (pass 6) + glob (pass 7)
