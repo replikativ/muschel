@@ -151,6 +151,14 @@
     "PWD"    (:cwd env)
     "OLDPWD" (:prev-cwd env)
     "IFS"    (:ifs env)
+    ;; bash dynamic variables. We expand them on read; not stored in
+    ;; :vars so they don't pollute (env/to-process-env env).
+    "RANDOM" (str (rand-int 32768))
+    "LINENO" (str (or (:lineno env) 1))
+    "SECONDS" (str (if-let [t0 (:start-ms env)]
+                     (quot (- #?(:clj  (System/currentTimeMillis)
+                                 :cljs (.getTime (js/Date.))) t0) 1000)
+                     0))
     ;; Regular var
     (get-in env [:vars name :value])))
 

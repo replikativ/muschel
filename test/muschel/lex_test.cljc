@@ -293,8 +293,16 @@
 (deftest refused-extended-glob
   (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) (l/tokenize "ls ?(a|b)"))))
 
-(deftest refused-locale-quoting
-  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) (l/tokenize "echo $\"foo\""))))
+(deftest locale-quoting-as-dquote
+  ;; `$"..."` is bash's locale-translation syntax. With no LC_MESSAGES
+  ;; catalog loaded, the result is identical to the inner "..." — we
+  ;; lex it as a `:dquoted` part so the rest of the pipeline doesn't
+  ;; have to care.
+  (let [toks (l/tokenize "echo $\"foo $X\"")
+        word (second toks)
+        part (first (:parts word))]
+    (is (= :dquoted (:type part)))
+    (is (= [:lit :var-ref] (mapv :type (:parts part))))))
 
 ;; ============================================================================
 ;; Whitespace / comments / continuations

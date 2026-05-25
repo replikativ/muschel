@@ -211,7 +211,7 @@
 ;; Forward declarations
 ;; ============================================================================
 
-(declare read-word! read-token! drain-heredocs!)
+(declare read-word! read-token! drain-heredocs! read-dquoted-part!)
 
 ;; ============================================================================
 ;; Balanced readers — used by $(...), ${...}, $((..)), `...`
@@ -456,8 +456,14 @@
                 :else (do (sb+ b (advance! sc)) (recur))))
             (tok :ansi-c-quoted start (mark sc) {:raw (sb->s b)})))
 
-      ;; $"..." — locale-aware quoting → REFUSED (i18n hook, nobody uses)
-      (= c2 \") (refused sc "$\"...\" locale-aware quoting" start)
+      ;; $"..." — locale-aware quoting. bash uses gettext for translation
+      ;; when LC_MESSAGES is set; with no catalog (our default) the result
+      ;; is identical to the inner "..." string. We model it that way:
+      ;; advance past the leading `$` and let the regular dquote part
+      ;; reader handle the rest.
+      (= c2 \")
+      (do (advance! sc)                                 ; $
+          (read-dquoted-part! sc))
 
       ;; $NAME — simple variable
       (name-start? c2)

@@ -100,9 +100,11 @@
         (:value p)))))
 
 (defn- assignment-prefix?
-  "True if the word token looks like an assignment prefix (NAME=...
-   where NAME is [A-Za-z_][A-Za-z_0-9]*). Recognises words whose first
-   part is a :lit matching the pattern; the value after `=` may be
+  "True if the word token looks like an assignment prefix.
+
+   Recognises `NAME=value`  → `{:name :rest-of-first}` and
+              `NAME+=value` → `{:name :rest-of-first :append? true}`
+   where NAME is `[A-Za-z_][A-Za-z_0-9]*`. The value after `=` may be
    anything (other parts of the word, or empty)."
   [t]
   (when (word-token? t)
@@ -112,9 +114,12 @@
         (let [v ^String (:value first-part)
               eq (.indexOf v "=")]
           (when (pos? eq)                                ; not at position 0
-            (let [name (subs v 0 eq)]
+            (let [;; `NAME+=value` → strip trailing + from name, mark append
+                  append? (and (> eq 1) (= \+ (.charAt v (dec eq))))
+                  name (subs v 0 (if append? (dec eq) eq))]
               (and (re-matches #"[A-Za-z_][A-Za-z_0-9]*" name)
-                   {:name name :rest-of-first (subs v (inc eq))}))))))))
+                   (cond-> {:name name :rest-of-first (subs v (inc eq))}
+                     append? (assoc :append? true))))))))))
 
 ;; ============================================================================
 ;; Forward declarations
@@ -296,7 +301,7 @@
             ;; Bash quirk: if the value starts with `~`, tilde
             ;; expansion applies — promote a leading `~` to a :tilde
             ;; part so expand-assign-value resolves it to $HOME.
-            (let [{:keys [name rest-of-first]} (assignment-prefix? t)
+            (let [{:keys [name rest-of-first append?]} (assignment-prefix? t)
                   parts (:parts t)
                   rest-parts (rest parts)
                   ;; Synthesise tilde-part if value starts with `~`
@@ -322,8 +327,9 @@
                               :offset (+ (:offset t) (count name) 1)}]
               (advance-tok! p)
               (vswap! assigns conj
-                      {:type :assign :name name :value value-word
-                       :line (:line t) :col (:col t) :offset (:offset t)})
+                      (cond-> {:type :assign :name name :value value-word
+                               :line (:line t) :col (:col t) :offset (:offset t)}
+                        append? (assoc :append? true)))
               (recur))
             (do (vreset! saw-nonassign? true)
                 (vswap! args conj (advance-tok! p))
@@ -627,13 +633,33 @@
   (or (parse-compound-cmd p)
       (parse-simple-cmd p)))
 
+(defn- collect-trailing-redirs!
+  "Compound commands (`while ... done`, `{ ... }`, `(...)`, `if ... fi`,
+   `case ... esac`, `for ... done`) accept trailing redirects after the
+   closing keyword, e.g. `done < input.txt` or `} > out.log`. Simple
+   commands consume their redirs inside `parse-simple-cmd*`, so this
+   loop is a no-op for them. Returns the collected redirs as a vector."
+  [p]
+  (let [v (volatile! [])]
+    (loop []
+      (when (redir-token? (peek-tok p))
+        (vswap! v conj (parse-redir p))
+        (recur)))
+    (vec @v)))
+
 (defn- parse-pipeline-body
   "Parse a pipeline: cmd ((| | |&) cmd)*. Returns either the single
    cmd (no pipes) or a left-folded :binary chain.
-   Each piped cmd is wrapped in its own :stmt — pipe acts on stmts."
+   Each piped cmd is wrapped in its own :stmt — pipe acts on stmts.
+
+   Trailing redirects after compound commands are collected here and
+   attached to the wrapping stmt's `:redirs`. `apply-redirs` in exec
+   concats stmt + cmd redirs, so the same machinery covers both
+   simple-cmd redirs (on `:cmd`) and compound-cmd redirs (on `:stmt`)."
   [p]
-  (let [left-cmd (parse-cmd p)
-        left-stmt {:type :stmt :cmd left-cmd :redirs []
+  (let [left-cmd  (parse-cmd p)
+        left-stmt {:type :stmt :cmd left-cmd
+                   :redirs (collect-trailing-redirs! p)
                    :bg? false :neg? false}]
     (loop [acc left-stmt]
       (let [t (peek-tok p)]
@@ -642,8 +668,9 @@
           (let [op (if (= :pipe (:type t)) :pipe :pipe-amp)]
             (advance-tok! p)
             (skip-newlines! p)
-            (let [right-cmd (parse-cmd p)
-                  right-stmt {:type :stmt :cmd right-cmd :redirs []
+            (let [right-cmd  (parse-cmd p)
+                  right-stmt {:type :stmt :cmd right-cmd
+                              :redirs (collect-trailing-redirs! p)
                               :bg? false :neg? false}]
               (recur {:type :stmt
                       :cmd {:type :binary :op op :left acc :right right-stmt}

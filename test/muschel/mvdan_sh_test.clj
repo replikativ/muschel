@@ -153,7 +153,7 @@
 ;;      \"\\\"shouldnotexist\\\": executable file not found in $PATH\")
 ;;   - arg-validation messages differ (`cd a b`, `exit 1 2`)
 ;;   - some edge-case bash semantics (`$?` after backgrounded false)
-(def ^:private failure-budget 285)
+(def ^:private failure-budget 260)
 
 (defn- run-case-rich
   "Like run-case but returns {:result … :got … :want …} for analysis."
@@ -251,7 +251,9 @@
 
 (defn -categorize-failures
   "Run all active cases, bucket failures by likely cause, print
-   counts + 2 example inputs per bucket."
+   counts + 2 example inputs per bucket. Force-exits when done —
+   a few cases (`wait` deref'ing dangling bg-job futures) keep
+   non-daemon threads alive that would otherwise block JVM exit."
   [& _]
   (let [active (remove skip? corpus)
         all (mapv (fn [c] (assoc (run-case-rich c) :in (:in c))) active)
@@ -264,7 +266,9 @@
     (doseq [[k cases] (sort-by (comp - count val) bucketed)]
       (println (format "%-25s %4d  e.g. %s"
                        k (count cases)
-                       (pr-str (vec (map :in (take 2 cases)))))))))
+                       (pr-str (vec (map :in (take 2 cases)))))))
+    (flush)
+    (System/exit 0)))
 
 (deftest mvdan-sh-corpus-regression
   (let [active (remove skip? corpus)

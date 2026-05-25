@@ -241,10 +241,17 @@
     (> (count args) 1)
     (do (write-line opts :err "usage: cd [dir]\n")
         (env/record-exit env 2))
+
+    ;; bash: `cd ''` errors out explicitly (not the same as bare `cd`,
+    ;; which goes to HOME). The arg was explicitly empty.
+    (and (seq args) (= "" (first args)))
+    (do (write-line opts :err "cd: empty directory path\n")
+        (env/record-exit env 1))
+
     :else
     (let [path (first args)]
       (try
-        (let [target (if (or (nil? path) (= "" path))
+        (let [target (if (nil? path)
                        (env/get-var env "HOME")
                        path)]
           (when (or (nil? target) (= "" target))
@@ -301,10 +308,28 @@
 
 (defn- builtin-set
   [env args _opts]
-  ;; Minimal: `set -e/-u/-x/+e/+u/+x` toggle options; rest replaces
-  ;; positional params.
-  (let [[opt-args rest-args] (split-with #(or (str/starts-with? % "-")
-                                              (str/starts-with? % "+")) args)
+  ;; `set -e/-u/-x/+e/+u/+x` toggle options. A bare `--` ends option
+  ;; parsing and causes everything after it (which may be empty) to
+  ;; REPLACE the positional params — `set --` clears them.
+  ;; If no `--` appears and there are non-option args, those replace
+  ;; positionals (legacy form). With no args at all, set prints all
+  ;; vars (not implemented — exits 0).
+  (let [arg-vec (vec args)
+        sep-ix  (some (fn [[i a]] (when (= "--" a) i))
+                      (map-indexed vector arg-vec))
+        opt-args (if sep-ix
+                   (subvec arg-vec 0 sep-ix)
+                   (vec (take-while #(or (str/starts-with? % "-")
+                                         (str/starts-with? % "+")) arg-vec)))
+        pos-args (when (or sep-ix (some? (first (drop-while
+                                                 #(or (str/starts-with? % "-")
+                                                      (str/starts-with? % "+"))
+                                                 arg-vec))))
+                   (if sep-ix
+                     (subvec arg-vec (inc sep-ix))
+                     (vec (drop-while #(or (str/starts-with? % "-")
+                                           (str/starts-with? % "+"))
+                                      arg-vec))))
         env' (reduce
               (fn [e a]
                 (let [on? (str/starts-with? a "-")
@@ -319,7 +344,7 @@
                        e))
                    e flags)))
               env opt-args)
-        env'' (if (seq rest-args) (env/with-pos-args env' rest-args) env')]
+        env'' (if (some? pos-args) (env/with-pos-args env' pos-args) env')]
     (env/record-exit env'' 0)))
 
 (defn- builtin-shift
@@ -376,7 +401,12 @@
           (env/record-exit env 2))
 
       :else
-      (assoc env (if (= name "break") :break-enclosing :continue-enclosing) n))))
+      ;; The builtin itself succeeded — set :last-exit 0 so the loop
+      ;; that catches the break/continue signal sees a clean exit. We
+      ;; track the depth on the side-channel keys.
+      (-> env
+          (assoc (if (= name "break") :break-enclosing :continue-enclosing) n)
+          (env/record-exit 0)))))
 
 (defn- builtin-break    [env args opts] (builtin-break-or-continue "break"    env args opts))
 (defn- builtin-continue [env args opts] (builtin-break-or-continue "continue" env args opts))
@@ -399,17 +429,40 @@
           (env/record-exit (bit-and (long n) 0xff))
           (assoc :returning? true)))))
 
-(defn- printf-format
-  "Format args according to `fmt` (a single bash printf format string).
-   Returns [output-string args-remaining error?]. The args-remaining
-   slice lets the caller loop and reuse the format until args are
-   exhausted (bash printf semantics).
+(defn- parse-printf-int
+  "bash printf accepts decimal `42`, octal `010` → 8, hex `0x10` → 16,
+   and `'c` → ASCII code of c. Returns 0 on parse error."
+  [s]
+  (let [s (str/trim (str s))]
+    (cond
+      (empty? s) 0
+      (and (>= (count s) 2) (= \' (.charAt s 0)))
+      (long (.charAt s 1))
+      (and (>= (count s) 2) (= \0 (.charAt s 0))
+           (or (= \x (.charAt s 1)) (= \X (.charAt s 1))))
+      (try (parse-int* (subs s 2) 16)
+           (catch #?(:clj Exception :cljs :default) _ 0))
+      ;; Leading 0 (with at least one more digit) → octal.
+      (and (> (count s) 1) (= \0 (.charAt s 0))
+           (re-matches #"0[0-7]+" s))
+      (try (parse-int* (subs s 1) 8)
+           (catch #?(:clj Exception :cljs :default) _ 0))
+      :else
+      (try (parse-int* s)
+           (catch #?(:clj Exception :cljs :default) _ 0)))))
 
-   Supports: %s %d %i %u %c %x %X %o %b %q %% with width / precision
-   modifiers and the `-` left-align flag. Escapes (\\n \\t ...) in the
+(defn- printf-format
+  "Format args according to `fmt-str` (a single bash printf format
+   string). Returns [output-string args-remaining error?]. The
+   args-remaining slice lets the caller loop and reuse the format
+   until args are exhausted (bash printf semantics).
+
+   Supports: %s %d %i %u %c %x %X %o %b %q %% with `-`/`+`/` `/`0`/`#`
+   flags, width and precision modifiers. Integer args parse `010`
+   as octal and `0x10` as hex per bash. Escapes (\\n \\t ...) in the
    format string are decoded via the ANSI-C table."
-  [^String fmt args]
-  (let [n (count fmt)
+  [^String fmt-str args]
+  (let [n (count fmt-str)
         out (volatile! [])
         push! (fn [s] (vswap! out conj (str s)))
         decode-escape (fn [s] (expand/decode-ansi-c s))
@@ -417,22 +470,21 @@
                               (loop [j i acc []]
                                 (cond
                                   (>= j n) [(apply str acc) j]
-                                  (= \% (.charAt fmt j))
+                                  (= \% (.charAt fmt-str j))
                                   [(apply str acc) j]
                                   :else
-                                  (recur (inc j) (conj acc (str (.charAt fmt j)))))))
-        format-int (fn [^String fmt-spec ^long n]
-                     ;; Java's String/format works for %d %x %X %o etc.
-                     (try (fmt fmt-spec n) (catch #?(:clj Throwable :cljs :default) _ (str n))))
-        format-str (fn [^String fmt-spec ^String s]
-                     (try (fmt fmt-spec s) (catch #?(:clj Throwable :cljs :default) _ s)))
-        parse-int-or (fn [s] (try (parse-int* (str/trim s))
-                                  (catch #?(:clj Exception :cljs :default) _ 0)))]
+                                  (recur (inc j) (conj acc (str (.charAt fmt-str j)))))))
+        format-int (fn [^String spec ^long x]
+                     (try (fmt spec x)
+                          (catch #?(:clj Throwable :cljs :default) _ (str x))))
+        format-str (fn [^String spec ^String s]
+                     (try (fmt spec s)
+                          (catch #?(:clj Throwable :cljs :default) _ s)))]
     (loop [i 0 args args]
       (cond
         (>= i n) [(apply str @out) args nil]
 
-        (not= \% (.charAt fmt i))
+        (not= \% (.charAt fmt-str i))
         (let [[chunk j] (consume-non-percent i)]
           (push! (decode-escape chunk))
           (recur j args))
@@ -440,34 +492,39 @@
         :else
         ;; At `%`. Parse flags + width + precision + conversion char.
         (let [j (inc i)
-              ;; consume flags
               [j flags] (loop [k j fs ""]
-                          (let [c (when (< k n) (.charAt fmt k))]
-                            (if (#{\- \+ \space \0 \# \'} (or c \space))
+                          (let [c (when (< k n) (.charAt fmt-str k))]
+                            ;; Past EOF or a non-flag char ends the
+                            ;; flag scan. The `(some? c)` guard is
+                            ;; load-bearing: \space is in the flag
+                            ;; set, so without it `printf %` spins.
+                            (if (and (some? c) (#{\- \+ \space \0 \# \'} c))
                               (recur (inc k) (str fs c))
                               [k fs])))
-              ;; consume width
               [j width] (loop [k j ws ""]
-                          (let [c (when (< k n) (.charAt fmt k))]
-                            (if (and c (and c (re-find #"[0-9]" (str c))))
+                          (let [c (when (< k n) (.charAt fmt-str k))]
+                            (if (and c (re-find #"[0-9]" (str c)))
                               (recur (inc k) (str ws c))
                               [k ws])))
-              ;; consume precision
-              [j prec] (if (and (< j n) (= \. (.charAt fmt j)))
+              [j prec] (if (and (< j n) (= \. (.charAt fmt-str j)))
                          (loop [k (inc j) ps ""]
-                           (let [c (when (< k n) (.charAt fmt k))]
-                             (if (and c (and c (re-find #"[0-9]" (str c))))
+                           (let [c (when (< k n) (.charAt fmt-str k))]
+                             (if (and c (re-find #"[0-9]" (str c)))
                                (recur (inc k) (str ps c))
                                [k ps])))
                          [j nil])
-              conv (when (< j n) (.charAt fmt j))
-              fmt-spec (str "%" flags width (when prec (str "." prec))
-                            (when conv (str conv)))]
+              conv (when (< j n) (.charAt fmt-str j))
+              ;; Java's Formatter uses %d not %i; map and drop the `'`
+              ;; (grouping) flag which Java doesn't accept for ints.
+              java-conv (case conv \i \d conv)
+              java-flags (str/replace (str flags) "'" "")
+              spec (str "%" java-flags width (when prec (str "." prec))
+                        (when java-conv (str java-conv)))]
           (case conv
             \% (do (push! "%") (recur (inc j) args))
             nil [(apply str @out) args "missing format char"]
             \s (let [a (or (first args) "")]
-                 (push! (format-str fmt-spec a))
+                 (push! (format-str spec a))
                  (recur (inc j) (rest args)))
             \c (let [a (or (first args) "")]
                  (push! (if (empty? a) "" (subs a 0 1)))
@@ -476,15 +533,13 @@
                  (push! (decode-escape a))
                  (recur (inc j) (rest args)))
             \q (let [a (or (first args) "")]
-                 ;; minimal shell-quote: single-quote, escaping embedded '
                  (push! (str "'" (str/replace a "'" "'\\''") "'"))
                  (recur (inc j) (rest args)))
             (\d \i \u \o \x \X)
             (let [a (or (first args) "0")
-                  num (parse-int-or a)]
-              (push! (format-int fmt-spec num))
+                  num (parse-printf-int a)]
+              (push! (format-int spec num))
               (recur (inc j) (rest args)))
-            ;; Unknown conv
             [(apply str @out) args (str "invalid format char: " conv)]))))))
 
 (defn- parse-name=value
@@ -926,15 +981,25 @@
    command, naked assignments mutate env permanently."
   [env call opts]
   (let [;; Expand args first (env may mutate from $X cmd-subst etc.)
-        [env1 fields] (expand-words env (:args call) opts)]
+        [env1 fields] (expand-words env (:args call) opts)
+        ;; bash quirk: `$(echo)` expands to "" and the whole call has
+        ;; an empty command name. Bash treats this as a no-op exit 0
+        ;; (no command lookup, no spawn) — match that.
+        fields (if (and (= 1 (count fields)) (= "" (first fields)))
+                 []
+                 fields)]
     (cond
       ;; Naked assignments: `FOO=bar BAZ=qux` (no cmd) — permanent.
+      ;; `FOO+=bar` appends to the existing value.
       (empty? fields)
       (let [env'
             (reduce
              (fn [env as]
-               (let [[env' val] (expand-assign env (:value as) opts)]
-                 (env/set-var env' (:name as) val)))
+               (let [[env' val] (expand-assign env (:value as) opts)
+                     final     (if (:append? as)
+                                 (str (env/get-var env' (:name as)) val)
+                                 val)]
+                 (env/set-var env' (:name as) final)))
              env1 (:assigns call))]
         (env/record-exit env' 0))
 
@@ -942,11 +1007,15 @@
       (let [name (first fields)
             args (rest fields)
             ;; Per-command env from assignments (visible to external
-            ;; cmd only, not persisted in env).
+            ;; cmd only, not persisted in env). `+=` also appends here,
+            ;; reading from the caller's env (not from previous extras).
             extra-env
             (reduce (fn [m as]
-                      (let [[_ val] (expand-assign env1 (:value as) opts)]
-                        (assoc m (:name as) val)))
+                      (let [[_ val] (expand-assign env1 (:value as) opts)
+                            final   (if (:append? as)
+                                      (str (env/get-var env1 (:name as)) val)
+                                      val)]
+                        (assoc m (:name as) final)))
                     {}
                     (:assigns call))
             ;; Function lookup

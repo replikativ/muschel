@@ -452,13 +452,36 @@
                                  [(subs body 0 slash) (subs body (inc slash))])]
               {:op :replace :name name :pat-src pat :repl-src repl})
             (str/starts-with? rest ":")
+            ;; ${var:OFFSET[:LENGTH]} substring. bash quirk: a negative
+            ;; offset must be written with a leading space (`${a: -1}`)
+            ;; to avoid colliding with the `${var:-default}` syntax —
+            ;; we trim here so " -1" parses as -1.
             (let [body (subs rest 1)
                   cc (.indexOf body ":")]
               (if (neg? cc)
-                {:op :substring :name name :offset (parse-int* body) :length nil}
                 {:op :substring :name name
-                 :offset (parse-int* (subs body 0 cc))
-                 :length (parse-int* (subs body (inc cc)))}))
+                 :offset (parse-int* (str/trim body)) :length nil}
+                {:op :substring :name name
+                 :offset (parse-int* (str/trim (subs body 0 cc)))
+                 :length (parse-int* (str/trim (subs body (inc cc))))}))
+
+            ;; ${var^^[pat]} / ${var^[pat]} — uppercase all / first
+            ;; ${var,,[pat]} / ${var,[pat]} — lowercase all / first
+            ;; pat is currently ignored (always applies to all chars).
+            (str/starts-with? rest "^^") {:op :upcase-all   :name name}
+            (str/starts-with? rest "^")  {:op :upcase-first :name name}
+            (str/starts-with? rest ",,") {:op :downcase-all  :name name}
+            (str/starts-with? rest ",")  {:op :downcase-first :name name}
+
+            ;; ${var@OP} — transform operators.
+            ;;   @U upper-case      @u upper-first    @L lower-case
+            ;;   @Q shell-quote     @E expand escapes
+            (str/starts-with? rest "@U") {:op :upcase-all    :name name}
+            (str/starts-with? rest "@u") {:op :upcase-first  :name name}
+            (str/starts-with? rest "@L") {:op :downcase-all  :name name}
+            (str/starts-with? rest "@Q") {:op :shell-quote   :name name}
+            (str/starts-with? rest "@E") {:op :expand-esc    :name name}
+
             :else
             ;; Unknown form — return as plain to be lenient
             {:op :plain :name name}))))))
@@ -520,11 +543,28 @@
       :replace-all  [env (replace-glob v (or (word-of (:pat-src opts)) "")
                                        (or (word-of (:repl-src opts)) "") true)]
 
+      :upcase-all    [env (str/upper-case v)]
+      :upcase-first  [env (if (empty? v) v (str (str/upper-case (subs v 0 1)) (subs v 1)))]
+      :downcase-all  [env (str/lower-case v)]
+      :downcase-first [env (if (empty? v) v (str (str/lower-case (subs v 0 1)) (subs v 1)))]
+      :shell-quote   [env (str "'" (str/replace v "'" "'\\''") "'")]
+      :expand-esc    [env (decode-ansi-c v)]
+
       :substring    (let [{:keys [offset length]} opts
-                          off (max 0 (min offset (count v)))
-                          end (if (nil? length)
-                                (count v)
-                                (max off (min (+ off length) (count v))))]
+                          n   (count v)
+                          ;; bash: negative offset = from end (requires a
+                          ;; leading space, ${a: -1}, which the lexer
+                          ;; preserves verbatim in the operand).
+                          off (cond
+                                (nil? offset) 0
+                                (neg? offset) (max 0 (+ n offset))
+                                :else         (min offset n))
+                          ;; bash: negative length = absolute position
+                          ;; from end (not relative to offset).
+                          end (cond
+                                (nil? length) n
+                                (neg? length) (max off (+ n length))
+                                :else         (max off (min (+ off length) n)))]
                       [env (subs v off end)]))))
 
 ;; ============================================================================
@@ -594,16 +634,73 @@
       [env' [{:s v :quoted? false}]])
 
     :dquoted
-    ;; Inside "...", expand sub-parts but mark all output as :quoted? true.
-    (let [[env' frags]
-          (reduce (fn [[env acc] sub]
-                    (let [[env' fs] (expand-part env sub opts)]
-                      [env' (into acc (mapv #(assoc % :quoted? true) fs))]))
-                  [env []]
-                  (:parts part))]
-      ;; Concatenate adjacent fragments inside a dquoted (no field
-      ;; splitting between them — the dquoted itself is one field).
-      [env' [{:s (apply str (map :s frags)) :quoted? true}]])
+    ;; Inside "...", expand sub-parts but mark all output as :quoted?
+    ;; true. Adjacent fragments concatenate (no field splitting).
+    ;;
+    ;; Special case: `"$@"` (or `"prefix$@suffix"`) preserves the
+    ;; positional split — `"$@"` with N positionals produces N fields,
+    ;; not one. The first field glues to anything before $@ in the
+    ;; same dquoted, the last to anything after. Zero positionals
+    ;; produce zero fields (which is what makes `count "$@"` work
+    ;; when $# is 0).
+    (let [parts (:parts part)
+          dollar-at? (fn [p]
+                       (and (= :var-ref (:type p))
+                            (= "@" (:name p))
+                            (not (:braced p))))]
+      (if-let [at-idx (some (fn [[i p]] (when (dollar-at? p) i))
+                            (map-indexed vector parts))]
+        (let [before (subvec (vec parts) 0 at-idx)
+              after  (subvec (vec parts) (inc at-idx))
+              expand-side (fn [env subs]
+                            (reduce (fn [[env acc] sub]
+                                      (let [[env' fs] (expand-part env sub opts)]
+                                        [env' (str acc (apply str (map :s fs)))]))
+                                    [env ""]
+                                    subs))
+              [env1 pre-str] (expand-side env before)
+              [env2 post-str] (expand-side env1 after)
+              pos (vec (:pos-args env2))]
+          (cond
+            ;; Zero positionals → zero fields if there's also no
+            ;; surrounding text (i.e. just "$@"). With surrounding
+            ;; text the empty $@ collapses and pre+post fuse to one
+            ;; field.
+            (and (empty? pos) (= "" pre-str) (= "" post-str))
+            [env2 []]
+
+            (empty? pos)
+            [env2 [{:s (str pre-str post-str) :quoted? true}]]
+
+            (= 1 (count pos))
+            [env2 [{:s (str pre-str (first pos) post-str) :quoted? true}]]
+
+            :else
+            ;; Emit positionals as quoted fields with UNQUOTED IFS
+            ;; separators between them. field-split sees the IFS frags
+            ;; and breaks; expand-assign-value joins all :s values to
+            ;; get the bash-correct "a b c" assignment semantics.
+            (let [ifs (:ifs env2)
+                  sep (if (seq ifs) (str (.charAt ifs 0)) " ")
+                  middle (mapcat (fn [p] [{:s sep :quoted? false}
+                                          {:s p :quoted? true}])
+                                 (rest pos))]
+              [env2 (into [{:s (str pre-str (first pos)) :quoted? true}]
+                          (concat (butlast middle)
+                                  ;; The last entry of `middle` was the
+                                  ;; last positional itself — splice in
+                                  ;; the suffix (post-str) onto it.
+                                  [(let [last-frag (last middle)]
+                                     (assoc last-frag :s
+                                            (str (:s last-frag) post-str)))]))])))
+        ;; Normal case — no $@ in this dquoted.
+        (let [[env' frags]
+              (reduce (fn [[env acc] sub]
+                        (let [[env' fs] (expand-part env sub opts)]
+                          [env' (into acc (mapv #(assoc % :quoted? true) fs))]))
+                      [env []]
+                      parts)]
+          [env' [{:s (apply str (map :s frags)) :quoted? true}]])))
 
     :brace-exp
     ;; brace-exp should have been expanded out before reaching here.
@@ -637,9 +734,14 @@
 ;; ============================================================================
 
 (defn- split-on-ifs
-  "Split `s` on any character in `ifs`. Multiple adjacent IFS chars are
-   collapsed when they are whitespace IFS chars. Empty `ifs` disables
-   splitting (POSIX)."
+  "Split `s` on any character in `ifs`. Multiple adjacent whitespace
+   IFS chars collapse to one separator. Empty `ifs` disables splitting.
+
+   Emits empty-string SENTINELS for leading/trailing IFS so callers can
+   distinguish `\"b c\"` (no leading sep → first field glues to prev)
+   from `\" b c\"` (leading sep → break before `b`). This matters for
+   field-splitting an unquoted `${a}` inside `foo${a}bar` when `a` has
+   surrounding spaces."
   [^String s ^String ifs]
   (cond
     (= "" ifs) [s]
@@ -650,10 +752,12 @@
           n (count s)
           out (volatile! [])
           cur (volatile! [])
+          ;; flush! always pushes (even when cur is empty) so we record
+          ;; sentinel boundaries; the caller decides what to do with
+          ;; empty fields. Initial leading-sep emits an empty piece.
           flush! (fn []
-                   (when (seq @cur)
-                     (vswap! out conj (apply str @cur))
-                     (vreset! cur [])))]
+                   (vswap! out conj (apply str @cur))
+                   (vreset! cur []))]
       (loop [i 0]
         (if (>= i n)
           (do (flush!) @out)
@@ -673,29 +777,66 @@
 (defn- field-split
   "Apply word splitting to a fragment list. Quoted fragments are
    joined to adjacent unquoted ones; only unquoted fragments are
-   split. Portable — uses a vec accumulator."
+   split. A `:break? true` frag forces a field boundary BEFORE it —
+   used to preserve the positional split of `\"$@\"` even though all
+   fragments are quoted.
+
+   `split-on-ifs` emits empty-string sentinels for leading/trailing
+   IFS in the source; here we treat them as flush-markers (start /
+   end a field instead of gluing)."
   [frags ifs]
   (when (seq frags)
     (let [out (volatile! [])
           cur (volatile! [])
-          push! (fn []
-                  (when (seq @cur)
-                    (vswap! out conj (apply str @cur))
-                    (vreset! cur [])))]
-      (doseq [{:keys [s quoted?]} frags]
-        (if (or quoted? (empty? s))
-          (vswap! cur conj s)
-          (let [pieces (split-on-ifs s ifs)]
+          ;; Tracks whether the current `cur` is the start of a
+          ;; meaningful field — flush! only emits if so. Prevents
+          ;; spurious empty fields between two flushes in a row.
+          live? (volatile! false)
+          flush! (fn []
+                   (when @live?
+                     (vswap! out conj (apply str @cur))
+                     (vreset! cur [])
+                     (vreset! live? false)))
+          add!   (fn [s] (vswap! cur conj s) (vreset! live? true))]
+      (doseq [{:keys [s quoted? break?]} frags]
+        (when break? (flush!) (vreset! live? true))
+        (cond
+          quoted?
+          (add! s)
+
+          (empty? s)
+          nil
+
+          :else
+          (let [pieces (split-on-ifs s ifs)
+                pc (count pieces)]
             (cond
-              (empty? pieces) nil
-              (= 1 (count pieces)) (vswap! cur conj (first pieces))
+              (zero? pc) nil
+
+              (= 1 pc)
+              (add! (first pieces))
+
               :else
-              (do (vswap! cur conj (first pieces))
-                  (push!)
-                  (doseq [p (butlast (rest pieces))]
-                    (vswap! out conj p))
-                  (vswap! cur conj (last pieces)))))))
-      (push!)
+              (do
+                ;; First piece: empty ⇒ flush (leading IFS in s),
+                ;; non-empty ⇒ glue to current cur.
+                (if (empty? (first pieces))
+                  (flush!)
+                  (add! (first pieces)))
+                ;; Boundary between first and rest forces a flush.
+                (flush!)
+                ;; Middle pieces are each their own field.
+                (doseq [p (butlast (rest pieces))]
+                  (add! p)
+                  (flush!))
+                ;; Last piece: empty ⇒ trailing IFS, keep cur empty so
+                ;; the next frag DOESN'T glue. Non-empty ⇒ start cur
+                ;; with it so a following frag CAN glue.
+                (let [lp (last pieces)]
+                  (if (empty? lp)
+                    nil
+                    (add! lp))))))))
+      (flush!)
       @out)))
 
 (defn- glob-expand
