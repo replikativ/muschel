@@ -60,6 +60,20 @@
          jobs-atom (s/with-context ctx (s/atom []))]
      (->SpindelSession ctx env-atom jobs-atom))))
 
+(defn spindel-session-using
+  "Build a SpindelSession on an EXISTING spindel execution context.
+
+   Useful when the caller already has a ctx whose fork lineage the
+   session should join — e.g. dvergr's chat-ctx fork inherits the
+   bash session for free when the chat-ctx is forked. With
+   `spindel-session` the session sits on its own root ctx and does
+   not branch alongside other ctx-scoped state."
+  ([ctx] (spindel-session-using ctx (env/new-env)))
+  ([ctx initial-env]
+   (let [env-atom (s/with-context ctx (s/atom initial-env))
+         jobs-atom (s/with-context ctx (s/atom []))]
+     (->SpindelSession ctx env-atom jobs-atom))))
+
 (defn stop-session!
   "Tear down the underlying spindel context, freeing background
    threads. Call when done with a session."
