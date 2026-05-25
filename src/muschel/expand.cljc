@@ -228,36 +228,51 @@
                 :list (split-brace-list raw))]
     seeds))
 
+(defn- alternate->parts
+  "Convert a brace-alternate STRING back to parts. If the alternate
+   contains `{...}`, re-lex it so the nested brace becomes a
+   `:brace-exp` part and gets expanded in the next iteration."
+  [alt]
+  (if (and (string? alt) (re-find #"\{" alt))
+    (let [tokens (lex/tokenize alt)
+          word-toks (filter #(= :word (:type %)) tokens)]
+      (if (= 1 (count word-toks))
+        (vec (:parts (first word-toks)))
+        ;; Multiple tokens? Use a sentinel literal — uncommon.
+        [{:type :lit :value alt}]))
+    [{:type :lit :value alt}]))
+
 (defn- brace-expand-word
   "Expand any `:brace-exp` parts in `word`. Returns a vector of
-   words (each with parts unchanged except brace-exps replaced by
-   :lit alternates).
-
-   `pre{a,b}suf` → two words: prea, preb. Brace expansion happens at
-   the word level (not the part level) and produces multiple words."
+   words. Nested braces in alternates are re-lexed and expanded in
+   subsequent iterations of the loop."
   [word]
-  (loop [acc [word]
-         done? false]
-    (if done?
-      acc
-      (let [next (mapcat
-                  (fn [w]
-                    (let [parts (:parts w)
-                          i (some (fn [[idx p]]
-                                    (when (= :brace-exp (:type p)) idx))
-                                  (map-indexed vector parts))]
-                      (if (nil? i)
-                        [w]
-                        (let [bp (nth parts i)
-                              alts (expand-brace-alternates bp)]
-                          (mapv (fn [alt]
-                                  (assoc w :parts
-                                         (-> (vec parts)
-                                             (assoc i {:type :lit :value alt}))))
-                                alts)))))
-                  acc)
-            still-brace? (some (fn [w] (some #(= :brace-exp (:type %)) (:parts w))) next)]
-        (recur (vec next) (not still-brace?))))))
+  (loop [acc [word]]
+    (let [next
+          (mapcat
+           (fn [w]
+             (let [parts (:parts w)
+                   i (some (fn [[idx p]]
+                             (when (= :brace-exp (:type p)) idx))
+                           (map-indexed vector parts))]
+               (if (nil? i)
+                 [w]
+                 (let [bp (nth parts i)
+                       alts (expand-brace-alternates bp)
+                       pre (vec (take i parts))
+                       post (vec (drop (inc i) parts))]
+                   (mapv (fn [alt]
+                           (assoc w :parts
+                                  (into [] (concat pre
+                                                   (alternate->parts alt)
+                                                   post))))
+                         alts)))))
+           acc)
+          still-brace? (some (fn [w] (some #(= :brace-exp (:type %)) (:parts w)))
+                             next)]
+      (if still-brace?
+        (recur (vec next))
+        (vec next)))))
 
 ;; ============================================================================
 ;; Tilde expansion (pass 2)
@@ -367,10 +382,12 @@
           (case c
             \* (recur (inc i) (conj acc ".*"))
             \? (recur (inc i) (conj acc "."))
-            \[ (let [;; Where to start looking for closing `]`. bash
-                     ;; quirk: a `]` as the FIRST char of the class
-                     ;; body is literal — skip it. Same for `!]` / `^]`.
-                     search-from
+            \[ (let [;; Scan from past the outer `[` looking for the
+                     ;; closing `]`. Special cases:
+                     ;; - leading `]` (or `!]`/`^]`) is literal, skip
+                     ;; - inner `[:class:]` POSIX class is one unit
+                     ;;   (its `]` doesn't close the outer class)
+                     scan-start
                      (cond
                        (>= (inc i) n) (inc i)
                        (= \] (.charAt pat (inc i))) (+ i 2)
@@ -378,12 +395,8 @@
                             (< (+ i 2) n)
                             (= \] (.charAt pat (+ i 2))))
                        (+ i 3)
-                       :else (+ i 2))
-                     ;; Skip over `[:class:]` POSIX classes when
-                     ;; finding the closing `]` so `[[:digit:]]`
-                     ;; matches the OUTER ] at position 10, not the
-                     ;; inner `]` of `[:digit:]` at position 9.
-                     end (loop [k search-from]
+                       :else (inc i))
+                     end (loop [k scan-start]
                            (cond
                              (>= k n) -1
                              (and (= \[ (.charAt pat k))
@@ -684,16 +697,14 @@
                        (and (:exported? meta) (:readonly? meta)) "declare -rx"
                        (:exported? meta) "declare -x"
                        (:readonly? meta) "declare -r"
-                       :else "declare --")
-                ;; bash @A omits quotes when the value has no special
-                ;; chars (alnum + a few). We quote conservatively when
-                ;; the value contains whitespace, quotes, or shell
-                ;; metacharacters.
+                       :else nil)            ; no attrs → no prefix
                 needs-quote? (boolean (re-find #"[\s'\"\\$`]" v))
                 rendered (if needs-quote?
                            (str "\"" (str/replace v "\"" "\\\"") "\"")
                            v)]
-            [env (str decl " " name "=" rendered)])))
+            [env (if decl
+                   (str decl " " name "=" rendered)
+                   (str name "=" rendered))])))
 
       :substring
       ;; bash quirk: when name is `@` or `*`, this slices the

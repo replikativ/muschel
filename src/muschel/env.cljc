@@ -79,9 +79,12 @@
   [& {:keys [cwd pos-args script]
       :or {pos-args [] script "bash"}}]
   (let [host (host-env-map)
+        cwd' (or cwd (get host "PWD") (host-cwd))
+        ;; Sync PWD in the var table to the resolved cwd so `$PWD`
+        ;; and `pwd` agree (bash invariant).
+        host (assoc host "PWD" cwd')
         vars (into {} (for [[k v] host]
-                        [k {:value v :exported? true :readonly? false}]))
-        cwd' (or cwd (get host "PWD") (host-cwd))]
+                        [k {:value v :exported? true :readonly? false}]))]
     {:vars       vars
      :cwd        cwd'
      :prev-cwd   cwd'

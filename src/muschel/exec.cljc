@@ -361,8 +361,19 @@
           args))
 
 (defn- builtin-unset
+  "`unset [-f] [-v] NAME ...` — remove variables (-v, default) or
+   functions (-f)."
   [env args _opts]
-  (env/record-exit (reduce env/unset-var env args) 0))
+  (let [[flags names] (split-with #(str/starts-with? % "-") args)
+        flag-str (apply str (map #(subs % 1) flags))
+        fn?  (str/includes? flag-str "f")]
+    (env/record-exit
+     (reduce (fn [e n]
+               (if fn?
+                 (update e :funcs dissoc n)
+                 (env/unset-var e n)))
+             env names)
+     0)))
 
 (def ^:private set-short-flags #{\e \u \x \f \n \a \v \m \E \B \H \C \P \T})
 (def ^:private set-long-options
@@ -784,11 +795,13 @@
             (let [src (host/read-file h resolved)
                   ast (parse/parse src)
                   old-args (:pos-args env)
-                  env' (if (seq call-args)
-                         (env/with-pos-args env (vec call-args))
-                         env)
+                  ;; Mark sourcing so `return` is permitted inside.
+                  env' (cond-> (assoc env :sourcing? true)
+                         (seq call-args) (env/with-pos-args (vec call-args)))
                   env'' (exec-stmts env' (:stmts ast) opts)
-                  env''' (dissoc env'' :returning?)]
+                  env''' (-> env''
+                             (dissoc :returning?)
+                             (dissoc :sourcing?))]
               (if (seq call-args)
                 (assoc env''' :pos-args old-args)
                 env'''))
@@ -881,7 +894,7 @@
                              (vreset! any-bad? true))))))
       (env/record-exit env (if @any-bad? 1 0)))))
 
-(declare run-argv run-external)
+(declare run-argv run-external builtins)
 
 (defn- builtin-command
   "`command [-v|-V] [-p] NAME [arg ...]` — run NAME, bypassing function
@@ -1021,6 +1034,218 @@
             env' (assoc env' :dir-stack (vec (rest stack)))]
         (print-dir-stack env' opts)
         (env/record-exit env' 0)))))
+
+(defn- builtin-getopts
+  "POSIX `getopts OPTSTRING VARNAME [args...]` — parse one option per
+   invocation. Reads/writes `OPTIND` (1-based arg index) and `OPTARG`.
+   Returns 0 while options remain, 1 at end, 2 on bad usage.
+
+   With a leading `:` in OPTSTRING, errors are silent and we emit
+   `?`/`:` in VARNAME instead of stderr messages."
+  [env args opts]
+  (cond
+    (empty? args)
+    (do (write-line opts :err "getopts: usage: getopts optstring name [arg ...]\n")
+        (env/record-exit env 2))
+
+    (< (count args) 2)
+    (do (write-line opts :err
+                    (str "getopts: usage: getopts optstring name [arg ...]\n"))
+        (env/record-exit env 2))
+
+    (not (re-matches #"[A-Za-z_][A-Za-z_0-9]*" (second args)))
+    (do (write-line opts :err
+                    (str "getopts: invalid identifier: \""
+                         (second args) "\"\n"))
+        (env/record-exit env 2))
+
+    :else
+    (let [optstring (first args)
+          varname (second args)
+          silent? (str/starts-with? optstring ":")
+          opt-args (if (> (count args) 2)
+                     (vec (drop 2 args))
+                     (vec (:pos-args env)))
+          ;; OPTIND: 1-based index into opt-args.
+          optind-str (or (env/get-var env "OPTIND") "1")
+          optind (try (parse-int* optind-str)
+                      (catch #?(:clj Exception :cljs :default) _ 1))
+          ;; :getopts-pos: 1-based char position within the current arg
+          ;; (skipping the leading `-`). Reset on each OPTIND advance.
+          inner-pos (or (:getopts-pos env) 1)
+          ;; Bash quirk: setting OPTIND from outside resets inner state.
+          inner-pos (if (and (some? (:getopts-prev-optind env))
+                             (not= optind (:getopts-prev-optind env)))
+                      1
+                      inner-pos)]
+      (cond
+        ;; OPTIND past the end → done.
+        (> optind (count opt-args))
+        (-> env
+            (env/set-var varname "?")
+            (env/record-exit 1))
+
+        :else
+        (let [cur (nth opt-args (dec optind) "")
+              ;; Not an option arg → done.
+              not-option? (or (= "" cur)
+                              (not (str/starts-with? cur "-"))
+                              (= "-" cur))]
+          (cond
+            not-option?
+            (-> env
+                (env/set-var varname "?")
+                (env/record-exit 1))
+
+            ;; `--` marks end of options.
+            (= "--" cur)
+            (-> env
+                (env/set-var "OPTIND" (str (inc optind)))
+                (env/set-var varname "?")
+                (env/record-exit 1))
+
+            :else
+            (let [flag-char (.charAt ^String cur inner-pos)
+                  flag-str (str flag-char)
+                  ix (.indexOf ^String optstring flag-str)
+                  takes-arg? (and (>= ix 0)
+                                  (< (inc ix) (count optstring))
+                                  (= \: (.charAt ^String optstring (inc ix))))
+                  more-in-arg? (< (inc inner-pos) (count cur))]
+              (cond
+                ;; Unknown option.
+                (neg? ix)
+                (let [env' (if silent?
+                             (-> env (env/set-var "OPTARG" flag-str))
+                             (do (write-line opts :err
+                                             (str "getopts: illegal option -- \""
+                                                  flag-str "\"\n"))
+                                 (env/set-var env "OPTARG" "")))
+                      ;; Advance: next char or next arg.
+                      [next-optind next-inner]
+                      (if more-in-arg?
+                        [optind (inc inner-pos)]
+                        [(inc optind) 1])]
+                  (-> env'
+                      (env/set-var varname "?")
+                      (env/set-var "OPTIND" (str next-optind))
+                      (assoc :getopts-pos next-inner
+                             :getopts-prev-optind next-optind)
+                      (env/record-exit 0)))
+
+                ;; Option takes an arg.
+                takes-arg?
+                (let [;; Arg is either the rest of cur OR the next arg.
+                      [arg-val next-optind]
+                      (cond
+                        more-in-arg?
+                        [(subs cur (inc inner-pos)) (inc optind)]
+                        (< (inc optind) (inc (count opt-args)))
+                        ;; arg is next opt-arg
+                        (if (>= optind (count opt-args))
+                          [nil (inc optind)]
+                          [(nth opt-args optind "") (+ optind 2)])
+                        :else
+                        [nil (inc optind)])]
+                  (cond
+                    (nil? arg-val)
+                    (let [env' (if silent?
+                                 (-> env
+                                     (env/set-var "OPTARG" flag-str)
+                                     (env/set-var varname ":"))
+                                 (do (write-line opts :err
+                                                 (str "getopts: option requires an argument -- \""
+                                                      flag-str "\"\n"))
+                                     (-> env
+                                         (env/set-var "OPTARG" "")
+                                         (env/set-var varname "?"))))]
+                      (-> env'
+                          (env/set-var "OPTIND" (str next-optind))
+                          (assoc :getopts-pos 1
+                                 :getopts-prev-optind next-optind)
+                          (env/record-exit 0)))
+
+                    :else
+                    (-> env
+                        (env/set-var varname flag-str)
+                        (env/set-var "OPTARG" arg-val)
+                        (env/set-var "OPTIND" (str next-optind))
+                        (assoc :getopts-pos 1
+                               :getopts-prev-optind next-optind)
+                        (env/record-exit 0))))
+
+                ;; Plain boolean option — advance within arg or to next.
+                :else
+                (let [[next-optind next-inner]
+                      (if more-in-arg?
+                        [optind (inc inner-pos)]
+                        [(inc optind) 1])]
+                  (-> env
+                      (env/set-var varname flag-str)
+                      (env/set-var "OPTARG" "")
+                      (env/set-var "OPTIND" (str next-optind))
+                      (assoc :getopts-pos next-inner
+                             :getopts-prev-optind next-optind)
+                      (env/record-exit 0)))))))))))
+
+(defn- builtin-hash
+  "Bash `hash` builtin — we don't track command-lookup cache, so it's
+   a no-op exit 0."
+  [env _args _opts]
+  (env/record-exit env 0))
+
+(defn- builtin-exec
+  "Bash `exec [cmd args...]` — replace shell process. We approximate:
+   without args, just apply any redirects (currently handled by
+   stmt-redirs already) and exit 0. With args, just run the command.
+   (Full exec semantics need OS-level process replacement which we
+   can't really model.)"
+  [env args opts]
+  (cond
+    (empty? args) (env/record-exit env 0)
+    :else (run-argv env (vec args) opts)))
+
+(defn- builtin-alias
+  "Bash `alias [-p] [NAME[=VALUE] ...]` — we don't expand aliases in
+   the parser, but we track the table so `alias foo` queries work."
+  [env args opts]
+  (let [aliases (or (:aliases env) {})]
+    (cond
+      ;; No args (or only -p): print all aliases.
+      (or (empty? args) (every? #(= "-p" %) args))
+      (do (doseq [[k v] (sort aliases)]
+            (write-line opts :out (str "alias " k "='" v "'\n")))
+          (env/record-exit env 0))
+
+      :else
+      (let [{:keys [env' err?]}
+            (reduce (fn [{:keys [env' err? aliases]} arg]
+                      (if (str/includes? arg "=")
+                        (let [i (.indexOf ^String arg "=")
+                              name (subs arg 0 i)
+                              value (subs arg (inc i))]
+                          {:env' (assoc env' :aliases (assoc aliases name value))
+                           :err? err?
+                           :aliases (assoc aliases name value)})
+                        ;; Query
+                        (if-let [v (get aliases arg)]
+                          (do (write-line opts :out (str "alias " arg "='" v "'\n"))
+                              {:env' env' :err? err? :aliases aliases})
+                          (do (write-line opts :err (str "alias: \"" arg "\" not found\n"))
+                              {:env' env' :err? true :aliases aliases}))))
+                    {:env' env :err? false :aliases aliases}
+                    args)]
+        (env/record-exit env' (if err? 1 0))))))
+
+(defn- builtin-builtin
+  "Bash `builtin NAME args...` — run NAME as a builtin, bypassing
+   functions and external lookup."
+  [env args opts]
+  (cond
+    (empty? args) (env/record-exit env 0)
+    (contains? builtins (first args))
+    ((get builtins (first args)) env (vec (rest args)) opts)
+    :else (env/record-exit env 1)))
 
 (defn- builtin-dirs
   "POSIX/bash `dirs [-c]` — print the dir stack."
@@ -1398,6 +1623,11 @@
    "pushd"    builtin-pushd
    "popd"     builtin-popd
    "dirs"     builtin-dirs
+   "getopts"  builtin-getopts
+   "hash"     builtin-hash
+   "exec"     builtin-exec
+   "alias"    builtin-alias
+   "builtin"  builtin-builtin
    "local"    builtin-local
    "declare"  builtin-declare
    "typeset"  builtin-declare
