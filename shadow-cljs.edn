@@ -1,0 +1,49 @@
+{:source-paths ["src" "test"]
+
+ :dependencies [[org.clojure/clojurescript "1.11.132"]]
+
+ ;; Top-level dev-http: {port → roots}. Serves the static HTML from
+ ;; `docs/playground/` AND the freshly-built bundle from
+ ;; `dist/playground/`. Open http://localhost:8888/index.html after
+ ;; `npm run watch:playground`.
+ :dev-http {8888 ["docs/playground" "dist/playground"]}
+
+ :builds
+ {:node-tests
+  {:target    :node-test
+   :output-to "out/node-tests.js"
+   :ns-regexp ".*-test"
+   :compiler-options {:infer-externs true}}
+
+  ;; CI build — matches what the replikativ/clj-tools orb expects.
+  ;; Same content as :node-tests, different output path so caching
+  ;; for the CI job stays separate.
+  :ci
+  {:target    :node-test
+   :output-to "out/ci-tests.js"
+   :ns-regexp ".*-test"
+   :compiler-options {:infer-externs true}}
+
+  :playground
+  {:target     :browser
+   :output-dir "dist/playground"
+   :modules    {:playground {:entries [muschel.playground]
+                             :init-fn muschel.playground/start}}
+   :compiler-options {:infer-externs true}}
+
+  ;; npm module — usable from plain JS / TypeScript.
+  ;; Shipped via root package.json's "files" field.
+  :npm
+  {:target    :node-library
+   :output-to "dist/muschel.js"
+   :exports   {:parse        muschel.js-api/parse
+               :check        muschel.js-api/check
+               :nodeHost     muschel.js-api/nodeHost
+               :browserHost  muschel.js-api/browserHost
+               :stockTools   muschel.js-api/stockTools
+               :session      muschel.js-api/session
+               :run          muschel.js-api/run
+               :setVar       muschel.js-api/setVar
+               :getVar       muschel.js-api/getVar
+               :cwd          muschel.js-api/cwd}
+   :compiler-options {:infer-externs true}}}}

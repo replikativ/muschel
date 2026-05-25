@@ -1,0 +1,158 @@
+;; muschel default permit ruleset
+;;
+;; Loaded by `muschel.permit/default-rules`. Edit this file (or supply
+;; your own ruleset) to extend the baseline.
+;;
+;; Rules are evaluated in ORDER; the LAST match wins. So later rules in
+;; this file (and rules in user/session rulesets passed AFTER this one
+;; to `check`) override earlier ones for the same command.
+;;
+;; Three tiers:
+;;   1. Auto-allow:  read-only commands safe to run without prompting.
+;;   2. Auto-deny:   destructive commands that should never auto-run.
+;;   3. Implicit:    no rule → `:ask` (default in `check`).
+;;
+;; Sources cross-referenced with codex's is_safe_command.rs and
+;; is_dangerous_command.rs (BSD-3) and Claude Code's documented
+;; read-only set.
+
+[;; -----------------------------------------------------------------------
+ ;; AUTO-ALLOW — read-only / informational
+ ;; -----------------------------------------------------------------------
+
+ ;; File inspection
+ {:tool :bash :pattern {:kind :cmd-name :name "cat"}     :action :allow :origin :default :reason "read file"}
+ {:tool :bash :pattern {:kind :cmd-name :name "head"}    :action :allow :origin :default :reason "read file head"}
+ {:tool :bash :pattern {:kind :cmd-name :name "tail"}    :action :allow :origin :default :reason "read file tail"}
+ {:tool :bash :pattern {:kind :cmd-name :name "less"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "more"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "wc"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "stat"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "file"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "du"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "df"}      :action :allow :origin :default}
+
+ ;; Directory listing / navigation
+ {:tool :bash :pattern {:kind :cmd-name :name "ls"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "tree"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "pwd"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "cd"}      :action :allow :origin :default :reason "builtin: env-only"}
+ {:tool :bash :pattern {:kind :cmd-name :name "realpath"} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "readlink"} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "basename"} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "dirname"}  :action :allow :origin :default}
+
+ ;; Searching
+ {:tool :bash :pattern {:kind :cmd-name :name "grep"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "rg"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "ag"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "ack"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "fd"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "which"}   :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "type"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "whereis"} :action :allow :origin :default}
+
+ ;; Text manipulation (output-only)
+ {:tool :bash :pattern {:kind :cmd-name :name "echo"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "printf"}  :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "cut"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "paste"}   :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "tr"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "sort"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "uniq"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "seq"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "nl"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "rev"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "tac"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "diff"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "cmp"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "comm"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "jq"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "yq"}      :action :allow :origin :default}
+
+ ;; System info / introspection
+ {:tool :bash :pattern {:kind :cmd-name :name "whoami"}  :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "id"}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "uname"}   :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "hostname"} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "date"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "uptime"}  :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "free"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "lscpu"}   :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "env"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "printenv"} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "ps"}      :action :allow :origin :default}
+
+ ;; muschel builtins (always safe — they operate on the env value only)
+ {:tool :bash :pattern {:kind :cmd-name :name "true"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "false"}   :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name ":"}       :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "test"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "["}       :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "[["}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "let"}     :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "shift"}   :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "jobs"}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "wait"}    :action :allow :origin :default}
+
+ ;; Read-only git (mirrors codex's allowlist)
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "status"]}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "log"]}       :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "diff"]}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "show"]}      :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "branch"]}    :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "describe"]}  :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "rev-parse"]} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "ls-files"]}  :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "ls-tree"]}   :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "remote" "-v"]} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "config" "--get"]} :action :allow :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["git" "config" "--list"]} :action :allow :origin :default}
+
+ ;; -----------------------------------------------------------------------
+ ;; AUTO-DENY — destructive
+ ;; -----------------------------------------------------------------------
+
+ ;; Privilege escalation (always deny — even with allowed inner cmd)
+ {:tool :bash :pattern {:kind :cmd-name :name "sudo"}    :action :deny :origin :default :reason "privilege escalation"}
+ {:tool :bash :pattern {:kind :cmd-name :name "su"}      :action :deny :origin :default :reason "privilege escalation"}
+ {:tool :bash :pattern {:kind :cmd-name :name "pkexec"}  :action :deny :origin :default :reason "privilege escalation"}
+ {:tool :bash :pattern {:kind :cmd-name :name "doas"}    :action :deny :origin :default :reason "privilege escalation"}
+
+ ;; Code-as-data execution (refuse, even though parser accepts)
+ {:tool :bash :pattern {:kind :cmd-name :name "eval"}    :action :deny :origin :default :reason "evaluates arbitrary string"}
+ {:tool :bash :pattern {:kind :cmd-name :name "source"}  :action :deny :origin :default :reason "reads + runs a file"}
+ {:tool :bash :pattern {:kind :cmd-name :name "."}       :action :deny :origin :default :reason "reads + runs a file"}
+ {:tool :bash :pattern {:kind :cmd-name :name "exec"}    :action :deny :origin :default :reason "replaces shell"}
+
+ ;; Disk-level destructive
+ {:tool :bash :pattern {:kind :cmd-name :name "dd"}      :action :deny :origin :default :reason "block-level write"}
+ {:tool :bash :pattern {:kind :cmd-name :name "fdisk"}   :action :deny :origin :default :reason "partition table"}
+ {:tool :bash :pattern {:kind :cmd-name :name "parted"}  :action :deny :origin :default :reason "partition table"}
+ {:tool :bash :pattern {:kind :cmd-name :name "wipefs"}  :action :deny :origin :default :reason "wipe filesystem signatures"}
+ {:tool :bash :pattern {:kind :cmd-name :name "cryptsetup"} :action :deny :origin :default}
+ {:tool :bash :pattern {:kind :argv-glob :glob "mkfs.*"} :action :deny :origin :default :reason "format filesystem"}
+
+ ;; `rm -rf` and friends (specific dangerous flags)
+ {:tool :bash :pattern {:kind :argv-vec :vec ["rm" "-rf"]}  :action :deny :origin :default :reason "recursive force delete"}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["rm" "-fr"]}  :action :deny :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["rm" "-Rf"]}  :action :deny :origin :default}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["rm" "-r"]}   :action :deny :origin :default :reason "recursive delete"}
+ {:tool :bash :pattern {:kind :argv-vec :vec ["rm" "-R"]}   :action :deny :origin :default}
+
+ ;; chmod 777, chown -R /
+ {:tool :bash :pattern {:kind :argv-vec :vec ["chmod" #{"777" "+rwx"}]} :action :deny :origin :default
+  :reason "world-writable permissions"}
+
+ ;; Reboot / shutdown
+ {:tool :bash :pattern {:kind :cmd-name :name "reboot"}   :action :deny :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "shutdown"} :action :deny :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "halt"}     :action :deny :origin :default}
+ {:tool :bash :pattern {:kind :cmd-name :name "poweroff"} :action :deny :origin :default}
+
+ ;; Backgrounding gate (parser supports; permit defaults to ask)
+ ;; Users can override to :allow for trusted agents that need to spawn servers.
+ ;;
+ ;; ── intentionally not listing every dangerous command; the implicit
+ ;; ── default of :ask catches the rest.
+ ]

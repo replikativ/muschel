@@ -1,0 +1,82 @@
+;; Babashka entry: lets you do `bb` / `bb sh` / `bb -e ...` from the
+;; repo root with muschel pre-loaded — no `--classpath` flag needed.
+;;
+;; When muschel is published to Clojars, consumers add the dep to their
+;; OWN bb.edn:
+;;
+;;   {:deps {org.replikativ/muschel {:mvn/version "0.1.x"}}}
+;;
+;; This file is only for repo-local development.
+{:paths ["src" "resources"]
+
+ :tasks
+ {:requires
+  ([clojure.string :as str]
+   [muschel.core :as m]
+   [muschel.session :as session])
+
+  sh
+  {:doc "Interactive muschel shell. Type bash, hit Enter, see output."
+   :task
+   (let [host (m/jvm-host)
+         sess (m/atom-session (m/new-env))]
+     (println "muschel" (System/getProperty "muschel.version" "dev")
+              "— Ctrl-D or 'exit' to quit")
+     (loop []
+       (print (str (:cwd (session/-env sess))
+                   " $? " (:last-exit (session/-env sess)) " > "))
+       (flush)
+       (when-let [line (read-line)]
+         (when-not (or (= "exit" (str/trim line))
+                       (= "quit" (str/trim line)))
+           (try
+             (let [{:keys [stdout stderr exit]}
+                   (m/run-and-capture (session/-env sess) line
+                                      {:host host :session sess})]
+               (when (seq stdout) (print stdout))
+               (when (seq stderr) (binding [*out* *err*] (print stderr)))
+               (flush))
+             (catch Throwable t
+               (binding [*out* *err*]
+                 (println (str "muschel: " (.getMessage t))))))
+           (recur)))))}
+
+  exec
+  {:doc "Run a one-shot bash string. Usage: bb exec \"echo hi | tr a-z A-Z\""
+   :task
+   (let [src (or (first *command-line-args*)
+                 (do (binding [*out* *err*]
+                       (println "usage: bb exec '<bash src>'"))
+                     (System/exit 2)))
+         host (m/jvm-host)
+         {:keys [stdout stderr exit]}
+         (m/run-and-capture (m/new-env) src {:host host})]
+     (when (seq stdout) (print stdout))
+     (when (seq stderr) (binding [*out* *err*] (print stderr)))
+     (flush)
+     (System/exit exit))}
+
+  translate
+  {:doc "Translate bash source to a Clojure form. Reads from argv or stdin.
+         Usage:
+           bb translate \"echo hi | tr a-z A-Z\"
+           echo \"echo hi\" | bb translate"
+   :requires ([muschel.emit :as emit]
+              [clojure.pprint])
+   :task
+   (let [src (or (first *command-line-args*)
+                 (when-not (.ready (java.io.BufferedReader. *in*))
+                   nil)
+                 (slurp *in*))]
+     (if (or (nil? src) (= "" (str/trim src)))
+       (do (binding [*out* *err*]
+             (println "usage: bb translate '<bash src>'   (or pipe to stdin)"))
+           (System/exit 2))
+       (try
+         (clojure.pprint/pprint (emit/translate src))
+         (catch clojure.lang.ExceptionInfo e
+           (binding [*out* *err*]
+             (println (str "muschel.emit: " (.getMessage e)))
+             (when-let [n (:node (ex-data e))]
+               (println "  AST node:" (pr-str (select-keys n [:type :op :reason])))))
+           (System/exit 1)))))}}}

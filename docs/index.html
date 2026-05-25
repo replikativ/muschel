@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>muschel</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        max-width: 720px; margin: 4rem auto 2rem; padding: 0 1rem;
+        line-height: 1.6;
+      }
+      h1 { margin-bottom: 0.25rem; }
+      .lede { color: #666; margin-top: 0; }
+      .cta {
+        display: inline-block; margin-top: 1.5rem; padding: 0.6rem 1.2rem;
+        background: #5fb3b3; color: #0f1419; text-decoration: none;
+        border-radius: 6px; font-weight: 600;
+      }
+      pre {
+        background: #f4f4f4; padding: 0.75rem 1rem; border-radius: 6px;
+        overflow-x: auto; font-size: 0.9rem;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background: #0f1419; color: #c5c8c6; }
+        .lede { color: #9aa3ab; }
+        pre  { background: #1a2026; }
+        a    { color: #5fb3b3; }
+      }
+      footer { margin-top: 3rem; color: #888; font-size: 0.85rem; }
+    </style>
+  </head>
+  <body>
+    <h1>muschel</h1>
+    <p class="lede">Parse bash, gate it with a permit, run it through a host you control — JVM, Node, or in the browser against a virtual fs.</p>
+
+    <a class="cta" href="playground/">Try the browser playground →</a>
+
+    <h2>Install</h2>
+    <pre><code>;; Clojure
+org.replikativ/muschel {:git/url "https://github.com/replikativ/muschel"
+                       :git/sha "&lt;sha&gt;"}</code></pre>
+
+    <pre><code># npm
+npm install muschel</code></pre>
+
+    <h2>Quick taste</h2>
+    <pre><code>const m = require('muschel');
+const r = m.run("echo hi | tr a-z A-Z", { host: m.nodeHost() });
+console.log(r.stdout);  // → "HI\n"</code></pre>
+
+    <footer>
+      <a href="https://github.com/replikativ/muschel">GitHub</a> ·
+      <a href="https://github.com/replikativ/muschel/blob/main/README.md">README</a> ·
+      <a href="https://github.com/replikativ/muschel/blob/main/CHANGELOG.md">Changelog</a>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,47 @@
+{
+  "name": "muschel",
+  "version": "0.1.0",
+  "description": "Parse bash, gate it with an allow/deny permit, and execute it through a pluggable host (Node, browser, JVM via Clojure).",
+  "main": "dist/muschel.js",
+  "types": "dist/muschel.d.ts",
+  "files": [
+    "dist/muschel.js",
+    "dist/muschel.d.ts",
+    "dist/playground/playground.js",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "LICENSE-mvdan-sh.txt"
+  ],
+  "keywords": [
+    "bash",
+    "shell",
+    "parser",
+    "ast",
+    "permit",
+    "sandbox",
+    "llm",
+    "agent",
+    "posix"
+  ],
+  "author": "Christian Weilbach <ch_weil@topiq.es>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/replikativ/muschel.git"
+  },
+  "homepage": "https://github.com/replikativ/muschel",
+  "bugs": {
+    "url": "https://github.com/replikativ/muschel/issues"
+  },
+  "scripts": {
+    "build": "shadow-cljs release npm playground",
+    "build:npm": "shadow-cljs release npm",
+    "build:playground": "shadow-cljs release playground",
+    "watch:playground": "shadow-cljs watch playground",
+    "test": "shadow-cljs compile node-tests && node out/node-tests.js"
+  },
+  "devDependencies": {
+    "shadow-cljs": "^2.28.0"
+  }
+}
