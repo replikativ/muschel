@@ -117,45 +117,45 @@
    (let [now (mtime)
          ;; Normalise entries into the internal shape.
          norm-entries (reduce-kv
-                        (fn [acc path v]
-                          (let [entry (cond
-                                        (= :dir v)
-                                        {:type :dir :mtime-ms now}
+                       (fn [acc path v]
+                         (let [entry (cond
+                                       (= :dir v)
+                                       {:type :dir :mtime-ms now}
 
-                                        (map? v)
-                                        (case (:type v)
-                                          :dir  {:type :dir :mtime-ms (or (:mtime-ms v) now)}
-                                          :file {:type :file
-                                                 :bytes (or (:bytes v) (:content v) "")
-                                                 :mtime-ms (or (:mtime-ms v) now)}
+                                       (map? v)
+                                       (case (:type v)
+                                         :dir  {:type :dir :mtime-ms (or (:mtime-ms v) now)}
+                                         :file {:type :file
+                                                :bytes (or (:bytes v) (:content v) "")
+                                                :mtime-ms (or (:mtime-ms v) now)}
                                           ;; default to file
-                                          {:type :file
-                                           :bytes (or (:bytes v) (:content v) "")
-                                           :mtime-ms (or (:mtime-ms v) now)})
+                                         {:type :file
+                                          :bytes (or (:bytes v) (:content v) "")
+                                          :mtime-ms (or (:mtime-ms v) now)})
 
-                                        (string? v)
-                                        {:type :file :bytes v :mtime-ms now}
+                                       (string? v)
+                                       {:type :file :bytes v :mtime-ms now}
 
-                                        :else
-                                        (throw (ex-info "Invalid virtual FS entry"
-                                                        {:path path :value v})))]
-                            (assoc acc path entry)))
-                        {}
-                        entries)
+                                       :else
+                                       (throw (ex-info "Invalid virtual FS entry"
+                                                       {:path path :value v})))]
+                           (assoc acc path entry)))
+                       {}
+                       entries)
          ;; Auto-create intermediate dirs.
          with-dirs (reduce
-                     (fn [acc path]
-                       (loop [segs (drop-last (fs/split-path path))
-                              acc  acc]
-                         (let [dirpath (fs/join-path "" (filter seq segs))
-                               dirpath (if (= "" dirpath) "/" dirpath)]
-                           (cond
-                             (contains? acc dirpath) acc
-                             (= "/" dirpath)         (assoc acc "/" {:type :dir :mtime-ms now})
-                             :else (recur (butlast segs)
-                                          (assoc acc dirpath {:type :dir :mtime-ms now}))))))
-                     norm-entries
-                     (keys norm-entries))
+                    (fn [acc path]
+                      (loop [segs (drop-last (fs/split-path path))
+                             acc  acc]
+                        (let [dirpath (fs/join-path "" (filter seq segs))
+                              dirpath (if (= "" dirpath) "/" dirpath)]
+                          (cond
+                            (contains? acc dirpath) acc
+                            (= "/" dirpath)         (assoc acc "/" {:type :dir :mtime-ms now})
+                            :else (recur (butlast segs)
+                                         (assoc acc dirpath {:type :dir :mtime-ms now}))))))
+                    norm-entries
+                    (keys norm-entries))
          all-entries (if (contains? with-dirs "/")
                        with-dirs
                        (assoc with-dirs "/" {:type :dir :mtime-ms now}))]

@@ -117,7 +117,7 @@
         (refuse! fallback-host opts
                  (format "not a builtin and not in fallback-allowlist (allowed: %s)"
                          (pr-str (sort (concat (keys builtins)
-                                                fallback-allowlist))))))))
+                                               fallback-allowlist))))))))
 
   ;; ---- async ----
   (-async [_ thunk] (host/-async fallback-host thunk))
@@ -141,10 +141,10 @@
     :or {fallback-allowlist #{}}}]
   {:pre [(some? fs) (some? fallback-host)]}
   (->BuiltinHost
-    fallback-host
-    (or builtins
-        #?(:clj  (do (require 'muschel.builtins.posix)
-                     @(resolve 'muschel.builtins.posix/standard-read-only))
-           :cljs (throw (ex-info ":builtins is required in cljs" {}))))
-    fs
-    fallback-allowlist))
+   fallback-host
+   (or builtins
+       #?(:clj  (do (require 'muschel.builtins.posix)
+                    @(resolve 'muschel.builtins.posix/standard-read-only))
+          :cljs (throw (ex-info ":builtins is required in cljs" {}))))
+   fs
+   fallback-allowlist))

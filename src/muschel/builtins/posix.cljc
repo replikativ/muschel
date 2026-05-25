@@ -26,6 +26,31 @@
             [muschel.env :as env]))
 
 ;; ============================================================================
+;; Dynamic context — set by muschel.host.builtin around every dispatch
+;;
+;; Most builtins only care about (argv, fs, env). Builtins like `sh` and
+;; future `xargs` / `find -exec` need recursive access to the dispatching
+;; host so they can re-enter through the same gates. Dynamic vars keep
+;; the common signature unchanged while letting the few that need it
+;; reach further.
+;; ============================================================================
+
+#?(:clj
+   (do
+     (def ^:dynamic *host* nil)
+     (def ^:dynamic *session* nil)
+     (def ^:dynamic *depth* 0))
+   :cljs
+   (do
+     (def ^:dynamic ^:private *host* nil)
+     (def ^:dynamic ^:private *session* nil)
+     (def ^:dynamic ^:private *depth* 0)))
+
+(def ^:private max-shell-depth
+  "Cap on nested `sh -c …` invocations to bound stack growth."
+  32)
+
+;; ============================================================================
 ;; Result builders
 ;; ============================================================================
 
@@ -341,21 +366,21 @@
         stderr (volatile! "")
         any-err? (volatile! false)
         rows (keep
-               (fn [f]
-                 (let [content (if (= "-" f) "" (fs/read-file fs f))]
-                   (if (and (not= "-" f) (nil? content))
-                     (do
-                       (vswap! stderr str "wc: " f ": No such file or directory\n")
-                       (vreset! any-err? true)
-                       nil)
-                     (assoc (count-stats (or content "")) :name f))))
-               files)
+              (fn [f]
+                (let [content (if (= "-" f) "" (fs/read-file fs f))]
+                  (if (and (not= "-" f) (nil? content))
+                    (do
+                      (vswap! stderr str "wc: " f ": No such file or directory\n")
+                      (vreset! any-err? true)
+                      nil)
+                    (assoc (count-stats (or content "")) :name f))))
+              files)
         fmt-row (fn [{:keys [lines words bytes name]}]
                   (str/trim
-                    (str (when show-l? (format "%8d " lines))
-                         (when show-w? (format "%8d " words))
-                         (when show-c? (format "%8d " bytes))
-                         (when (and name (not= "-" name)) name))))
+                   (str (when show-l? (format "%8d " lines))
+                        (when show-w? (format "%8d " words))
+                        (when show-c? (format "%8d " bytes))
+                        (when (and name (not= "-" name)) name))))
         total (when (> (count rows) 1)
                 (reduce (fn [acc r]
                           (-> acc

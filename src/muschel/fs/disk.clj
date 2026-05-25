@@ -125,14 +125,14 @@
         (when (Files/isDirectory p follow)
           (with-open [stream (Files/newDirectoryStream p)]
             (vec
-              (sort-by :name
-                (mapv (fn [^Path child]
-                        (let [attrs (Files/readAttributes child BasicFileAttributes follow)]
-                          {:name     (str (.getFileName child))
-                           :type     (type-of child)
-                           :size     (.size attrs)
-                           :mtime-ms (.toMillis (.lastModifiedTime attrs))}))
-                      stream))))))))
+             (sort-by :name
+                      (mapv (fn [^Path child]
+                              (let [attrs (Files/readAttributes child BasicFileAttributes follow)]
+                                {:name     (str (.getFileName child))
+                                 :type     (type-of child)
+                                 :size     (.size attrs)
+                                 :mtime-ms (.toMillis (.lastModifiedTime attrs))}))
+                            stream))))))))
 
   (-read-file [this path]
     (when-let [bs (fs/-read-bytes this path)]
