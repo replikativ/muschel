@@ -370,8 +370,6 @@
             \[ (let [;; Where to start looking for closing `]`. bash
                      ;; quirk: a `]` as the FIRST char of the class
                      ;; body is literal — skip it. Same for `!]` / `^]`.
-                     ;; This is for finding `]` (start position), NOT a
-                     ;; minimum-length guard.
                      search-from
                      (cond
                        (>= (inc i) n) (inc i)
@@ -381,7 +379,22 @@
                             (= \] (.charAt pat (+ i 2))))
                        (+ i 3)
                        :else (+ i 2))
-                     end (.indexOf pat "]" search-from)]
+                     ;; Skip over `[:class:]` POSIX classes when
+                     ;; finding the closing `]` so `[[:digit:]]`
+                     ;; matches the OUTER ] at position 10, not the
+                     ;; inner `]` of `[:digit:]` at position 9.
+                     end (loop [k search-from]
+                           (cond
+                             (>= k n) -1
+                             (and (= \[ (.charAt pat k))
+                                  (< (inc k) n)
+                                  (= \: (.charAt pat (inc k))))
+                             (let [close (.indexOf pat ":]" (+ k 2))]
+                               (if (neg? close)
+                                 (recur (inc k))
+                                 (recur (+ close 2))))
+                             (= \] (.charAt pat k)) k
+                             :else (recur (inc k))))]
                  (if (neg? end)
                    (recur (inc i) (conj acc "\\["))
                    (let [raw (subs pat (inc i) end)
@@ -671,9 +684,16 @@
                        (and (:exported? meta) (:readonly? meta)) "declare -rx"
                        (:exported? meta) "declare -x"
                        (:readonly? meta) "declare -r"
-                       :else "declare --")]
-            [env (str decl " " name "=\""
-                      (str/replace v "\"" "\\\"") "\"")])))
+                       :else "declare --")
+                ;; bash @A omits quotes when the value has no special
+                ;; chars (alnum + a few). We quote conservatively when
+                ;; the value contains whitespace, quotes, or shell
+                ;; metacharacters.
+                needs-quote? (boolean (re-find #"[\s'\"\\$`]" v))
+                rendered (if needs-quote?
+                           (str "\"" (str/replace v "\"" "\\\"") "\"")
+                           v)]
+            [env (str decl " " name "=" rendered)])))
 
       :substring
       ;; bash quirk: when name is `@` or `*`, this slices the
@@ -953,28 +973,34 @@
    used to preserve the positional split of `\"$@\"` even though all
    fragments are quoted.
 
-   `split-on-ifs` emits empty-string sentinels for leading/trailing
-   IFS in the source; here we treat them as flush-markers (start /
-   end a field instead of gluing)."
+   Returns a vector of `{:s string :quoted? bool}` — the `:quoted?`
+   flag of a field is true iff EVERY contributing frag was quoted.
+   Callers (glob expansion) use this to skip globbing on fully-
+   quoted fields, matching bash semantics."
   [frags ifs]
   (when (seq frags)
     (let [out (volatile! [])
           cur (volatile! [])
-          ;; Tracks whether the current `cur` is the start of a
-          ;; meaningful field — flush! only emits if so. Prevents
-          ;; spurious empty fields between two flushes in a row.
+          ;; Tracks whether the cur is fully-quoted (so the EMITTED
+          ;; field carries :quoted? true). A single non-quoted
+          ;; contribution flips it.
+          all-q? (volatile! true)
           live? (volatile! false)
           flush! (fn []
                    (when @live?
-                     (vswap! out conj (apply str @cur))
+                     (vswap! out conj {:s (apply str @cur) :quoted? @all-q?})
                      (vreset! cur [])
+                     (vreset! all-q? true)
                      (vreset! live? false)))
-          add!   (fn [s] (vswap! cur conj s) (vreset! live? true))]
+          add!   (fn [s quoted?]
+                   (vswap! cur conj s)
+                   (vreset! live? true)
+                   (when-not quoted? (vreset! all-q? false)))]
       (doseq [{:keys [s quoted? break?]} frags]
         (when break? (flush!) (vreset! live? true))
         (cond
           quoted?
-          (add! s)
+          (add! s true)
 
           (empty? s)
           nil
@@ -986,43 +1012,41 @@
               (zero? pc) nil
 
               (= 1 pc)
-              (add! (first pieces))
+              (add! (first pieces) false)
 
               :else
               (do
-                ;; First piece: empty ⇒ flush (leading IFS in s),
-                ;; non-empty ⇒ glue to current cur.
                 (if (empty? (first pieces))
                   (flush!)
-                  (add! (first pieces)))
-                ;; Boundary between first and rest forces a flush.
+                  (add! (first pieces) false))
                 (flush!)
-                ;; Middle pieces are each their own field.
                 (doseq [p (butlast (rest pieces))]
-                  (add! p)
+                  (add! p false)
                   (flush!))
-                ;; Last piece: empty ⇒ trailing IFS, keep cur empty so
-                ;; the next frag DOESN'T glue. Non-empty ⇒ start cur
-                ;; with it so a following frag CAN glue.
                 (let [lp (last pieces)]
-                  (if (empty? lp)
-                    nil
-                    (add! lp))))))))
+                  (when-not (empty? lp)
+                    (add! lp false))))))))
       (flush!)
       @out)))
 
 (defn- glob-expand
   "Apply pathname expansion to one word. Returns the original word
    wrapped in a single-element vector if no glob chars or no matches.
-   Skipped when env's :noglob option is true."
+   Skipped when env's :noglob option is true.
+
+   bash quirk: leading `./` is preserved in the result (we strip it
+   before globbing and re-attach to each match)."
   [env word]
   #?(:clj
      (let [has-glob? (re-find #"(?<!\\)[*?\[]" word)]
        (if (or (not has-glob?) (env/option env :noglob))
          [word]
-         (let [matches (try (fs/glob (:cwd env) word)
+         (let [dot-prefix? (str/starts-with? word "./")
+               pat (cond-> word dot-prefix? (subs 2))
+               matches (try (fs/glob (:cwd env) pat)
                             (catch #?(:clj Throwable :cljs :default) _ nil))
-               strs (mapv (fn [p] (str (fs/relativize (:cwd env) p))) matches)]
+               base (mapv (fn [p] (str (fs/relativize (:cwd env) p))) matches)
+               strs (mapv #(if dot-prefix? (str "./" %) %) base)]
            (if (seq strs)
              (sort strs)
              [word]))))
@@ -1034,7 +1058,8 @@
 
 (defn expand-word
   "Expand one AST :word into a list of strings (field-split, globbed).
-   Returns [env' [string...]]."
+   Returns [env' [string...]]. Field-split fields that came entirely
+   from QUOTED sources skip glob expansion (bash semantics)."
   [env word & {:as opts}]
   (let [alternates (brace-expand-word word)
         [env' fields]
@@ -1048,7 +1073,11 @@
                          [env []]
                          parts)
                  split (field-split frags (:ifs env'))
-                 globbed (mapcat #(glob-expand env' %) split)]
+                 globbed (mapcat (fn [{:keys [s quoted?]}]
+                                   (if quoted?
+                                     [s]   ; quoted → literal
+                                     (glob-expand env' s)))
+                                 split)]
              [env' (into acc globbed)]))
          [env []]
          alternates)]

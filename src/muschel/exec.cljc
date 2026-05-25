@@ -90,12 +90,18 @@
     {:cmd-subst
      (fn [env body]
        (let [;; bash quirk: $(< file) reads the file directly (no
-             ;; fork). Match by checking for a leading `<` after trim.
-             trimmed (str/triml (or body ""))]
+             ;; fork). Only matches when the WHOLE body is `< file`
+             ;; with no trailing command — anything more complex
+             ;; falls through to normal exec.
+             trimmed (str/trim (or body ""))
+             file-read-match (when (str/starts-with? trimmed "<")
+                               (let [rest (str/trim (subs trimmed 1))]
+                                 (when (and (not (empty? rest))
+                                            (not (re-find #"[\s;&|()\n]" rest)))
+                                   rest)))]
          (cond
-           (str/starts-with? trimmed "<")
-           (let [path (str/trim (subs trimmed 1))
-                 ;; Resolve relative to cwd via the host.
+           file-read-match
+           (let [path file-read-match
                  abs (if (str/starts-with? path "/")
                        path
                        (str (:cwd env) "/" path))]
@@ -456,17 +462,21 @@
                            \u (env/set-option e :nounset on?)
                            \x (env/set-option e :xtrace on?)
                            \f (env/set-option e :noglob on?)
+                           \a (env/set-option e :allexport on?)
                            e))
                        e flags)))
                   env leftover)
             env' (reduce (fn [e [op long]]
                            (let [on? (= op "-")
                                  k (case long
-                                     "errexit"  :errexit
-                                     "nounset"  :nounset
-                                     "xtrace"   :xtrace
-                                     "noglob"   :noglob
-                                     "pipefail" :pipefail
+                                     "errexit"   :errexit
+                                     "nounset"   :nounset
+                                     "xtrace"    :xtrace
+                                     "noglob"    :noglob
+                                     "pipefail"  :pipefail
+                                     "allexport" :allexport
+                                     "noexec"    :noexec
+                                     "verbose"   :verbose
                                      nil)]
                              (if k (env/set-option e k on?) e)))
                          env' opt-pairs)
@@ -710,15 +720,26 @@
     (env/record-exit
      (reduce (fn [e arg]
                (let [[name value] (parse-name=value arg)
+                     ;; bash: `declare =foo` is an invalid name error.
+                     ;; We surface that here (rather than letting the
+                     ;; empty name silently leak into the var table).
                      e (cond
+                         (empty? name)
+                         (do (write-line opts :err
+                                         (str "declare: invalid name \""
+                                              name "\"\n"))
+                             (env/record-exit e 1))
+
                          ;; `declare NAME=value` — set new value
                          value (env/set-var e name value)
                          ;; `declare NAME` — preserve existing value
-                         ;; if any (bash quirk); otherwise create empty.
+                         ;; if any (bash quirk); otherwise mark
+                         ;; declared-but-no-value so `[[ -v NAME ]]`
+                         ;; and `${NAME-default}` see it as unset.
                          (env/declared? e name) e
                          :else (assoc-in e [:vars name]
                                          {:value "" :exported? false
-                                          :readonly? false}))
+                                          :readonly? false :no-value? true}))
                      e (if export? (env/export e name) e)
                      e (if readonly? (env/mark-readonly e name) e)]
                  e))
@@ -939,19 +960,27 @@
     (write-line opts :out (str (str/join " " (map tilde stack)) "\n"))))
 
 (defn- builtin-pushd
-  "POSIX/bash `pushd [DIR]` — push current dir + cd to DIR. With no
-   args, swap top of stack. Prints the new stack on success."
+  "POSIX/bash `pushd [-n] [DIR]` — push current dir + cd to DIR. With
+   no args, swap top of stack. `-n` is parsed but only suppresses the
+   cd (push happens). Prints the new stack on success."
   [env args opts]
-  (let [args (vec (filter #(not (str/starts-with? % "-")) args))
-        target (first args)
+  (let [{flag-args true non-flag-args false}
+        (group-by #(str/starts-with? % "-") args)
+        no-cd? (some #(= "-n" %) flag-args)
+        non-flag-args (vec non-flag-args)
+        target (first non-flag-args)
         stack (or (:dir-stack env) [])
         old-cwd (:cwd env)]
     (cond
+      (> (count non-flag-args) 1)
+      (do (write-line opts :err "pushd: too many arguments\n")
+          (env/record-exit env 2))
+
       (and (empty? target) (empty? stack))
       (do (write-line opts :err "pushd: no other directory\n")
           (env/record-exit env 1))
 
-      ;; pushd (no args): swap top of stack with cwd
+      ;; pushd (no args): swap top of stack with cwd.
       (empty? target)
       (let [new-cwd (first stack)
             new-stack (vec (cons old-cwd (rest stack)))
@@ -960,15 +989,25 @@
         (env/record-exit env' 0))
 
       :else
-      (let [fi (host/file-info (:host opts) target)]
-        (if (and (:exists? fi) (:dir? fi))
-          (let [env' (env/cd env target)
-                env' (assoc env' :dir-stack (vec (cons old-cwd stack)))]
-            (print-dir-stack env' opts)
-            (env/record-exit env' 0))
+      (let [resolved (resolve-path env target)
+            fi (host/file-info (:host opts) resolved)]
+        (cond
+          (not (:exists? fi))
           (do (write-line opts :err
-                          (str "pushd: " target ": No such file or directory\n"))
-              (env/record-exit env 1)))))))
+                          (str "pushd: no such file or directory: \""
+                               target "\"\n"))
+              (env/record-exit env 1))
+
+          (not (:dir? fi))
+          (do (write-line opts :err (str "pushd: not a directory: \"" target "\"\n"))
+              (env/record-exit env 1))
+
+          :else
+          (let [env' (cond-> env
+                       (not no-cd?) (env/cd target)
+                       :always (assoc :dir-stack (vec (cons old-cwd stack))))]
+            (print-dir-stack env' opts)
+            (env/record-exit env' 0)))))))
 
 (defn- builtin-popd
   "POSIX/bash `popd` — pop the dir stack, cd to the popped dir."
@@ -1097,105 +1136,164 @@
                             (zero? last-v) 1
                             :else 0))))
 
-(defn- builtin-test
-  "POSIX `test` / `[`. Builtin to avoid spawning a subprocess per
-   iteration of a while/until loop.
+(declare eval-test-expr)
 
-   Supports the common forms:
-     -e/-f/-d/-r/-w/-x/-s/-L PATH   file tests
-     -z/-n STR                       empty / non-empty string
-     STR1 = STR2 / != STR2           string compare
-     N1 -eq -ne -lt -le -gt -ge N2   integer compare
-     ! EXPR                          negate (only single-arg form here)
-     no args                         false (exit 1)
+(defn- test-primary-1
+  "Single-arg form: `test STR` → true iff STR is non-empty."
+  [_env [s] _opts]
+  (not= "" s))
 
-   For `[`, the final arg must be `]`; we strip + validate."
-  [env args opts]
-  (let [args (if (= (last args) "]") (vec (butlast args)) (vec args))
-        true!  (fn [] (env/record-exit env 0))
-        false! (fn [] (env/record-exit env 1))
-        err!   (fn [msg]
-                 (write-line opts :err (str "test: " msg "\n"))
-                 (env/record-exit env 2))
-        ;; All file tests go through host so the cwd is honored
-        ;; (resolved via host/resolve-path).
-        h (:host opts)
-        info     (fn [p] (host/file-info h (resolve-path env p)))
-        file-exists? (fn [p] (:exists? (info p)))
-        regular?     (fn [p] (:file? (info p)))
-        dir?         (fn [p] (:dir? (info p)))
-        readable?    (fn [p] (:readable? (info p)))
-        writable?    (fn [p] (:writable? (info p)))
-        executable?  (fn [p] (:executable? (info p)))
-        nonempty?    (fn [p] (let [i (info p)]
-                               (and (:exists? i) (pos? (or (:size i) 0)))))
-        symlink?     (fn [p] (:symlink? (info p)))
+(defn- test-primary-2
+  "Two-arg form: unary op + value. Returns true/false, or :unknown
+   if the op isn't recognised (caller treats as non-test args)."
+  [env [op v] opts]
+  (let [h (:host opts)
+        info (fn [p] (host/file-info h (resolve-path env p)))]
+    (case op
+      "-e" (boolean (:exists?  (info v)))
+      "-f" (boolean (:file?    (info v)))
+      "-d" (boolean (:dir?     (info v)))
+      "-r" (boolean (:readable? (info v)))
+      "-w" (boolean (:writable? (info v)))
+      "-x" (boolean (:executable? (info v)))
+      "-s" (let [i (info v)] (boolean (and (:exists? i) (pos? (or (:size i) 0)))))
+      ("-L" "-h") (boolean (:symlink? (info v)))
+      "-z" (= "" v)
+      "-n" (not= "" v)
+      "-v" (env/has-value? env v)
+      "-o" (boolean (env/option env (keyword v)))
+      ("-b" "-c" "-g" "-k" "-p" "-S" "-u" "-N" "-O" "-G" "-t") false
+      :unknown)))
+
+(defn- test-primary-3
+  "Three-arg form: a OP b. Returns true/false, or :unknown."
+  [env [a op b] opts]
+  (let [h (:host opts)
+        file-age (fn [p] (or (host/file-mtime-ms h (resolve-path env p)) 0))
+        same-file? (fn [x y]
+                     (try (= (host/resolve-path (:cwd env) x)
+                             (host/resolve-path (:cwd env) y))
+                          (catch #?(:clj Throwable :cljs :default) _ false)))
         parse-int-or (fn [s fallback]
                        (try (parse-int* (str/trim (str s)))
                             (catch #?(:clj Exception :cljs :default) _ fallback)))]
+    (case op
+      ("=" "==") (= a b)
+      "!=" (not= a b)
+      "<" (neg? (compare a b))
+      ">" (pos? (compare a b))
+      "-eq" (= (parse-int-or a 0) (parse-int-or b 0))
+      "-ne" (not= (parse-int-or a 0) (parse-int-or b 0))
+      "-lt" (< (parse-int-or a 0) (parse-int-or b 0))
+      "-le" (<= (parse-int-or a 0) (parse-int-or b 0))
+      "-gt" (> (parse-int-or a 0) (parse-int-or b 0))
+      "-ge" (>= (parse-int-or a 0) (parse-int-or b 0))
+      "-ef" (same-file? a b)
+      "-nt" (> (file-age a) (file-age b))
+      "-ot" (< (file-age a) (file-age b))
+      :unknown)))
+
+(defn- eval-primary
+  "Try test-primary-3 then -2 then -1 on the leading args. Returns
+   [bool consumed-count] on success, or `:unknown` if no primary fits."
+  [env args opts]
+  (let [n (count args)]
+    (cond
+      (and (>= n 3) (not= :unknown (test-primary-3 env (take 3 args) opts)))
+      [(test-primary-3 env (take 3 args) opts) 3]
+      (and (>= n 2) (not= :unknown (test-primary-2 env (take 2 args) opts)))
+      [(test-primary-2 env (take 2 args) opts) 2]
+      (>= n 1)
+      [(test-primary-1 env (take 1 args) opts) 1]
+      :else
+      :unknown)))
+
+(defn- eval-test-expr
+  "Parse + evaluate a test expression with `-a`, `-o`, `!`, and
+   escaped-paren grouping (`(` and `)` as separate args). Returns
+   [bool rest-of-args]; rest-of-args is empty on a clean parse.
+
+   POSIX precedence: `!` > `-a` > `-o`."
+  [env args opts]
+  (letfn [(p-or [args]
+            (let [[v r] (p-and args)]
+              (loop [v v r r]
+                (if (= (first r) "-o")
+                  (let [[v2 r2] (p-and (vec (next r)))]
+                    (recur (or v v2) r2))
+                  [v r]))))
+          (p-and [args]
+            (let [[v r] (p-not args)]
+              (loop [v v r r]
+                (if (= (first r) "-a")
+                  (let [[v2 r2] (p-not (vec (next r)))]
+                    (recur (and v v2) r2))
+                  [v r]))))
+          (p-not [args]
+            (cond
+              (= (first args) "!")
+              (let [[v r] (p-not (vec (next args)))]
+                [(not v) r])
+              (= (first args) "(")
+              (let [[v r] (p-or (vec (next args)))]
+                (if (= (first r) ")")
+                  [v (vec (next r))]
+                  [v r]))
+              :else
+              (let [r (eval-primary env args opts)]
+                (if (= r :unknown)
+                  [false (vec (next args))]
+                  [(first r) (vec (drop (second r) args))]))))]
+    (p-or args)))
+
+(defn- builtin-test
+  "POSIX `test` / `[`. Supports `-a` (and), `-o` (or), `!` (not), and
+   `(` `)` for grouping."
+  [env args opts]
+  (let [args (vec args)
+        ;; Strip trailing `]` if invoked as `[`.
+        args (if (= (last args) "]") (vec (butlast args)) args)
+        true!  #(env/record-exit env 0)
+        false! #(env/record-exit env 1)]
     (cond
       (empty? args) (false!)
 
-      ;; ! EXPR — negate; recurse on the rest
-      (and (= (first args) "!") (seq (rest args)))
-      (let [inner-env (builtin-test env (vec (rest args)) opts)]
-        (env/record-exit env (if (zero? (:last-exit inner-env)) 1 0)))
-
-      ;; Single-arg form: `test STR` → true iff STR is non-empty
+      ;; Common short-circuit paths kept for clarity.
       (= 1 (count args))
-      (if (not= "" (first args)) (true!) (false!))
+      (if (test-primary-1 env args opts) (true!) (false!))
 
-      ;; Two-arg form: unary op + value
       (= 2 (count args))
-      (let [[op v] args]
-        (case op
-          "-e" (if (file-exists? v) (true!) (false!))
-          "-f" (if (regular? v) (true!) (false!))
-          "-d" (if (dir? v) (true!) (false!))
-          "-r" (if (readable? v) (true!) (false!))
-          "-w" (if (writable? v) (true!) (false!))
-          "-x" (if (executable? v) (true!) (false!))
-          "-s" (if (nonempty? v) (true!) (false!))
-          ("-L" "-h") (if (symlink? v) (true!) (false!))
-          "-z" (if (= "" v) (true!) (false!))
-          "-n" (if (not= "" v) (true!) (false!))
-          ;; -v VAR — true if VAR is declared (even empty)
-          "-v" (if (env/declared? env v) (true!) (false!))
-          ;; set -o NAME option check
-          "-o" (if (env/option env (keyword v)) (true!) (false!))
-          ;; Unix-specific file tests we can't portably check in Java —
-          ;; return false (matches bash for empty/missing operand).
-          ("-b" "-c" "-g" "-k" "-p" "-S" "-u" "-N" "-O" "-G" "-t")
-          (false!)
-          (err! (str "unknown unary operator: " op))))
+      (case (first args)
+        "!" (if (test-primary-1 env (rest args) opts) (false!) (true!))
+        (let [r (test-primary-2 env args opts)]
+          (if (= r :unknown)
+            (do (write-line opts :err
+                            (str "test: unknown unary operator: "
+                                 (first args) "\n"))
+                (env/record-exit env 2))
+            (if r (true!) (false!)))))
 
-      ;; Three-arg form: STR op STR  /  NUM op NUM
       (= 3 (count args))
-      (let [[a op b] args
-            file-age (fn [p] (or (host/file-mtime-ms h (resolve-path env p)) 0))
-            same-file? (fn [a b]
-                         (try (= (host/resolve-path (:cwd env) a)
-                                 (host/resolve-path (:cwd env) b))
-                              (catch #?(:clj Throwable :cljs :default) _ false)))]
-        (case op
-          ("=" "==") (if (= a b) (true!) (false!))
-          "!="       (if (not= a b) (true!) (false!))
-          ;; Lexicographic string compare (bash semantics for `<` `>` in [[ ]])
-          "<"        (if (neg? (compare a b)) (true!) (false!))
-          ">"        (if (pos? (compare a b)) (true!) (false!))
-          "-eq"      (if (= (parse-int-or a 0) (parse-int-or b 0)) (true!) (false!))
-          "-ne"      (if (not= (parse-int-or a 0) (parse-int-or b 0)) (true!) (false!))
-          "-lt"      (if (< (parse-int-or a 0) (parse-int-or b 0)) (true!) (false!))
-          "-le"      (if (<= (parse-int-or a 0) (parse-int-or b 0)) (true!) (false!))
-          "-gt"      (if (> (parse-int-or a 0) (parse-int-or b 0)) (true!) (false!))
-          "-ge"      (if (>= (parse-int-or a 0) (parse-int-or b 0)) (true!) (false!))
-          ;; File ops
-          "-ef"      (if (same-file? a b) (true!) (false!))
-          "-nt"      (if (> (file-age a) (file-age b)) (true!) (false!))
-          "-ot"      (if (< (file-age a) (file-age b)) (true!) (false!))
-          (err! (str "unknown binary operator: " op))))
+      (let [r (test-primary-3 env args opts)]
+        (if (= r :unknown)
+          (case (first args)
+            "!" (if (let [r2 (test-primary-2 env (rest args) opts)]
+                      (if (= r2 :unknown) false r2))
+                  (false!) (true!))
+            (do (write-line opts :err
+                            (str "test: unknown binary operator: "
+                                 (second args) "\n"))
+                (env/record-exit env 2)))
+          (if r (true!) (false!))))
 
-      :else (err! "too many arguments (compound expressions not yet supported)"))))
+      :else
+      ;; Compound expression with -a/-o/!/().
+      (let [[v rest] (eval-test-expr env args opts)]
+        (if (seq rest)
+          (do (write-line opts :err
+                          (str "test: too many arguments\n"))
+              (env/record-exit env 2))
+          (if v (true!) (false!)))))))
 
 (defn- find-job
   "Resolve a wait/kill argument to a JobHandle from the session.
@@ -1383,21 +1481,30 @@
                  fields)]
     (cond
       ;; Naked assignments: `FOO=bar BAZ=qux` (no cmd) — permanent.
-      ;; `FOO+=bar` appends to the existing value. If the call had
+      ;; `FOO+=bar` appends to the existing value. Readonly violations
+      ;; print to stderr and exit 1, matching bash. If the call had
       ;; args that all expanded away (e.g. `$(false)`), bash propagates
       ;; the LAST cmd-subst's exit; otherwise we record 0.
       (empty? fields)
-      (let [env'
+      (let [[env' readonly-err?]
             (reduce
-             (fn [env as]
-               (let [[env' val] (expand-assign env (:value as) opts)
-                     final     (if (:append? as)
-                                 (str (env/get-var env' (:name as)) val)
-                                 val)]
-                 (env/set-var env' (:name as) final)))
-             env1 (:assigns call))
+             (fn [[env err?] as]
+               (cond
+                 err? [env err?]
+                 (env/readonly? env (:name as))
+                 (do (write-line opts :err (str (:name as) ": readonly variable\n"))
+                     [env true])
+                 :else
+                 (let [[env' val] (expand-assign env (:value as) opts)
+                       final     (if (:append? as)
+                                   (str (env/get-var env' (:name as)) val)
+                                   val)]
+                   [(env/set-var env' (:name as) final) false])))
+             [env1 false] (:assigns call))
             had-args? (seq (:args call))]
-        (env/record-exit env' (if had-args? (or cmd-subst-exit 0) 0)))
+        (env/record-exit env' (cond readonly-err? 1
+                                    had-args?    (or cmd-subst-exit 0)
+                                    :else        0)))
 
       :else
       (let [name (first fields)

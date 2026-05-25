@@ -73,7 +73,7 @@
 ;; ============================================================================
 
 (defn- arith-error [^String src ^long pos msg]
-  (err/error! (str "arithmetic: " msg)
+  (err/error! msg
               {:type ::arith-error
                :line 1
                :col (inc pos)
@@ -329,20 +329,38 @@
 ;; Evaluator
 ;; ============================================================================
 
+(declare evaluate)
+
 (defn- env-get-int
-  "Read variable `name` as integer. Unset vars are 0 (bash default).
-   Non-numeric strings parse leading digits if any, else 0."
+  "Read variable `name` as integer.  Unset vars are 0 (bash default).
+   If the value is a valid bash arithmetic expression — including
+   another variable name chain (`a=b; b=5`) — we recursively evaluate
+   it, with a depth limit to prevent cycles."
   [env nm]
+  (env-get-int env nm 0))
+
+(defn- env-get-int-rec [env nm depth]
   (let [v (env/get-var env nm)]
     (cond
       (= "" v) 0
-      :else (try (parse-long-dec (str/trim v))
-                 (catch #?(:clj Exception :cljs js/Error) _
-                   ;; Bash: recursively evaluate if the value is itself
-                   ;; an expression. We don't recurse (avoid infinite
-                   ;; loops); fall back to scanning leading digits.
-                   (let [m (re-find #"^-?\d+" (str/trim v))]
-                     (if m (parse-long-dec m) 0)))))))
+      (>= depth 16) 0   ; depth limit guards against `a=a` cycles
+      :else
+      (try (parse-long-dec (str/trim v))
+           (catch #?(:clj Exception :cljs js/Error) _
+             ;; Try evaluating the value as an expression (handles
+             ;; the `a=b; b=5; $((a))` chain bash supports).
+             (try (let [[_ result] (evaluate env (str/trim v))]
+                    result)
+                  (catch #?(:clj Throwable :cljs :default) _
+                    ;; Fall back to leading-digits scan.
+                    (let [m (re-find #"^-?\d+" (str/trim v))]
+                      (if m (parse-long-dec m) 0)))))))))
+
+(defn- env-get-int
+  "Read variable `name` as integer with bash's recursive expression
+   semantics."
+  [env nm]
+  (env-get-int-rec env nm 0))
 
 (defn- env-set-int [env nm v]
   (env/set-var env nm (str v)))
@@ -358,10 +376,10 @@
     "-"  (- a b)
     "*"  (* a b)
     "/"  (if (zero? b)
-           (err/error! "arithmetic: division by zero" {:type ::arith-error})
+           (err/error! "division by zero" {:type ::arith-error})
            (quot a b))
     "%"  (if (zero? b)
-           (err/error! "arithmetic: division by zero" {:type ::arith-error})
+           (err/error! "division by zero" {:type ::arith-error})
            (mod a b))
     "**" (ipow a b)
     "<<" (bit-shift-left a b)
@@ -390,7 +408,7 @@
         "~" [env' (bit-not v)]
         ("++" "--")
         (do (when-not (= :name (:type (:operand ast)))
-              (err/error! "arithmetic: ++/-- requires a variable"
+              (err/error! "++/-- requires a variable"
                           {:type ::arith-error}))
             (let [nm (:name (:operand ast))
                   old (env-get-int env nm)
@@ -399,7 +417,7 @@
 
     :postfix
     (do (when-not (= :name (:type (:operand ast)))
-          (err/error! "arithmetic: ++/-- requires a variable"
+          (err/error! "++/-- requires a variable"
                       {:type ::arith-error}))
         (let [nm (:name (:operand ast))
               old (env-get-int env nm)

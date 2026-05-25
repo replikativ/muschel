@@ -152,8 +152,10 @@
     ("1" "2" "3" "4" "5" "6" "7" "8" "9")
     (positional env #?(:clj (Integer/parseInt name)
                        :cljs (js/parseInt name)))
-    "PWD"    (:cwd env)
-    "OLDPWD" (:prev-cwd env)
+    ;; PWD / OLDPWD: bash updates these on `cd`, but the user can
+    ;; assign them as ordinary vars and that takes precedence.
+    "PWD"    (or (get-in env [:vars "PWD" :value]) (:cwd env))
+    "OLDPWD" (or (get-in env [:vars "OLDPWD" :value]) (:prev-cwd env))
     "IFS"    (:ifs env)
     ;; bash dynamic variables. We expand them on read; not stored in
     ;; :vars so they don't pollute (env/to-process-env env).
@@ -172,6 +174,21 @@
   [env name]
   (or (special-var-names name)
       (contains? (:vars env) name)))
+
+(defn has-value?
+  "True if the var has actually been assigned a value (so `${x-d}`
+   wouldn't trigger the default and `[[ -v x ]]` is true).
+
+   Differs from `declared?` in that `declare x` (with no `=`) marks
+   the var as declared but with `:no-value? true`."
+  [env name]
+  (cond
+    (special-var-names name)
+    (some? (get-var* env name))
+
+    :else
+    (let [meta (get-in env [:vars name])]
+      (and meta (not (:no-value? meta))))))
 
 (defn exported?
   [env name]
@@ -252,17 +269,20 @@
 
 (defn cd
   "Change to `path` (absolute or relative to current cwd). Returns new
-   env with :cwd updated and :prev-cwd set to the old cwd.
-   `cd -` switches to OLDPWD.
-   Bash also updates the env-vars PWD and OLDPWD; we expose these via
-   `get-var` so they're always in sync without explicit storage."
+   env with :cwd updated and :prev-cwd set to the old cwd. `cd -`
+   switches to OLDPWD. Bash also updates the env-vars PWD and OLDPWD
+   on every cd — we sync them too so process-env-export and `${PWD}`
+   reads see the right value."
   [env path]
   (let [old (:cwd env)
         target (cond
                  (= path "-") (:prev-cwd env)
                  (= path "")  (or (get-var* env "HOME") old)
                  :else        (absolutize old path))]
-    (assoc env :cwd target :prev-cwd old)))
+    (-> env
+        (assoc :cwd target :prev-cwd old)
+        (assoc-in [:vars "PWD"]    {:value target :exported? true :readonly? false})
+        (assoc-in [:vars "OLDPWD"] {:value old    :exported? true :readonly? false}))))
 
 ;; ============================================================================
 ;; Exit status
@@ -356,9 +376,11 @@
              env' (assoc env :scope-stack stack')]
          (if value
            (set-var env' name value)
-           ;; declare without assignment — start fresh (empty string)
+           ;; `local x` (no `=`) declares without assigning — mark
+           ;; `:no-value? true` so `[[ -v x ]]` is false until set.
            (assoc-in env' [:vars name]
-                     {:value "" :exported? false :readonly? false})))))))
+                     {:value "" :exported? false :readonly? false
+                      :no-value? true})))))))
 
 (defn pop-scope
   "Pop the topmost scope frame, restoring any locally-shadowed
