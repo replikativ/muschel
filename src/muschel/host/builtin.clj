@@ -157,8 +157,7 @@
   (->BuiltinHost
    fallback-host
    (or builtins
-       #?(:clj  (do (require 'muschel.builtins.posix)
-                    @(resolve 'muschel.builtins.posix/standard-read-only))
-          :cljs (throw (ex-info ":builtins is required in cljs" {}))))
+       (do (require 'muschel.builtins.posix)
+           @(resolve 'muschel.builtins.posix/standard-read-only)))
    fs
    fallback-allowlist))

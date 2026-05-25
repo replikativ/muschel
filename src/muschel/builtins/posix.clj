@@ -35,16 +35,9 @@
 ;; reach further.
 ;; ============================================================================
 
-#?(:clj
-   (do
-     (def ^:dynamic *host* nil)
-     (def ^:dynamic *session* nil)
-     (def ^:dynamic *depth* 0))
-   :cljs
-   (do
-     (def ^:dynamic ^:private *host* nil)
-     (def ^:dynamic ^:private *session* nil)
-     (def ^:dynamic ^:private *depth* 0)))
+(def ^:dynamic *host* nil)
+(def ^:dynamic *session* nil)
+(def ^:dynamic *depth* 0)
 
 (def ^:private max-shell-depth
   "Cap on nested `sh -c …` invocations to bound stack growth."

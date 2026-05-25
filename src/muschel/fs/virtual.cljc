@@ -31,7 +31,9 @@
       (when normalized
         (fs/join-path "" normalized)))))
 
-(defn- mtime [] (System/currentTimeMillis))
+(defn- mtime []
+  #?(:clj (System/currentTimeMillis)
+     :cljs (.getTime (js/Date.))))
 
 (defrecord VirtualFS [entries-atom cwd-atom]
   fs/FS
