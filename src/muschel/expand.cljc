@@ -129,10 +129,13 @@
                    (recur (+ i 2) (conj acc "\\U"))))
 
             (if (oct-digit? e)
+              ;; bash truncates octal escapes to a single byte (\\777 → 0xFF),
+              ;; matching what an 8-bit terminal would see.
               (let [end (loop [j (+ i 1) k 0]
                           (if (and (< k 3) (< j n) (oct-digit? (.charAt s j)))
-                            (recur (inc j) (inc k)) j))]
-                (recur end (conj acc (str (char (parse-oct (subs s (+ i 1) end)))))))
+                            (recur (inc j) (inc k)) j))
+                    v (bit-and (parse-oct (subs s (+ i 1) end)) 0xFF)]
+                (recur end (conj acc (str (char v)))))
               (recur (+ i 2) (conj acc (str "\\" e))))))
 
         :else
@@ -303,10 +306,50 @@
 ;;   ${NAME:OFFSET}  ${NAME:OFFSET:LEN}    — substring
 ;;   ${!NAME}                        — indirect (one extra lookup)
 
+(def ^:private posix-char-class->regex
+  "Translation table for `[[:class:]]` POSIX bracket-expressions to
+   Java regex escapes."
+  {"alpha"  "a-zA-Z"
+   "alnum"  "a-zA-Z0-9"
+   "digit"  "0-9"
+   "lower"  "a-z"
+   "upper"  "A-Z"
+   "space"  "\\s"
+   "blank"  " \\t"
+   "punct"  "\\p{Punct}"
+   "cntrl"  "\\p{Cntrl}"
+   "print"  "\\p{Print}"
+   "graph"  "\\p{Graph}"
+   "xdigit" "0-9A-Fa-f"})
+
+(defn- translate-bracket-body
+  "Inside `[...]` of a glob: expand POSIX classes `[:digit:]` etc and
+   regex-escape `]` if needed. Leading `!` already stripped + `^`
+   substituted by the caller."
+  [^String body]
+  (let [n (count body)]
+    (loop [i 0 acc []]
+      (if (>= i n)
+        (apply str acc)
+        (cond
+          ;; [:class:]
+          (and (<= (+ i 7) n)
+               (= "[:" (subs body i (+ i 2)))
+               (let [close (.indexOf body ":]" (+ i 2))]
+                 (and (pos? close) (< close n))))
+          (let [close (.indexOf body ":]" (+ i 2))
+                class-name (subs body (+ i 2) close)
+                rgx (get posix-char-class->regex class-name)]
+            (if rgx
+              (recur (+ close 2) (conj acc rgx))
+              (recur (inc i) (conj acc (str (.charAt body i))))))
+          :else
+          (recur (inc i) (conj acc (str (.charAt body i)))))))))
+
 (defn glob->regex
-  "Translate a bash glob pattern (`*` `?` `[abc]` `[!abc]`) to a regex
-   body (NOT anchored — the caller adds ^…$ if needed). Portable —
-   uses a vec accumulator instead of StringBuilder."
+  "Translate a bash glob pattern (`*` `?` `[abc]` `[!abc]`,
+   `[[:digit:]]`, etc.) to a regex body (NOT anchored — the caller
+   adds ^…$ if needed)."
   [^String pat]
   (let [n (count pat)]
     (loop [i 0 acc []]
@@ -316,13 +359,27 @@
           (case c
             \* (recur (inc i) (conj acc ".*"))
             \? (recur (inc i) (conj acc "."))
-            \[ (let [end (.indexOf pat "]" (inc i))]
-                 (if (neg? end)
+            \[ (let [;; Find the closing `]`. bash quirk: a `]` as the
+                     ;; FIRST char of the class body is literal — start
+                     ;; looking from i+2 in that case (and also for `!]`
+                     ;; / `^]`). Empty `[]` is a literal `[]`.
+                     skip (cond
+                            (>= (inc i) n) 1
+                            (= \] (.charAt pat (inc i))) 2
+                            (and (>= (+ i 2) n) (= \] (.charAt pat (inc i)))) 2
+                            (and (#{\! \^} (.charAt pat (inc i)))
+                                 (< (+ i 2) n)
+                                 (= \] (.charAt pat (+ i 2))))
+                            3
+                            :else 1)
+                     end (.indexOf pat "]" (+ i skip))]
+                 (if (or (neg? end) (= 1 skip))
                    (recur (inc i) (conj acc "\\["))
-                   (let [body (subs pat (inc i) end)
-                         body (if (str/starts-with? body "!")
-                                (str "^" (subs body 1))
-                                body)]
+                   (let [raw (subs pat (inc i) end)
+                         raw (if (str/starts-with? raw "!")
+                               (str "^" (subs raw 1))
+                               raw)
+                         body (translate-bracket-body raw)]
                      (recur (inc end)
                             (conj acc "[" body "]")))))
             \\ (if (< (inc i) n)
@@ -377,11 +434,26 @@
     (subs s 0 (- (count s) (count suf)))
     s))
 
-(defn- replace-glob [^String s ^String pat ^String repl all?]
-  (let [rx (re-pattern (glob->regex pat))]
-    (if all?
-      (str/replace s rx repl)
-      (str/replace-first s rx repl))))
+(defn- replace-glob
+  "Apply `${var/pat/repl}` / `${var//pat/repl}`. `repl` is passed
+   through as a LITERAL replacement (bash semantics): regex
+   metacharacters like `$` and `\\` in repl should not be treated
+   specially. Java's `Matcher#quoteReplacement` does this.
+
+   `(?s)` makes `.*` (from `*` in the glob) match across newlines,
+   matching bash's pattern-in-replacement semantics.
+
+   Empty pattern is a no-op (bash drops the operation)."
+  [^String s ^String pat ^String repl all?]
+  (cond
+    (or (nil? pat) (= "" pat)) s
+    :else
+    (let [rx (re-pattern (str "(?s)" (glob->regex pat)))
+          repl' #?(:clj  (java.util.regex.Matcher/quoteReplacement (or repl ""))
+                   :cljs (or repl ""))]
+      (if all?
+        (str/replace s rx repl')
+        (str/replace-first s rx repl')))))
 
 (declare expand-string-in-env)
 
@@ -481,6 +553,8 @@
             (str/starts-with? rest "@L") {:op :downcase-all  :name name}
             (str/starts-with? rest "@Q") {:op :shell-quote   :name name}
             (str/starts-with? rest "@E") {:op :expand-esc    :name name}
+            (str/starts-with? rest "@a") {:op :attrs         :name name}
+            (str/starts-with? rest "@A") {:op :decl-stmt     :name name}
 
             :else
             ;; Unknown form — return as plain to be lenient
@@ -496,6 +570,18 @@
       (and (some? v) (not= v ""))
       (some? v))))
 
+(defn- nounset-trip?
+  "True when `set -u` is on and reading `name` would touch an unset
+   variable (and we're not using a default-providing op like `:-`).
+   `get-var*` returns nil for genuinely-unset positional params even
+   though `declared?` claims they're 'declared' as special vars; we
+   prefer get-var* here."
+  [env name op]
+  (and (env/option env :nounset)
+       (nil? (env/get-var* env name))
+       (not (#{:default :default-unset :alt :alt-unset
+               :assign :assign-unset :error :error-unset} op))))
+
 (defn- apply-param-op
   "Apply a parsed param expansion. Returns [new-env result-string]
    since some ops (`:=`) mutate the env."
@@ -503,6 +589,9 @@
   (let [{:keys [name]} opts
         v (or (env/get-var* env name) "")
         word-of (fn [src] (when src (expand-string-in-env env src opts)))]
+    (when (nounset-trip? env name op)
+      (err/error! (str name ": unbound variable")
+                  {:type ::param-error :source (:src opts)}))
     (case op
       :plain    [env v]
       :length   [env (str (count v))]
@@ -549,6 +638,23 @@
       :downcase-first [env (if (empty? v) v (str (str/lower-case (subs v 0 1)) (subs v 1)))]
       :shell-quote   [env (str "'" (str/replace v "'" "'\\''") "'")]
       :expand-esc    [env (decode-ansi-c v)]
+      :attrs         ;; bash flags: 'x' exported, 'r' readonly, 'a' array,
+      ;; 'i' integer, 'l' lower, 'u' upper. Unset vars → empty.
+      (let [meta (get-in env [:vars name])
+            flags (str (when (:exported? meta) "x")
+                       (when (:readonly? meta) "r"))]
+        (if (nil? meta) [env ""] [env flags]))
+      :decl-stmt
+      (let [meta (get-in env [:vars name])]
+        (if (nil? meta)
+          [env ""]
+          (let [decl (cond
+                       (and (:exported? meta) (:readonly? meta)) "declare -rx"
+                       (:exported? meta) "declare -x"
+                       (:readonly? meta) "declare -r"
+                       :else "declare --")]
+            [env (str decl " " name "=\""
+                      (str/replace v "\"" "\\\"") "\"")])))
 
       :substring    (let [{:keys [offset length]} opts
                           n   (count v)
@@ -609,17 +715,21 @@
     [env [{:s (decode-ansi-c (:raw part)) :quoted? true}]]
 
     :var-ref
-    (cond
-      (:special? part)
-      [env [{:s (env/get-var env (:name part)) :quoted? false}]]
-      (:positional? part)
-      [env [{:s (env/get-var env (:name part)) :quoted? false}]]
-      (not (:braced part))
-      [env [{:s (env/get-var env (:name part)) :quoted? false}]]
-      :else
-      (let [parsed (parse-param-body (:raw part))
-            [env' v] (apply-param-op env (:op parsed) parsed)]
-        [env' [{:s v :quoted? false}]]))
+    (let [name (:name part)]
+      (when (and name (nounset-trip? env name :plain))
+        (err/error! (str name ": unbound variable")
+                    {:type ::param-error :source (:offset part)}))
+      (cond
+        (:special? part)
+        [env [{:s (env/get-var env name) :quoted? false}]]
+        (:positional? part)
+        [env [{:s (env/get-var env name) :quoted? false}]]
+        (not (:braced part))
+        [env [{:s (env/get-var env name) :quoted? false}]]
+        :else
+        (let [parsed (parse-param-body (:raw part))
+              [env' v] (apply-param-op env (:op parsed) parsed)]
+          [env' [{:s v :quoted? false}]])))
 
     :cmd-subst
     ;; Cmd-subst body is the raw bash source (lazy parsing — matches

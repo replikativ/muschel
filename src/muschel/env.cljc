@@ -77,7 +77,7 @@
      :pos-args    initial positional params (default: [])
      :script      \\$0 value (default: \"muschel\")"
   [& {:keys [cwd pos-args script]
-      :or {pos-args [] script "muschel"}}]
+      :or {pos-args [] script "bash"}}]
   (let [host (host-env-map)
         vars (into {} (for [[k v] host]
                         [k {:value v :exported? true :readonly? false}]))
@@ -143,7 +143,11 @@
     "#" (str (count (:pos-args env)))
     "!" (some-> (:last-bg-pid env) str)
     "@" (str/join " " (:pos-args env))           ; same as $* outside quotes
-    "*" (str/join (subs (:ifs env) 0 1) (:pos-args env))
+    "*" (let [ifs (or (:ifs env) "")]
+          ;; bash: empty IFS → concatenate positionals with no
+          ;; separator. Default IFS uses the first char (a space).
+          (str/join (if (empty? ifs) "" (subs ifs 0 1))
+                    (:pos-args env)))
     "0" (:script env)
     ("1" "2" "3" "4" "5" "6" "7" "8" "9")
     (positional env #?(:clj (Integer/parseInt name)
@@ -153,8 +157,9 @@
     "IFS"    (:ifs env)
     ;; bash dynamic variables. We expand them on read; not stored in
     ;; :vars so they don't pollute (env/to-process-env env).
-    "RANDOM" (str (rand-int 32768))
-    "LINENO" (str (or (:lineno env) 1))
+    "RANDOM"  (str (rand-int 32768))
+    "SRANDOM" (str (rand-int 0x7fffffff))
+    "LINENO"  (str (or (:lineno env) 1))
     "SECONDS" (str (if-let [t0 (:start-ms env)]
                      (quot (- #?(:clj  (System/currentTimeMillis)
                                  :cljs (.getTime (js/Date.))) t0) 1000)

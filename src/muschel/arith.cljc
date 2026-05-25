@@ -57,8 +57,16 @@
 (defn- parse-long-dec [^String s] (parse-long-base s 10))
 
 (defn- ipow ^long [^long a ^long b]
-  #?(:clj  (long (Math/pow a b))
-     :cljs (long (js/Math.pow a b))))
+  ;; bash treats `**` overflow by wrapping into a 64-bit signed int.
+  ;; Math/pow returns a double; for huge `b`, Infinity → Long throws.
+  ;; Walk iteratively with multiplication; let JVM Long overflow happen
+  ;; (matches bash's behavior on most platforms).
+  (cond
+    (neg? b) 0
+    (zero? b) 1
+    :else
+    (loop [acc 1 i 0]
+      (if (>= i b) acc (recur (unchecked-multiply acc a) (inc i))))))
 
 ;; ============================================================================
 ;; Tokenizer

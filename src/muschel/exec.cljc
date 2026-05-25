@@ -89,15 +89,45 @@
   (let [h (:host base-opts)]
     {:cmd-subst
      (fn [env body]
-       (let [ast (parse/parse body)
-             sb-out (host/string-sink h)
-             nested-opts (assoc base-opts :out sb-out)
-             env' (exec-stmts env (:stmts ast) nested-opts)]
-         [env' (host/sink->string h sb-out)]))
+       (let [;; bash quirk: $(< file) reads the file directly (no
+             ;; fork). Match by checking for a leading `<` after trim.
+             trimmed (str/triml (or body ""))]
+         (cond
+           (str/starts-with? trimmed "<")
+           (let [path (str/trim (subs trimmed 1))
+                 ;; Resolve relative to cwd via the host.
+                 abs (if (str/starts-with? path "/")
+                       path
+                       (str (:cwd env) "/" path))]
+             (try
+               (let [content (host/read-file h abs)]
+                 [env (str/replace content #"\n+$" "")])
+               (catch #?(:clj Throwable :cljs :default) _
+                 [(env/record-exit env 1) ""])))
+
+           :else
+           ;; bash isolates cmd-subst into a subshell: env mutations
+           ;; (cd, var assigns, etc.) don't leak back to the parent.
+           ;; Only :last-exit propagates.
+           (let [ast (parse/parse body)
+                 sb-out (host/string-sink h)
+                 nested-opts (assoc base-opts :out sb-out)
+                 child (env/fork env)
+                 env' (exec-stmts child (:stmts ast) nested-opts)]
+             [(env/record-exit env (:last-exit env'))
+              (host/sink->string h sb-out)]))))
      :arith
      (fn [env expr]
-       (let [[env' v] (arith/evaluate env expr)]
-         [env' v]))}))
+       ;; Arith errors (div by zero, bad parse) surface as bash
+       ;; runtime errors — print to stderr, return 0, mark exit 1.
+       (try
+         (let [[env' v] (arith/evaluate env expr)]
+           [env' v])
+         (catch #?(:clj clojure.lang.ExceptionInfo
+                   :cljs ExceptionInfo) e
+           (host/write-string! h (:err base-opts)
+                               (str (.getMessage e) "\n"))
+           [(env/record-exit env 1) 0])))}))
 
 (defn- expand-words [env words opts]
   (expand/expand-words env words
@@ -254,19 +284,42 @@
         (let [target (if (nil? path)
                        (env/get-var env "HOME")
                        path)]
-          (when (or (nil? target) (= "" target))
-            (write-line opts :err "cd: HOME not set\n")
-            (env/record-exit env 1))
-          (let [env' (env/cd env target)]
-            (env/record-exit env' 0)))
+          (cond
+            (or (nil? target) (= "" target))
+            (do (write-line opts :err "cd: HOME not set\n")
+                (env/record-exit env 1))
+
+            :else
+            (let [env' (env/cd env target)
+                  ;; Verify the resolved cwd actually exists + is a dir.
+                  fi (host/file-info (:host opts) (:cwd env'))]
+              (cond
+                (not (:exists? fi))
+                (do (write-line opts :err
+                                (str "cd: no such file or directory: \""
+                                     target "\"\n"))
+                    (env/record-exit env 1))
+                (not (:dir? fi))
+                (do (write-line opts :err
+                                (str "cd: not a directory: \""
+                                     target "\"\n"))
+                    (env/record-exit env 1))
+                :else (env/record-exit env' 0)))))
         (catch #?(:clj Throwable :cljs :default) e
           (write-line opts :err (str "cd: " (.getMessage e) "\n"))
           (env/record-exit env 1))))))
 
 (defn- builtin-pwd
-  [env _args opts]
-  (write-line opts :out (str (:cwd env) "\n"))
-  (env/record-exit env 0))
+  "POSIX `pwd [-L|-P]`. We don't distinguish logical vs physical paths
+   (no symlink resolution), but we still reject unknown flags."
+  [env args opts]
+  (if-let [bad (some #(when (and (str/starts-with? % "-")
+                                 (not (re-matches #"-[LP]+" %))) %)
+                     args)]
+    (do (write-line opts :err (str "invalid option: \"" bad "\"\n"))
+        (env/record-exit env 2))
+    (do (write-line opts :out (str (:cwd env) "\n"))
+        (env/record-exit env 0))))
 
 (defn- builtin-echo
   "bash `echo [-neE] [arg ...]`. Flags only count if they appear at
@@ -306,14 +359,17 @@
   [env args _opts]
   (env/record-exit (reduce env/unset-var env args) 0))
 
+(def ^:private set-short-flags #{\e \u \x \f \n \a \v \m \E \B \H \C \P \T})
+(def ^:private set-long-options
+  #{"errexit" "nounset" "xtrace" "noglob" "noexec" "allexport"
+    "pipefail" "verbose" "history" "monitor" "physical"})
+
 (defn- builtin-set
-  [env args _opts]
+  [env args opts]
   ;; `set -e/-u/-x/+e/+u/+x` toggle options. A bare `--` ends option
   ;; parsing and causes everything after it (which may be empty) to
   ;; REPLACE the positional params — `set --` clears them.
-  ;; If no `--` appears and there are non-option args, those replace
-  ;; positionals (legacy form). With no args at all, set prints all
-  ;; vars (not implemented — exits 0).
+  ;; Unknown options error out.
   (let [arg-vec (vec args)
         sep-ix  (some (fn [[i a]] (when (= "--" a) i))
                       (map-indexed vector arg-vec))
@@ -330,22 +386,64 @@
                      (vec (drop-while #(or (str/starts-with? % "-")
                                            (str/starts-with? % "+"))
                                       arg-vec))))
-        env' (reduce
-              (fn [e a]
-                (let [on? (str/starts-with? a "-")
-                      flags (subs a 1)]
-                  (reduce
-                   (fn [e c]
-                     (case c
-                       \e (env/set-option e :errexit on?)
-                       \u (env/set-option e :nounset on?)
-                       \x (env/set-option e :xtrace on?)
-                       \f (env/set-option e :noglob on?)
-                       e))
-                   e flags)))
-              env opt-args)
-        env'' (if (some? pos-args) (env/with-pos-args env' pos-args) env')]
-    (env/record-exit env'' 0)))
+        ;; Pre-validate: detect bad short flags and bad -o LONGOPT.
+        bad-flag (some (fn [a]
+                         (when (> (count a) 1)
+                           (cond
+                             ;; -o LONGOPT / +o LONGOPT validated below
+                             (and (= 2 (count a)) (or (= "-o" a) (= "+o" a)))
+                             nil
+                             :else
+                             (some #(when-not (set-short-flags %) %)
+                                   (rest a)))))
+                       opt-args)
+        ;; Handle `-o name` / `+o name` pairs.
+        [opt-pairs leftover] (loop [in opt-args pairs [] left []]
+                               (cond
+                                 (empty? in) [pairs left]
+                                 (and (#{"-o" "+o"} (first in)) (>= (count in) 2))
+                                 (recur (drop 2 in) (conj pairs (vec (take 2 in))) left)
+                                 :else (recur (rest in) pairs (conj left (first in)))))
+        bad-long (some (fn [[op v]]
+                         (when-not (set-long-options v) v))
+                       opt-pairs)]
+    (cond
+      bad-flag
+      (do (write-line opts :err (str "set: invalid option: \"-" (str bad-flag) "\"\n"))
+          (env/record-exit env 2))
+
+      bad-long
+      (do (write-line opts :err (str "set: invalid option: \"" bad-long "\"\n"))
+          (env/record-exit env 2))
+
+      :else
+      (let [env' (reduce
+                  (fn [e a]
+                    (let [on? (str/starts-with? a "-")
+                          flags (subs a 1)]
+                      (reduce
+                       (fn [e c]
+                         (case c
+                           \e (env/set-option e :errexit on?)
+                           \u (env/set-option e :nounset on?)
+                           \x (env/set-option e :xtrace on?)
+                           \f (env/set-option e :noglob on?)
+                           e))
+                       e flags)))
+                  env leftover)
+            env' (reduce (fn [e [op long]]
+                           (let [on? (= op "-")
+                                 k (case long
+                                     "errexit"  :errexit
+                                     "nounset"  :nounset
+                                     "xtrace"   :xtrace
+                                     "noglob"   :noglob
+                                     "pipefail" :pipefail
+                                     nil)]
+                             (if k (env/set-option e k on?) e)))
+                         env' opt-pairs)
+            env'' (if (some? pos-args) (env/with-pos-args env' pos-args) env')]
+        (env/record-exit env'' 0)))))
 
 (defn- builtin-shift
   [env args opts]
@@ -412,22 +510,28 @@
 (defn- builtin-continue [env args opts] (builtin-break-or-continue "continue" env args opts))
 
 (defn- builtin-return
-  "`return [N]` — exit a function with status N (default $?).
-   Outside a function this would normally error, but bash allows it
-   inside a sourced file. For simplicity we set :returning? regardless;
-   the function-call wrapper clears it."
+  "`return [N]` — exit a function with status N (default $?). Outside
+   a function (and outside a sourced file), bash errors with
+   \"return: can only be done from a func or sourced script\"."
   [env args opts]
-  (let [n (if (seq args)
-            (try (parse-int* (first args))
-                 (catch #?(:clj Exception :cljs :default) _ nil))
-            (:last-exit env))]
-    (if (nil? n)
-      (do (write-line opts :err (str "invalid return status code: \""
-                                     (first args) "\"\n"))
-          (env/record-exit env 2))
-      (-> env
-          (env/record-exit (bit-and (long n) 0xff))
-          (assoc :returning? true)))))
+  (cond
+    (and (empty? (:scope-stack env)) (not (:sourcing? env)))
+    (do (write-line opts :err
+                    "return: can only be done from a func or sourced script\n")
+        (env/record-exit env 1))
+
+    :else
+    (let [n (if (seq args)
+              (try (parse-int* (first args))
+                   (catch #?(:clj Exception :cljs :default) _ nil))
+              (:last-exit env))]
+      (if (nil? n)
+        (do (write-line opts :err (str "invalid return status code: \""
+                                       (first args) "\"\n"))
+            (env/record-exit env 2))
+        (-> env
+            (env/record-exit (bit-and (long n) 0xff))
+            (assoc :returning? true))))))
 
 (defn- parse-printf-int
   "bash printf accepts decimal `42`, octal `010` → 8, hex `0x10` → 16,
@@ -578,11 +682,15 @@
     (env/record-exit
      (reduce (fn [e arg]
                (let [[name value] (parse-name=value arg)
-                     e (if value
-                         (env/set-var e name value)
-                         (assoc-in e [:vars name]
-                                   {:value "" :exported? false
-                                    :readonly? false}))
+                     e (cond
+                         ;; `declare NAME=value` — set new value
+                         value (env/set-var e name value)
+                         ;; `declare NAME` — preserve existing value
+                         ;; if any (bash quirk); otherwise create empty.
+                         (env/declared? e name) e
+                         :else (assoc-in e [:vars name]
+                                         {:value "" :exported? false
+                                          :readonly? false}))
                      e (if export? (env/export e name) e)
                      e (if readonly? (env/mark-readonly e name) e)]
                  e))
@@ -641,41 +749,280 @@
 
 (declare ^:private builtins)
 
+(def ^:private shell-keywords
+  #{"if" "then" "elif" "else" "fi"
+    "for" "while" "until" "do" "done"
+    "case" "esac" "in"
+    "function" "select" "time" "coproc"
+    "!" "{" "}" "[[" "]]"})
+
+(defn- type-of-name
+  "Returns one of :keyword :builtin :function :file :not-found for
+   how bash would resolve `name`. Used by builtin-type for both the
+   long-form output and the `-t` short-form."
+  [env name h]
+  (cond
+    (shell-keywords name) :keyword
+    ;; bash: a function shadows a builtin (mvdan test: `echo() { :; };
+    ;; type echo` → "echo is a function").
+    (env/lookup-fn env name) :function
+    (contains? builtins name) :builtin
+    :else
+    (let [paths (str/split (or (env/get-var env "PATH") "") #":")]
+      (if (some (fn [p]
+                  (let [c (str p "/" name)]
+                    (and (host/file-exists? h c) (host/file-executable? h c))))
+                paths)
+        :file
+        :not-found))))
+
 (defn- builtin-type
-  "`type CMD ...` — report how each CMD would be resolved.
-   Output formats (bash-style):
-     CMD is a shell builtin
-     CMD is a function
-     CMD is /path/to/cmd
-     bash: type: CMD: not found    (stderr; exit nonzero)"
+  "`type [-t|-p|-P] CMD ...` — report how each CMD would be resolved.
+   With `-t`: short form (`alias|keyword|function|builtin|file`).
+   With `-p` / `-P`: print PATH match (empty for builtins/funcs)."
   [env args opts]
   (if (empty? args)
     (env/record-exit env 0)
-    (let [any-bad? (volatile! false)]
-      (doseq [name args]
+    (let [any-bad? (volatile! false)
+          [flags names] (split-with #(str/starts-with? % "-") args)
+          flag-str (apply str (map #(subs % 1) flags))
+          short? (str/includes? flag-str "t")
+          path?  (or (str/includes? flag-str "p") (str/includes? flag-str "P"))
+          h (:host opts)]
+      (doseq [name names]
+        (let [k (type-of-name env name h)]
+          (cond
+            short?
+            (case k
+              :keyword  (write-line opts :out "keyword\n")
+              :builtin  (write-line opts :out "builtin\n")
+              :function (write-line opts :out "function\n")
+              :file     (write-line opts :out "file\n")
+              :not-found (vreset! any-bad? true))
+
+            path?
+            (case k
+              :file (let [paths (str/split (or (env/get-var env "PATH") "") #":")
+                          found (some (fn [p]
+                                        (let [c (str p "/" name)]
+                                          (when (and (host/file-exists? h c)
+                                                     (host/file-executable? h c))
+                                            c)))
+                                      paths)]
+                      (when found (write-line opts :out (str found "\n"))))
+              ;; -p prints nothing for non-file resolutions; -P keeps
+              ;; trying path even when there's a builtin/function. We
+              ;; treat both the same (POSIX `-p` for now).
+              (do nil (vreset! any-bad? true)))
+
+            :else
+            (case k
+              :keyword  (write-line opts :out (str name " is a shell keyword\n"))
+              :function (write-line opts :out (str name " is a function\n"))
+              :builtin  (write-line opts :out (str name " is a shell builtin\n"))
+              :file (let [paths (str/split (or (env/get-var env "PATH") "") #":")
+                          found (some (fn [p]
+                                        (let [c (str p "/" name)]
+                                          (when (and (host/file-exists? h c)
+                                                     (host/file-executable? h c))
+                                            c)))
+                                      paths)]
+                      (write-line opts :out (str name " is " found "\n")))
+              :not-found (do (write-line opts :err (str "type: " name ": not found\n"))
+                             (vreset! any-bad? true))))))
+      (env/record-exit env (if @any-bad? 1 0)))))
+
+(declare run-argv run-external)
+
+(defn- builtin-command
+  "`command [-v|-V] [-p] NAME [arg ...]` — run NAME, bypassing function
+   lookup. With `-v` print the command resolution (path / `NAME is a
+   shell builtin` / function name) — exit 0 on found, 1 on not found.
+
+   Bash quirks we honour:
+   - `-v foo` prints `foo` for builtin/function, the path for an
+     external. Multiple names with -v: only print the FIRST that
+     resolves; if any name doesn't resolve, exit 1 at the end.
+   - Unknown flag → 'command: invalid option' + exit 2."
+  [env args opts]
+  (let [;; Parse leading -v/-V/-p flags (combined like -vp accepted).
+        [flag-args rest-args]
+        (split-with (fn [a]
+                      (and (str/starts-with? a "-") (not= a "--")))
+                    args)
+        rest-args (vec (if (= "--" (first rest-args)) (rest rest-args) rest-args))
+        flags (apply str (map #(subs % 1) flag-args))
+        bad-flag (some #(when-not (#{\v \V \p} %) %) flags)]
+    (cond
+      bad-flag
+      (do (write-line opts :err (str "command: invalid option \"-"
+                                     (str bad-flag) "\"\n"))
+          (env/record-exit env 2))
+
+      (str/includes? flags "v")
+      ;; -v: print how each name would resolve, return 0 if any
+      ;; resolved (bash actually exits 1 if NONE resolved; with multiple
+      ;; names it exits 0 as soon as one resolves but keeps printing).
+      (let [any? (volatile! false)
+            h (:host opts)
+            path-env (env/get-var env "PATH")
+            paths (str/split (or path-env "") #":")]
+        (doseq [name rest-args]
+          (cond
+            (env/lookup-fn env name)
+            (do (write-line opts :out (str name "\n")) (vreset! any? true))
+
+            (contains? builtins name)
+            (do (write-line opts :out (str name "\n")) (vreset! any? true))
+
+            :else
+            (when-let [found (some (fn [p]
+                                     (let [c (str p "/" name)]
+                                       (when (and (host/file-exists? h c)
+                                                  (host/file-executable? h c))
+                                         c)))
+                                   paths)]
+              (write-line opts :out (str found "\n"))
+              (vreset! any? true))))
+        (env/record-exit env (if @any? 0 1)))
+
+      (empty? rest-args)
+      (env/record-exit env 0)
+
+      :else
+      ;; Plain `command NAME args` — run NAME, skipping function table.
+      (let [name (first rest-args)
+            args' (vec (rest rest-args))]
         (cond
           (contains? builtins name)
-          (write-line opts :out (str name " is a shell builtin\n"))
-
-          (env/lookup-fn env name)
-          (write-line opts :out (str name " is a function\n"))
-
+          ((get builtins name) env args' opts)
           :else
-          ;; Search PATH for the executable via host
-          (let [h (:host opts)
-                path-env (env/get-var env "PATH")
-                paths (str/split (or path-env "") #":")
-                found (some (fn [p]
-                              (let [candidate (str p "/" name)]
-                                (when (and (host/file-exists? h candidate)
-                                           (host/file-executable? h candidate))
-                                  candidate)))
-                            paths)]
-            (if found
-              (write-line opts :out (str name " is " found "\n"))
-              (do (write-line opts :err (str "type: " name ": not found\n"))
-                  (vreset! any-bad? true))))))
-      (env/record-exit env (if @any-bad? 1 0)))))
+          (run-external env name args' {} opts))))))
+
+(defn- print-dir-stack
+  "bash's pushd/popd/dirs print the stack with $HOME → ~ substituted."
+  [env opts]
+  (let [home (env/get-var env "HOME")
+        tilde (fn [p]
+                (if (and home (not= "" home) (str/starts-with? p home))
+                  (str "~" (subs p (count home)))
+                  p))
+        stack (cons (:cwd env) (or (:dir-stack env) []))]
+    (write-line opts :out (str (str/join " " (map tilde stack)) "\n"))))
+
+(defn- builtin-pushd
+  "POSIX/bash `pushd [DIR]` — push current dir + cd to DIR. With no
+   args, swap top of stack. Prints the new stack on success."
+  [env args opts]
+  (let [args (vec (filter #(not (str/starts-with? % "-")) args))
+        target (first args)
+        stack (or (:dir-stack env) [])
+        old-cwd (:cwd env)]
+    (cond
+      (and (empty? target) (empty? stack))
+      (do (write-line opts :err "pushd: no other directory\n")
+          (env/record-exit env 1))
+
+      ;; pushd (no args): swap top of stack with cwd
+      (empty? target)
+      (let [new-cwd (first stack)
+            new-stack (vec (cons old-cwd (rest stack)))
+            env' (assoc env :cwd new-cwd :dir-stack new-stack)]
+        (print-dir-stack env' opts)
+        (env/record-exit env' 0))
+
+      :else
+      (let [fi (host/file-info (:host opts) target)]
+        (if (and (:exists? fi) (:dir? fi))
+          (let [env' (env/cd env target)
+                env' (assoc env' :dir-stack (vec (cons old-cwd stack)))]
+            (print-dir-stack env' opts)
+            (env/record-exit env' 0))
+          (do (write-line opts :err
+                          (str "pushd: " target ": No such file or directory\n"))
+              (env/record-exit env 1)))))))
+
+(defn- builtin-popd
+  "POSIX/bash `popd` — pop the dir stack, cd to the popped dir."
+  [env _args opts]
+  (let [stack (or (:dir-stack env) [])]
+    (if (empty? stack)
+      (do (write-line opts :err "popd: directory stack empty\n")
+          (env/record-exit env 1))
+      (let [target (first stack)
+            env' (env/cd env target)
+            env' (assoc env' :dir-stack (vec (rest stack)))]
+        (print-dir-stack env' opts)
+        (env/record-exit env' 0)))))
+
+(defn- builtin-dirs
+  "POSIX/bash `dirs [-c]` — print the dir stack."
+  [env args opts]
+  (cond
+    (some #(= "-c" %) args)
+    (env/record-exit (assoc env :dir-stack []) 0)
+    :else
+    (do (print-dir-stack env opts)
+        (env/record-exit env 0))))
+
+(defn- read-one-line
+  "Drain the next line from `source`. Strips the trailing `\\n`. nil
+   if EOF. Handles both string sources (via host) and plain strings."
+  [host source]
+  (when source
+    (let [all (host/read-all-string host source)]
+      (cond
+        (or (nil? all) (= "" all)) nil
+        :else
+        (let [nl (.indexOf ^String all "\n")]
+          (if (neg? nl)
+            all
+            (subs all 0 nl)))))))
+
+(defn- builtin-read
+  "POSIX `read [-r] [-d delim] [-p prompt] var ...` — minimal impl.
+
+   Reads one line from stdin (the host's stdin via opts), splits it
+   into fields by IFS, and assigns to the given vars (last var gets
+   the remainder). With no vars, stores in REPLY. Exit 0 on read,
+   1 on EOF.
+
+   Not yet implemented: `-n` (n chars), `-t` (timeout), `-s` (silent),
+   `-a` (array), `-N` (exact bytes)."
+  [env args opts]
+  (let [;; Strip flags (we accept but ignore most for now).
+        [flags rest]
+        (loop [args args flags #{}]
+          (let [a (first args)]
+            (cond
+              (= a "-r") (recur (rest args) (conj flags :raw))
+              (or (= a "-d") (= a "-p") (= a "-n") (= a "-t")
+                  (= a "-N") (= a "-u"))
+              ;; flags that take a value — skip the value too
+              (recur (drop 2 args) (conj flags a))
+              :else [flags args])))
+        vars (if (seq rest) (vec rest) ["REPLY"])
+        h (:host opts)
+        line (read-one-line h (:in opts))]
+    (if (nil? line)
+      (env/record-exit env 1)
+      (let [ifs (:ifs env)
+            ;; bash splits the line by IFS — first N-1 vars get one
+            ;; field each; the last var gets the remainder.
+            n (count vars)
+            line (if (:raw flags) line
+                     ;; `read` without `-r` interprets `\` escapes.
+                     (str/replace line #"\\(.)" "$1"))
+            fields (if (= 1 n)
+                     [line]
+                     (let [parts (str/split line (re-pattern (str "[" (str/escape (or ifs " \t")
+                                                                                  {\\ "\\\\"}) "]+"))
+                                            n)]
+                       (vec parts)))
+            env' (reduce (fn [e [v val]]
+                           (env/set-var e v (or val "")))
+                         env (map vector vars fields))]
+        (env/record-exit env' 0)))))
 
 (defn- builtin-printf
   [env args opts]
@@ -701,15 +1048,26 @@
             (env/record-exit env 0)))))))
 
 (defn- builtin-let
-  [env args _opts]
+  [env args opts]
   ;; `let expr [expr...]` — evaluate each arithmetic expression.
   ;; Exit status is 0 iff the LAST expression's value is non-zero.
-  (let [[env' last-v]
-        (reduce (fn [[env _] expr]
-                  (arith/evaluate env expr))
-                [env 0]
+  ;; Arith errors (divide-by-zero, parse failures) print to stderr
+  ;; and continue with the remaining expressions.
+  (let [[env' last-v err?]
+        (reduce (fn [[env _last err?] expr]
+                  (try
+                    (let [[env' v] (arith/evaluate env expr)]
+                      [env' v err?])
+                    (catch #?(:clj clojure.lang.ExceptionInfo
+                              :cljs ExceptionInfo) e
+                      (write-line opts :err (str (.getMessage e) "\n"))
+                      [env 0 true])))
+                [env 0 false]
                 args)]
-    (env/record-exit env' (if (zero? last-v) 1 0))))
+    (env/record-exit env' (cond
+                            err? 1
+                            (zero? last-v) 1
+                            :else 0))))
 
 (defn- builtin-test
   "POSIX `test` / `[`. Builtin to avoid spawning a subprocess per
@@ -745,7 +1103,8 @@
                                (and (:exists? i) (pos? (or (:size i) 0)))))
         symlink?     (fn [p] (:symlink? (info p)))
         parse-int-or (fn [s fallback]
-                       (try (parse-int* s) (catch #?(:clj Exception :cljs :default) _ fallback)))]
+                       (try (parse-int* (str/trim (str s)))
+                            (catch #?(:clj Exception :cljs :default) _ fallback)))]
     (cond
       (empty? args) (false!)
 
@@ -908,6 +1267,11 @@
    "source"   builtin-source
    "."        builtin-source
    "type"     builtin-type
+   "command"  builtin-command
+   "read"     builtin-read
+   "pushd"    builtin-pushd
+   "popd"     builtin-popd
+   "dirs"     builtin-dirs
    "local"    builtin-local
    "declare"  builtin-declare
    "typeset"  builtin-declare
@@ -1085,14 +1449,19 @@
 
 (defn- run-binary [env binary opts]
   (case (:op binary)
+    ;; bash quirk: errexit is suppressed for the LEFT of `&&`/`||` and
+    ;; for the whole construct when it appears in protected context;
+    ;; the right side runs at the same protection level as the parent.
     :and
-    (let [env' (exec-stmt env (:left binary) opts)]
+    (let [env' (exec-stmt env (:left binary)
+                          (assoc opts :errexit-protected? true))]
       (if (zero? (:last-exit env'))
         (exec-stmt env' (:right binary) opts)
         env'))
 
     :or
-    (let [env' (exec-stmt env (:left binary) opts)]
+    (let [env' (exec-stmt env (:left binary)
+                          (assoc opts :errexit-protected? true))]
       (if (zero? (:last-exit env'))
         env'
         (exec-stmt env' (:right binary) opts)))
@@ -1165,7 +1534,9 @@
   ;; POSIX: when an if has no else branch and the cond is false (or no
   ;; elif matches), the exit status is 0 — not the failed cond's
   ;; status. Only the body that ACTUALLY ran determines exit.
-  (let [env-cond (exec-stmts env (:cond cmd) opts)]
+  ;; Conditions of `if`/`elif` are errexit-protected.
+  (let [cond-opts (assoc opts :errexit-protected? true)
+        env-cond (exec-stmts env (:cond cmd) cond-opts)]
     (cond
       (zero? (:last-exit env-cond))
       (exec-stmts env-cond (:then cmd) opts)
@@ -1177,7 +1548,7 @@
             (exec-stmts env (:else cmd) opts)
             (env/record-exit env 0))
           (let [{:keys [cond then]} (first elifs)
-                env-c (exec-stmts env cond opts)]
+                env-c (exec-stmts env cond cond-opts)]
             (if (zero? (:last-exit env-c))
               (exec-stmts env-c then opts)
               (recur env-c (rest elifs))))))
@@ -1238,53 +1609,68 @@
 
 (defn- run-while [env cmd opts]
   ;; POSIX: loop exit is the last body's exit, or 0 if body never ran.
-  (with-in-loop env
-    (fn [env-in-loop]
-      (loop [env env-in-loop last-body-exit 0 ran-body? false]
-        (let [env-c (exec-stmts env (:cond cmd) opts)]
-          (if (zero? (:last-exit env-c))
-            (let [env-b (exec-stmts env-c (:body cmd) opts)
-                  [k env-after] (handle-loop-iteration env-b)]
-              (case k
-                :abort env-after
-                :done  env-after
-                :next  (recur env-after (:last-exit env-b) true)))
-            (env/record-exit env-c (if ran-body? last-body-exit 0))))))))
+  ;; While/until conditions are errexit-protected (matching bash).
+  (let [cond-opts (assoc opts :errexit-protected? true)]
+    (with-in-loop env
+      (fn [env-in-loop]
+        (loop [env env-in-loop last-body-exit 0 ran-body? false]
+          (let [env-c (exec-stmts env (:cond cmd) cond-opts)]
+            (if (zero? (:last-exit env-c))
+              (let [env-b (exec-stmts env-c (:body cmd) opts)
+                    [k env-after] (handle-loop-iteration env-b)]
+                (case k
+                  :abort env-after
+                  :done  env-after
+                  :next  (recur env-after (:last-exit env-b) true)))
+              (env/record-exit env-c (if ran-body? last-body-exit 0)))))))))
 
 (defn- run-until [env cmd opts]
-  (with-in-loop env
-    (fn [env-in-loop]
-      (loop [env env-in-loop last-body-exit 0 ran-body? false]
-        (let [env-c (exec-stmts env (:cond cmd) opts)]
-          (if (not (zero? (:last-exit env-c)))
-            (let [env-b (exec-stmts env-c (:body cmd) opts)
-                  [k env-after] (handle-loop-iteration env-b)]
-              (case k
-                :abort env-after
-                :done  env-after
-                :next  (recur env-after (:last-exit env-b) true)))
-            (env/record-exit env-c (if ran-body? last-body-exit 0))))))))
+  (let [cond-opts (assoc opts :errexit-protected? true)]
+    (with-in-loop env
+      (fn [env-in-loop]
+        (loop [env env-in-loop last-body-exit 0 ran-body? false]
+          (let [env-c (exec-stmts env (:cond cmd) cond-opts)]
+            (if (not (zero? (:last-exit env-c)))
+              (let [env-b (exec-stmts env-c (:body cmd) opts)
+                    [k env-after] (handle-loop-iteration env-b)]
+                (case k
+                  :abort env-after
+                  :done  env-after
+                  :next  (recur env-after (:last-exit env-b) true)))
+              (env/record-exit env-c (if ran-body? last-body-exit 0)))))))))
+
+(defn- word-has-quoted-part?
+  "True if `word` (AST) contains any :squoted, :dquoted, :escape part —
+   meaning bash treats the corresponding text as LITERAL, not glob,
+   when used as a pattern on the RHS of `==` / `!=` / `case`."
+  [word]
+  (boolean
+   (some (fn [p] (#{:squoted :dquoted :escape :ansi-c-quoted} (:type p)))
+         (:parts word))))
 
 (defn- test-primary
   "Evaluate one 'primary' test expression — 1, 2, or 3 string args
    like `-f file`, `a == b`. Returns true/false bool. For `==`/`!=`
    inside `[[ ]]`, the right side is treated as a GLOB pattern (bash
-   semantics)."
-  [env words double? opts]
+   semantics) UNLESS the RHS AST word had any quoted parts, in which
+   case it's a literal match."
+  [env words double? rhs-quoted? opts]
   (let [h (:host opts)
         tmp-env (env/record-exit env 0)
         r (builtin-test tmp-env (vec words)
-                        ;; Suppress error output during compound eval
                         (assoc opts
                                :err (host/string-sink h)
                                :out (host/string-sink h)))]
     (cond
-      ;; In [[ ]], == and != do PATTERN matching, not literal compare.
       (and double? (= 3 (count words)) (#{"==" "!="} (second words)))
       (let [[a op b] words
-            pat (expand/glob->regex b)
-            rx (re-pattern (str "^" pat "$"))
-            match? (boolean (re-find rx a))]
+            match? (if rhs-quoted?
+                     (= a b)
+                     (let [pat (expand/glob->regex b)
+                           ;; (?s) = DOTALL: `*` (→ `.*`) matches `\n`
+                           ;; too, so `[[ "a\nb" == *b ]]` works.
+                           rx  (re-pattern (str "(?s)^" pat "$"))]
+                       (boolean (re-find rx a))))]
         (if (= op "==") match? (not match?)))
 
       :else
@@ -1300,32 +1686,59 @@
     @groups))
 
 (defn- eval-compound-test
-  [env strs double? opts]
-  (let [or-groups (split-on #(= "||" %) strs)]
+  "Evaluate the inner expression of `[[ ... ]]`.
+
+   `strs` is a vector of expanded strings (one per AST arg);
+   `quoteds?` is the parallel vector of quoted-flag booleans so that
+   `==` / `!=` know when to treat their RHS as literal."
+  [env strs quoteds? double? opts]
+  (let [or-groups (split-on #(= "||" %) strs)
+        ;; Track grouping by index so we can read quoteds? alongside.
+        idxs (vec (range (count strs)))
+        or-idx-groups (split-on #(= "||" (nth strs %)) idxs)]
     (some
-     (fn [or-group]
-       (let [and-groups (split-on #(= "&&" %) or-group)]
+     (fn [[or-group or-idx-group]]
+       (let [and-groups (split-on #(= "&&" %) or-group)
+             and-idx-groups (split-on #(= "&&" (nth strs %)) or-idx-group)]
          (every?
-          (fn [and-group]
-            (let [[negated? body]
-                  (loop [n? false g and-group]
+          (fn [[and-group and-idx-group]]
+            (let [[negated? body body-idxs]
+                  (loop [n? false g and-group ig and-idx-group]
                     (if (= (first g) "!")
-                      (recur (not n?) (rest g))
-                      [n? (vec g)]))]
+                      (recur (not n?) (rest g) (rest ig))
+                      [n? (vec g) (vec ig)]))]
               (if (empty? body)
                 false
-                (let [r (test-primary env body double? opts)]
+                ;; For `a OP b` patterns, the RHS's quoted? is at the
+                ;; last index of body-idxs.
+                (let [rhs-q? (boolean (and (= 3 (count body))
+                                           (nth quoteds? (last body-idxs))))
+                      r (test-primary env body double? rhs-q? opts)]
                   (if negated? (not r) r)))))
-          and-groups)))
-     or-groups)))
+          (map vector and-groups and-idx-groups))))
+     (map vector or-groups or-idx-groups))))
+
+(defn- expand-test-args
+  "Expand each `[[ ]]` arg word to a single string (NO field-split, NO
+   glob — bash semantics inside `[[ ]]`). Returns [env strs quoteds?]
+   where quoteds? is the parallel vector of word-has-quoted-part?."
+  [env words opts]
+  (reduce (fn [[env strs qs] w]
+            (let [[env' v] (expand/expand-assign-value env w
+                                                       :cmd-subst (:cmd-subst opts)
+                                                       :arith (:arith opts))]
+              [env' (conj strs v) (conj qs (word-has-quoted-part? w))]))
+          [env [] []]
+          words))
 
 (defn- run-test-bracket
   [env cmd opts]
-  (let [[env' args] (expand-words env (:args cmd) opts)]
-    (case (:form cmd)
-      :single (builtin-test env' args opts)
-      :double (let [pass? (eval-compound-test env' (vec args) true opts)]
-                (env/record-exit env' (if pass? 0 1))))))
+  (case (:form cmd)
+    :single (let [[env' args] (expand-words env (:args cmd) opts)]
+              (builtin-test env' args opts))
+    :double (let [[env' args quoteds?] (expand-test-args env (:args cmd) opts)
+                  pass? (eval-compound-test env' (vec args) quoteds? true opts)]
+              (env/record-exit env' (if pass? 0 1)))))
 
 ;; ============================================================================
 ;; Stmt dispatch
@@ -1348,9 +1761,16 @@
     :function-def (env/define-fn (env/record-exit env 0) (:name cmd) (:body cmd))
     :test-bracket (run-test-bracket env cmd opts)
     :arith-cmd
-    ;; ((expr)) — evaluate; exit status is 0 if result is nonzero, 1 if zero
-    (let [[env' v] (arith/evaluate env (:expr cmd))]
-      (env/record-exit env' (if (zero? v) 1 0)))
+    ;; ((expr)) — evaluate; exit status is 0 if result is nonzero, 1
+    ;; if zero. Runtime arith errors (`((3/0))`) print to stderr and
+    ;; exit 1, matching bash.
+    (try
+      (let [[env' v] (arith/evaluate env (:expr cmd))]
+        (env/record-exit env' (if (zero? v) 1 0)))
+      (catch #?(:clj clojure.lang.ExceptionInfo
+                :cljs ExceptionInfo) e
+        (write-line opts :err (str (.getMessage e) "\n"))
+        (env/record-exit env 1)))
 
     :c-for
     ;; for ((init; cond; update)); do body; done
@@ -1386,6 +1806,9 @@
                               ;; Expand each pattern (no field-split; first
                               ;; field if multiple). Skip patterns containing
                               ;; cmd-subst-side-effects — handled by expand.
+                              ;; Each pattern carries its AST so we can
+                              ;; check if it was quoted (then it's a
+                              ;; literal match, not glob).
                               [env-p pats]
                               (reduce
                                (fn [[env acc] w]
@@ -1393,15 +1816,18 @@
                                                  env w
                                                  :cmd-subst (:cmd-subst opts)
                                                  :arith (:arith opts))]
-                                   [env' (conj acc p)]))
+                                   [env' (conj acc {:s p
+                                                    :quoted? (word-has-quoted-part? w)})]))
                                [env []]
                                (:patterns clause))
-                              matches? (some (fn [pat]
-                                               (let [rx (re-pattern
-                                                         (str "^"
-                                                              (expand/glob->regex pat)
-                                                              "$"))]
-                                                 (re-find rx word-val)))
+                              matches? (some (fn [{:keys [s quoted?]}]
+                                               (if quoted?
+                                                 (= s word-val)
+                                                 (let [rx (re-pattern
+                                                           (str "(?s)^"
+                                                                (expand/glob->regex s)
+                                                                "$"))]
+                                                   (re-find rx word-val))))
                                              pats)]
                           (if (or matches? force-run?)
                             (let [env-b (exec-stmts env-p (:body clause) opts)]
@@ -1426,6 +1852,9 @@
         cmd (:cmd stmt)
         cmd-redirs (:redirs cmd)
         all-redirs (vec (concat stmt-redirs cmd-redirs))
+        ;; A `!`-negated stmt is errexit-protected — the user is
+        ;; explicitly testing the inner cmd's status.
+        opts (cond-> opts (:neg? stmt) (assoc :errexit-protected? true))
         [env-r opts-r close!] (apply-redirs env all-redirs opts)
         cmd-without-redirs (dissoc cmd :redirs)]
     (try
@@ -1498,11 +1927,27 @@
       (pos? (or (:break-enclosing env) 0))
       (pos? (or (:continue-enclosing env) 0))))
 
+(defn- errexit-trip?
+  "True when `set -e` (errexit) is on AND the last stmt produced a
+   non-zero exit AND we're NOT in an errexit-protected context (the
+   condition of `if`/`while`/`until`, a non-final part of `&&`/`||`,
+   inside a `[[ ]]` or `[ ]`, or after a `!`-negated stmt).
+
+   bash semantics: only SIMPLE commands trip; `set -e; if false; …`
+   does NOT exit. The protected-context flag is set by callers
+   (run-if cond, run-binary left side, etc.) via opts."
+  [env opts]
+  (and (env/option env :errexit)
+       (not (zero? (or (:last-exit env) 0)))
+       (not (:errexit-protected? opts))))
+
 (defn exec-stmts [env stmts opts]
   (reduce (fn [env st]
-            (if (stop-propagating? env)
-              (reduced env)
-              (exec-stmt env st opts)))
+            (cond
+              (stop-propagating? env) (reduced env)
+              (errexit-trip? env opts)
+              (reduced (assoc env :exiting? true))
+              :else (exec-stmt env st opts)))
           env
           stmts))
 
