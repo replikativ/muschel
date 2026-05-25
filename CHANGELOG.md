@@ -83,7 +83,7 @@ via `build.clj`, so individual deployments carry a unique version.
 
 - JVM: 216 tests / 555 assertions
 - ClojureScript (node): 131 tests / 396 assertions
-- mvdan corpus: 650 / 852 cases passing (failure budget 205)
+- mvdan corpus: 661 / 852 cases passing (failure budget 195)
 
 ### Known gaps
 

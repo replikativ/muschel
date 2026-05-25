@@ -492,17 +492,24 @@
 
     :else
     (let [n (count raw)
-          ;; find end of NAME — first non-name char
-          name-end (loop [i 0]
-                     (if (< i n)
-                       (let [c (.charAt raw i)]
-                         (if (or (and (>= (int c) 48) (<= (int c) 57))
-                                 (and (>= (int c) 65) (<= (int c) 90))
-                                 (and (>= (int c) 97) (<= (int c) 122))
-                                 (= c \_))
-                           (recur (inc i))
-                           i))
-                       i))
+          ;; Special parameters (`@`, `*`, `?`, `$`, `#`, `!`, `0`-`9`)
+          ;; are single-char names at the start of the operand.
+          ;; Regular name chars: [A-Za-z_][A-Za-z_0-9]*.
+          first-c (and (pos? n) (.charAt raw 0))
+          special-1? (and first-c (#{\@ \* \? \$ \! \-} first-c))
+          name-end (cond
+                     special-1? 1
+                     :else
+                     (loop [i 0]
+                       (if (< i n)
+                         (let [c (.charAt raw i)]
+                           (if (or (and (>= (int c) 48) (<= (int c) 57))
+                                   (and (>= (int c) 65) (<= (int c) 90))
+                                   (and (>= (int c) 97) (<= (int c) 122))
+                                   (= c \_))
+                             (recur (inc i))
+                             i))
+                         i)))
           name (subs raw 0 name-end)]
       (if (= name-end n)
         {:op :plain :name name}
@@ -668,22 +675,45 @@
             [env (str decl " " name "=\""
                       (str/replace v "\"" "\\\"") "\"")])))
 
-      :substring    (let [{:keys [offset length]} opts
-                          n   (count v)
-                          ;; bash: negative offset = from end (requires a
-                          ;; leading space, ${a: -1}, which the lexer
-                          ;; preserves verbatim in the operand).
-                          off (cond
-                                (nil? offset) 0
-                                (neg? offset) (max 0 (+ n offset))
-                                :else         (min offset n))
-                          ;; bash: negative length = absolute position
-                          ;; from end (not relative to offset).
-                          end (cond
-                                (nil? length) n
-                                (neg? length) (max off (+ n length))
-                                :else         (max off (min (+ off length) n)))]
-                      [env (subs v off end)]))))
+      :substring
+      ;; bash quirk: when name is `@` or `*`, this slices the
+      ;; POSITIONAL ARRAY (N positionals starting at the offset),
+      ;; not the joined string. We render the result as a single
+      ;; space-joined string here; callers in dquoted contexts get
+      ;; the spaces preserved (the dquoted-$@ path handles split).
+      (cond
+        (#{"@" "*"} name)
+        (let [pos (vec (:pos-args env))
+              n (count pos)
+              {:keys [offset length]} opts
+              off (cond
+                    (nil? offset) 1
+                    (neg? offset) (max 0 (+ n offset 1))
+                    :else         (min offset (inc n)))
+              ;; bash: offset 0 means $0 + positionals; we approximate
+              ;; with $0 = script name + pos-args.
+              src (if (zero? off)
+                    (cons (:script env) pos)
+                    (drop (dec off) pos))
+              taken (if (nil? length)
+                      src
+                      (take (max 0 length) src))
+              sep (let [ifs (or (:ifs env) "")]
+                    (if (empty? ifs) "" (subs ifs 0 1)))]
+          [env (str/join sep taken)])
+
+        :else
+        (let [n (count v)
+              {:keys [offset length]} opts
+              off (cond
+                    (nil? offset) 0
+                    (neg? offset) (max 0 (+ n offset))
+                    :else         (min offset n))
+              end (cond
+                    (nil? length) n
+                    (neg? length) (max off (+ n length))
+                    :else         (max off (min (+ off length) n)))]
+          [env (subs v off end)])))))
 
 ;; ============================================================================
 ;; Word part expansion

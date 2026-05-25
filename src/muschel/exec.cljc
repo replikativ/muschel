@@ -372,37 +372,66 @@
   (let [arg-vec (vec args)
         sep-ix  (some (fn [[i a]] (when (= "--" a) i))
                       (map-indexed vector arg-vec))
+        ;; Build the opt-arg slice. Without `--`, take leading
+        ;; `-`/`+`-prefixed args AND consume one extra arg after any
+        ;; `-o`/`+o` even if it doesn't start with -/+ (it's the
+        ;; long-option name like `pipefail`).
         opt-args (if sep-ix
                    (subvec arg-vec 0 sep-ix)
-                   (vec (take-while #(or (str/starts-with? % "-")
-                                         (str/starts-with? % "+")) arg-vec)))
-        pos-args (when (or sep-ix (some? (first (drop-while
-                                                 #(or (str/starts-with? % "-")
-                                                      (str/starts-with? % "+"))
-                                                 arg-vec))))
+                   (loop [i 0 acc []]
+                     (let [a (when (< i (count arg-vec)) (nth arg-vec i))]
+                       (cond
+                         (nil? a) acc
+                         (or (str/starts-with? a "-") (str/starts-with? a "+"))
+                         (if (and (> (count a) 1)
+                                  (some #(= \o %) (rest a))
+                                  (< (inc i) (count arg-vec)))
+                           (recur (+ i 2) (conj acc a (nth arg-vec (inc i))))
+                           (recur (inc i) (conj acc a)))
+                         :else acc))))
+        pos-args (when (or sep-ix (< (count opt-args) (count arg-vec)))
                    (if sep-ix
                      (subvec arg-vec (inc sep-ix))
-                     (vec (drop-while #(or (str/starts-with? % "-")
-                                           (str/starts-with? % "+"))
-                                      arg-vec))))
-        ;; Pre-validate: detect bad short flags and bad -o LONGOPT.
-        bad-flag (some (fn [a]
-                         (when (> (count a) 1)
-                           (cond
-                             ;; -o LONGOPT / +o LONGOPT validated below
-                             (and (= 2 (count a)) (or (= "-o" a) (= "+o" a)))
-                             nil
-                             :else
-                             (some #(when-not (set-short-flags %) %)
-                                   (rest a)))))
-                       opt-args)
-        ;; Handle `-o name` / `+o name` pairs.
-        [opt-pairs leftover] (loop [in opt-args pairs [] left []]
-                               (cond
-                                 (empty? in) [pairs left]
-                                 (and (#{"-o" "+o"} (first in)) (>= (count in) 2))
-                                 (recur (drop 2 in) (conj pairs (vec (take 2 in))) left)
-                                 :else (recur (rest in) pairs (conj left (first in)))))
+                     (subvec arg-vec (count opt-args))))
+        ;; Walk opt-args once: split combined flags into ["-abc"] →
+        ;; chars [a b c]; when we see `o`, consume the next opt-arg
+        ;; as the long-option name. Track bad chars + bad long opts.
+        {bad-flag :bad-flag bad-long :bad-long opt-pairs :opt-pairs
+         leftover :leftover}
+        (loop [in opt-args
+               st {:bad-flag nil :bad-long nil :opt-pairs [] :leftover []}]
+          (cond
+            (or (:bad-flag st) (:bad-long st)) st
+            (empty? in) st
+            :else
+            (let [a (first in)
+                  sign (.charAt a 0)
+                  ;; chars after the sign
+                  cs (vec (rest a))]
+              (if (some #(= \o %) cs)
+                ;; Has `o`. Other chars (non-o) go to short flags;
+                ;; `o` consumes the NEXT arg as long-opt name.
+                (let [non-o (filter #(not= \o %) cs)
+                      next-arg (second in)
+                      bad-c (some #(when-not (set-short-flags %) %) non-o)]
+                  (cond
+                    bad-c (assoc st :bad-flag bad-c)
+                    (or (nil? next-arg) (str/starts-with? next-arg "-"))
+                    (assoc st :bad-long "")
+                    (not (set-long-options next-arg))
+                    (assoc st :bad-long next-arg)
+                    :else
+                    (recur (drop 2 in)
+                           (-> st
+                               (update :leftover into
+                                       (when (seq non-o)
+                                         [(apply str sign non-o)]))
+                               (update :opt-pairs conj
+                                       [(str sign) next-arg])))))
+                ;; No `o` — just validate short flags.
+                (if-let [bad (some #(when-not (set-short-flags %) %) cs)]
+                  (assoc st :bad-flag bad)
+                  (recur (rest in) (update st :leftover conj a)))))))
         bad-long (some (fn [[op v]]
                          (when-not (set-long-options v) v))
                        opt-pairs)]
@@ -1344,16 +1373,19 @@
    command, naked assignments mutate env permanently."
   [env call opts]
   (let [;; Expand args first (env may mutate from $X cmd-subst etc.)
+        ;; env1's :last-exit is the exit of the LAST cmd-subst that
+        ;; ran during expansion — bash propagates this when the call
+        ;; resolves to an empty command (e.g. `$(false)` alone).
         [env1 fields] (expand-words env (:args call) opts)
-        ;; bash quirk: `$(echo)` expands to "" and the whole call has
-        ;; an empty command name. Bash treats this as a no-op exit 0
-        ;; (no command lookup, no spawn) — match that.
+        cmd-subst-exit (:last-exit env1)
         fields (if (and (= 1 (count fields)) (= "" (first fields)))
                  []
                  fields)]
     (cond
       ;; Naked assignments: `FOO=bar BAZ=qux` (no cmd) — permanent.
-      ;; `FOO+=bar` appends to the existing value.
+      ;; `FOO+=bar` appends to the existing value. If the call had
+      ;; args that all expanded away (e.g. `$(false)`), bash propagates
+      ;; the LAST cmd-subst's exit; otherwise we record 0.
       (empty? fields)
       (let [env'
             (reduce
@@ -1363,8 +1395,9 @@
                                  (str (env/get-var env' (:name as)) val)
                                  val)]
                  (env/set-var env' (:name as) final)))
-             env1 (:assigns call))]
-        (env/record-exit env' 0))
+             env1 (:assigns call))
+            had-args? (seq (:args call))]
+        (env/record-exit env' (if had-args? (or cmd-subst-exit 0) 0)))
 
       :else
       (let [name (first fields)
