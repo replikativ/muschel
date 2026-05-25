@@ -11,8 +11,8 @@
 (defn- mk-host
   ([] (mk-host {}))
   ([{:keys [fs allowlist]
-     :or {fs (vfs/make {"/work/a.txt" "alpha\nbeta\ngamma"
-                        "/work/b.txt" "one\ntwo"}
+     :or {fs (vfs/make {"/work/a.txt" "alpha\nbeta\ngamma\n"
+                        "/work/b.txt" "one\ntwo\n"}
                        {:cwd "/work"})
           allowlist #{}}}]
    (hb/make {:fs fs
@@ -135,6 +135,27 @@
     (is (= 0 (:exit r)))
     (is (= "beta\n" (:stdout r)))))
 
+(deftest grep-dash-e-multiple-patterns
+  ;; -e PATTERN can be repeated; also lets patterns starting with `-`
+  ;; through without confusing tools.cli.
+  (let [r (run (mk-host) "grep -e alpha -e gamma a.txt")]
+    (is (= 0 (:exit r)))
+    (is (.contains ^String (:stdout r) "alpha"))
+    (is (.contains ^String (:stdout r) "gamma"))
+    (is (not (.contains ^String (:stdout r) "beta")))))
+
+(deftest grep-word-regexp
+  (let [fs (vfs/make {"/work/x.txt" "foobar\nfoo\nbarfoo"} {:cwd "/work"})
+        r  (run (mk-host {:fs fs}) "grep -w foo x.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "foo\n" (:stdout r)))))
+
+(deftest grep-files-without-match-stdin
+  ;; Regression: -L in stdin mode used to print `nil`.
+  (let [r (run (mk-host) "echo hello | grep -L bye")]
+    (is (= 0 (:exit r)))
+    (is (.contains ^String (:stdout r) "standard input"))))
+
 ;; ============================================================================
 ;; find
 ;; ============================================================================
@@ -178,6 +199,44 @@
     (is (re-find #"found" (:stdout r)))
     (is (re-find #"a\.txt" (:stdout r)))))
 
+(deftest find-root-no-OOM
+  ;; Regression: -list-dir "/" used to return a phantom "" entry which
+  ;; made find /-walk recurse forever.
+  (let [fs (vfs/make {"/a" "x" "/b" "y"} {:cwd "/"})
+        r (run (mk-host {:fs fs}) "find /")]
+    (is (= 0 (:exit r)))
+    (is (.contains ^String (:stdout r) "/a"))
+    (is (.contains ^String (:stdout r) "/b"))))
+
+(deftest find-or-operator
+  (let [fs (vfs/make {"/work/a.txt" "x" "/work/b.md" "y" "/work/c.org" "z"}
+                     {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "find . -name '*.txt' -o -name '*.md'")]
+    (is (= 0 (:exit r)))
+    (is (.contains ^String (:stdout r) "a.txt"))
+    (is (.contains ^String (:stdout r) "b.md"))
+    (is (not (.contains ^String (:stdout r) "c.org")))))
+
+(deftest find-not-operator
+  (let [fs (vfs/make {"/work/a.txt" "x" "/work/b.md" "y"} {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "find . -type f -not -name '*.txt'")]
+    (is (= 0 (:exit r)))
+    (is (not (.contains ^String (:stdout r) "a.txt")))
+    (is (.contains ^String (:stdout r) "b.md"))))
+
+(deftest find-mindepth
+  (let [fs (vfs/make {"/work/a" "x" "/work/sub/b" "y"} {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "find . -mindepth 2")]
+    (is (= 0 (:exit r)))
+    (is (.contains ^String (:stdout r) "sub/b"))
+    (is (not (re-find #"^\./a$" (:stdout r))))))
+
+(deftest find-iname-case-insensitive
+  (let [fs (vfs/make {"/work/README.MD" "x" "/work/notes.md" "y"} {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "find . -iname '*.md'")]
+    (is (.contains ^String (:stdout r) "README.MD"))
+    (is (.contains ^String (:stdout r) "notes.md"))))
+
 ;; ============================================================================
 ;; tr — stdin-only character transforms
 ;; ============================================================================
@@ -196,6 +255,18 @@
   (let [r (run (mk-host) "echo aaabbbccc | tr -s a-z")]
     (is (= 0 (:exit r)))
     (is (= "abc\n" (:stdout r)))))
+
+(deftest tr-character-classes
+  ;; The single most common tr idiom — used to no-op silently.
+  (let [r (run (mk-host) "echo Hello | tr '[:lower:]' '[:upper:]'")]
+    (is (= 0 (:exit r)))
+    (is (= "HELLO\n" (:stdout r)))))
+
+(deftest tr-rejects-extra-operand-with-d
+  ;; GNU tr exits non-zero on `tr -d SET1 SET2`. We used to silently drop SET2.
+  (let [r (run (mk-host) "echo abc | tr -d a b")]
+    (is (= 2 (:exit r)))
+    (is (re-find #"extra operand" (:stderr r)))))
 
 ;; ============================================================================
 ;; cut — column extraction
@@ -230,13 +301,24 @@
     (is (= "" (:stdout r)))))
 
 (deftest diff-different-exits-one-unified
-  (let [fs (vfs/make {"/work/x" "a\nb\nc" "/work/y" "a\nB\nc"} {:cwd "/work"})
+  (let [fs (vfs/make {"/work/x" "a\nb\nc\n" "/work/y" "a\nB\nc\n"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "diff x y")]
     (is (= 1 (:exit r)))
     (is (.contains ^String (:stdout r) "--- x"))
     (is (.contains ^String (:stdout r) "+++ y"))
+    (is (.contains ^String (:stdout r) "@@ -1,3 +1,3 @@"))
     (is (.contains ^String (:stdout r) "-b"))
     (is (.contains ^String (:stdout r) "+B"))))
+
+(deftest diff-size-mismatch-no-IOOB
+  ;; Regression: prior diff threw IndexOutOfBoundsException whenever
+  ;; len(a) != len(b) because it used diffit's intermediate indices to
+  ;; index into the original a-lines.
+  (let [fs (vfs/make {"/work/x" "a\n" "/work/y" "a\nb\nc\n"} {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "diff x y")]
+    (is (= 1 (:exit r)))
+    (is (.contains ^String (:stdout r) "+b"))
+    (is (.contains ^String (:stdout r) "+c"))))
 
 (deftest diff-brief
   (let [fs (vfs/make {"/work/x" "a" "/work/y" "b"} {:cwd "/work"})
@@ -262,7 +344,16 @@
     (is (re-find #"muschel:" (:stderr r)))))
 
 (deftest xargs-with-replace
-  (let [r (run (mk-host) "echo one two | xargs -I X echo got X")]
+  ;; -I R reads a whole line at a time per GNU semantics. Use echo -e to
+  ;; produce two lines on stdin so the two invocations are reachable.
+  (let [r (run (mk-host) "echo -e \"one\\ntwo\" | xargs -I X echo got X")]
     (is (= 0 (:exit r)))
     (is (.contains ^String (:stdout r) "got one"))
     (is (.contains ^String (:stdout r) "got two"))))
+
+(deftest xargs-no-run-if-empty
+  ;; -r / --no-run-if-empty: when stdin produces no tokens, skip the
+  ;; command entirely. Otherwise xargs would still run (with no args).
+  (let [r (run (mk-host) "echo -n \"\" | xargs -r echo hello")]
+    (is (= 0 (:exit r)))
+    (is (= "" (:stdout r)))))

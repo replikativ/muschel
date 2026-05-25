@@ -73,21 +73,25 @@
     (when-let [resolved (fs/-resolve this path)]
       (when (= :dir (:type (get @entries-atom resolved)))
         (let [prefix (str (str/replace resolved #"/$" "") "/")
-              all   @entries-atom]
+              plen   (count prefix)
+              all    @entries-atom]
           (->> all
-               (filter (fn [[p _]]
-                         (and (str/starts-with? p prefix)
-                              ;; Direct children only — no nested.
-                              (not (str/includes? (subs p (count prefix)) "/")))))
-               (mapv (fn [[p e]]
-                       (let [name (subs p (count prefix))]
-                         {:name name
-                          :type (:type e)
-                          :size (cond
-                                  (= :dir (:type e)) 0
-                                  (string? (:bytes e)) (count (:bytes e))
-                                  :else (alength ^bytes (:bytes e)))
-                          :mtime-ms (or (:mtime-ms e) 0)})))
+               (keep (fn [[p e]]
+                       (when (and (str/starts-with? p prefix)
+                                  (> (count p) plen))
+                         (let [tail (subs p plen)]
+                           ;; Direct child: no nested separator AND the
+                           ;; entry isn't the dir itself (guards root,
+                           ;; where prefix is "/" and the dir would
+                           ;; otherwise list itself with name "").
+                           (when-not (str/includes? tail "/")
+                             {:name tail
+                              :type (:type e)
+                              :size (cond
+                                      (= :dir (:type e)) 0
+                                      (string? (:bytes e)) (count (:bytes e))
+                                      :else (alength ^bytes (:bytes e)))
+                              :mtime-ms (or (:mtime-ms e) 0)})))))
                (sort-by :name))))))
 
   (-read-file [this path]

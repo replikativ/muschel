@@ -4,11 +4,11 @@
             [muschel.builtins.posix :as posix]))
 
 (defn- make-fs []
-  (vfs/make {"/work/a.txt"     "alpha\nbeta\ngamma"
+  (vfs/make {"/work/a.txt"     "alpha\nbeta\ngamma\n"
              "/work/empty.txt" ""
              "/work/.dot"      "hidden"
              "/work/sub"       :dir
-             "/work/sub/b.txt" "deep\nfile"}
+             "/work/sub/b.txt" "deep\nfile\n"}
             {:cwd "/work"}))
 
 ;; ============================================================================
@@ -124,8 +124,8 @@
 (deftest wc-default-all-three
   (let [r (posix/wc ["wc" "a.txt"] (make-fs) {})]
     (is (= 0 (:exit r)))
-    ;; "alpha\nbeta\ngamma" = 3 lines (str/split-lines), 3 words, 16 bytes
-    (is (re-find #"^\s*3\s+3\s+16\s+a\.txt" (:stdout r))
+    ;; "alpha\nbeta\ngamma\n" = 3 newlines, 3 words, 17 bytes
+    (is (re-find #"^\s*3\s+3\s+17\s+a\.txt" (:stdout r))
         (str "got: " (pr-str (:stdout r))))))
 
 (deftest wc-l-only

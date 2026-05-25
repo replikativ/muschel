@@ -26,7 +26,6 @@
   (:refer-clojure :exclude [cat])
   (:require [clojure.string :as str]
             [clojure.tools.cli :as cli]
-            [diffit.vec :as dv]
             [muschel.fs :as fs]
             [muschel.host :as host]))
 
@@ -204,8 +203,8 @@
 
 (defn cat
   "POSIX cat, subset: -n (number all lines), -b (number non-empty),
-   -s (squeeze blank lines), -E (show $ at line end). No -A (we
-   don't implement TAB/control-char display)."
+   -s (squeeze blank lines), -E (show $ at line end). Preserves the
+   byte-level trailing-newline property of the source content."
   [argv fs env]
   (let [{:keys [opts pos err]} (cli-parse argv cat-spec)]
     (if err
@@ -218,45 +217,52 @@
             files       (if (seq pos) pos ["-"])
             stderr      (volatile! "")
             any-err?    (volatile! false)
+            out         (StringBuilder.)
             n           (volatile! 0)
             last-blank? (volatile! false)
-            process-line
-            (fn [line]
-              (let [is-blank? (= "" line)]
-                (cond
-                  (and squeeze? @last-blank? is-blank?) nil
-                  :else
-                  (let [_ (vreset! last-blank? is-blank?)
-                        line' (if show-end? (str line "$") line)]
-                    (cond
-                      num-nb?
-                      (if is-blank?
-                        line'
-                        (do (vswap! n inc)
-                            (format "%6d\t%s" @n line')))
-                      num-all?
-                      (do (vswap! n inc)
-                          (format "%6d\t%s" @n line'))
-                      :else line')))))
-            contents
-            (mapcat (fn [f]
-                      (if (= "-" f)
-                        (str/split-lines stdin)
-                        (let [bytes (fs/read-bytes fs f)]
-                          (if (nil? bytes)
-                            (let [stat (fs/stat fs f)
-                                  msg  (if (= :dir (:type stat))
-                                         (str "cat: " f ": Is a directory")
-                                         (str "cat: " f ": No such file or directory"))]
-                              (vswap! stderr str msg "\n")
-                              (vreset! any-err? true)
-                              nil)
-                            (let [s (if (string? bytes) bytes (String. ^bytes bytes "UTF-8"))]
-                              (str/split-lines s))))))
-                    files)
-            processed (keep process-line contents)]
-        {:stdout (str (str/join "\n" processed)
-                      (when (seq processed) "\n"))
+            emit-line!
+            (fn [line trailing-nl?]
+              (let [is-blank? (= "" line)
+                    skip?     (and squeeze? @last-blank? is-blank?)]
+                (when-not skip?
+                  (vreset! last-blank? is-blank?)
+                  (let [shown   (if show-end? (str line "$") line)
+                        labeled (cond
+                                  num-nb?
+                                  (if is-blank? shown
+                                      (do (vswap! n inc)
+                                          (format "%6d\t%s" @n shown)))
+                                  num-all?
+                                  (do (vswap! n inc)
+                                      (format "%6d\t%s" @n shown))
+                                  :else shown)]
+                    (.append out ^String labeled)
+                    (when trailing-nl? (.append out "\n"))))))
+            process-content
+            (fn [content]
+              (let [lines     (str/split-lines content)
+                    last-idx  (dec (count lines))
+                    has-trailing-nl? (and (pos? (count content))
+                                          (= \newline (.charAt ^String content
+                                                               (dec (count content)))))]
+                (dotimes [i (count lines)]
+                  (emit-line! (nth lines i)
+                              (or (< i last-idx) has-trailing-nl?)))))]
+        (doseq [f files]
+          (if (= "-" f)
+            (process-content stdin)
+            (let [bytes (fs/read-bytes fs f)]
+              (if (nil? bytes)
+                (let [stat (fs/stat fs f)
+                      msg  (if (= :dir (:type stat))
+                             (str "cat: " f ": Is a directory")
+                             (str "cat: " f ": No such file or directory"))]
+                  (vswap! stderr str msg "\n")
+                  (vreset! any-err? true))
+                (process-content (if (string? bytes)
+                                   bytes
+                                   (String. ^bytes bytes "UTF-8")))))))
+        {:stdout (.toString out)
          :stderr @stderr
          :exit (if @any-err? 1 0)}))))
 
@@ -287,57 +293,96 @@
     :parse-fn #(Long/parseLong %)
     :validate [#(>= % 0) "must be non-negative"]]])
 
+(defn- finish-lines
+  "Take a sequence of line strings; emit them joined by `\\n`, plus a
+   trailing `\\n` iff there were any lines. Empty seq → empty string."
+  [lines]
+  (if (seq lines)
+    (str (str/join "\n" lines) "\n")
+    ""))
+
+(defn- header-line
+  "GNU-style multi-file header: `==> name <==`."
+  [name]
+  (str "==> " name " <=="))
+
 (defn head
-  "POSIX head. -n N (or -N) lines, default 10."
+  "POSIX head. -n N (or -N) lines, default 10. With multiple files,
+   each block is preceded by `==> name <==` (use -q to suppress)."
   [argv fs env]
-  (let [{:keys [opts pos err]} (cli-parse (expand-numeric-n argv) head-tail-spec)]
+  (let [{:keys [opts pos err]} (cli-parse (expand-numeric-n argv)
+                                          (conj head-tail-spec
+                                                ["-q" "--quiet"]
+                                                ["-v" "--verbose"]))]
     (if err
       (usage-err "head" err)
-      (let [n     (:lines opts)
-            stdin (or (:stdin env) "")
-            files (if (seq pos) pos ["-"])
-            stderr (volatile! "")
+      (let [n        (:lines opts)
+            stdin    (or (:stdin env) "")
+            files    (if (seq pos) pos ["-"])
+            multi?   (> (count files) 1)
+            show-h?  (or (:verbose opts)
+                         (and multi? (not (:quiet opts))))
+            stderr   (volatile! "")
             any-err? (volatile! false)
-            results
-            (mapv (fn [f]
-                    (let [content (if (= "-" f) stdin (fs/read-file fs f))]
-                      (if (nil? content)
-                        (do (vswap! stderr str "head: cannot open '" f "' for reading: No such file or directory\n")
-                            (vreset! any-err? true)
-                            "")
-                        (->> (str/split-lines content)
-                             (take n)
-                             (str/join "\n")
-                             (#(if (str/blank? %) "" (str % "\n")))))))
-                  files)]
-        {:stdout (str/join "\n" results)
+            blocks
+            (keep
+             (fn [[idx f]]
+               (let [content (if (= "-" f) stdin (fs/read-file fs f))]
+                 (if (nil? content)
+                   (do (vswap! stderr str "head: cannot open '" f "' for reading: No such file or directory\n")
+                       (vreset! any-err? true)
+                       nil)
+                   (let [head-text (->> (str/split-lines content)
+                                        (take n)
+                                        finish-lines)]
+                     (if show-h?
+                       (str (when (pos? idx) "\n")
+                            (header-line (if (= "-" f) "standard input" f))
+                            "\n"
+                            head-text)
+                       head-text)))))
+             (map-indexed vector files))]
+        {:stdout (apply str blocks)
          :stderr @stderr
          :exit (if @any-err? 1 0)}))))
 
 (defn tail
-  "POSIX tail. -n N (or -N), default 10. No -f."
+  "POSIX tail. -n N (or -N), default 10. No -f. Multi-file headers
+   like head."
   [argv fs env]
-  (let [{:keys [opts pos err]} (cli-parse (expand-numeric-n argv) head-tail-spec)]
+  (let [{:keys [opts pos err]} (cli-parse (expand-numeric-n argv)
+                                          (conj head-tail-spec
+                                                ["-q" "--quiet"]
+                                                ["-v" "--verbose"]))]
     (if err
       (usage-err "tail" err)
-      (let [n     (:lines opts)
-            stdin (or (:stdin env) "")
-            files (if (seq pos) pos ["-"])
-            stderr (volatile! "")
+      (let [n        (:lines opts)
+            stdin    (or (:stdin env) "")
+            files    (if (seq pos) pos ["-"])
+            multi?   (> (count files) 1)
+            show-h?  (or (:verbose opts)
+                         (and multi? (not (:quiet opts))))
+            stderr   (volatile! "")
             any-err? (volatile! false)
-            results
-            (mapv (fn [f]
-                    (let [content (if (= "-" f) stdin (fs/read-file fs f))]
-                      (if (nil? content)
-                        (do (vswap! stderr str "tail: cannot open '" f "' for reading: No such file or directory\n")
-                            (vreset! any-err? true)
-                            "")
-                        (->> (str/split-lines content)
-                             (take-last n)
-                             (str/join "\n")
-                             (#(if (str/blank? %) "" (str % "\n")))))))
-                  files)]
-        {:stdout (str/join "\n" results)
+            blocks
+            (keep
+             (fn [[idx f]]
+               (let [content (if (= "-" f) stdin (fs/read-file fs f))]
+                 (if (nil? content)
+                   (do (vswap! stderr str "tail: cannot open '" f "' for reading: No such file or directory\n")
+                       (vreset! any-err? true)
+                       nil)
+                   (let [tail-text (->> (str/split-lines content)
+                                        (take-last n)
+                                        finish-lines)]
+                     (if show-h?
+                       (str (when (pos? idx) "\n")
+                            (header-line (if (= "-" f) "standard input" f))
+                            "\n"
+                            tail-text)
+                       tail-text)))))
+             (map-indexed vector files))]
+        {:stdout (apply str blocks)
          :stderr @stderr
          :exit (if @any-err? 1 0)}))))
 
@@ -351,23 +396,30 @@
    ["-c" "--bytes"]
    ["-m" "--chars"]])
 
-(defn- count-stats [s]
-  (let [byte-count (count (.getBytes ^String s "UTF-8"))
+(defn- count-stats
+  "Count lines (newline occurrences — GNU semantics, so trailing-nl-less
+   content yields one fewer line than chunks), words (whitespace-separated
+   runs), bytes (UTF-8), and chars (codepoints / String length)."
+  [^String s]
+  (let [byte-count (count (.getBytes s "UTF-8"))
         word-count (count (re-seq #"\S+" s))
-        line-count (if (= "" s) 0 (count (str/split-lines s)))]
-    {:lines line-count :words word-count :bytes byte-count}))
+        line-count (count (filter #(= \newline %) s))
+        char-count (.length s)]
+    {:lines line-count :words word-count :bytes byte-count :chars char-count}))
 
 (defn wc
-  "POSIX wc. -l (lines), -w (words), -c (bytes). Default: all three.
-   With multiple files, prints a final 'total' row."
+  "POSIX wc. -l (lines = `\\n` occurrences), -w (words), -c (bytes),
+   -m (chars). Default when no flags: -l -w -c. With multiple files,
+   prints a final 'total' row."
   [argv fs env]
   (let [{:keys [opts pos err]} (cli-parse argv wc-spec)]
     (if err
       (usage-err "wc" err)
-      (let [explicit? (some opts [:lines :words :bytes])
+      (let [explicit? (some opts [:lines :words :bytes :chars])
             show-l?   (or (not explicit?) (boolean (:lines opts)))
             show-w?   (or (not explicit?) (boolean (:words opts)))
             show-c?   (or (not explicit?) (boolean (:bytes opts)))
+            show-m?   (boolean (:chars opts))
             stdin     (or (:stdin env) "")
             files     (if (seq pos) pos ["-"])
             stderr    (volatile! "")
@@ -382,19 +434,21 @@
                           nil)
                         (assoc (count-stats (or content "")) :name f))))
                   files)
-            fmt-row (fn [{:keys [lines words bytes name]}]
+            fmt-row (fn [{:keys [lines words bytes chars name]}]
                       (str/trim
                        (str (when show-l? (format "%8d " lines))
                             (when show-w? (format "%8d " words))
                             (when show-c? (format "%8d " bytes))
+                            (when show-m? (format "%8d " chars))
                             (when (and name (not= "-" name)) name))))
             total (when (> (count rows) 1)
                     (reduce (fn [acc r]
                               (-> acc
                                   (update :lines + (:lines r))
                                   (update :words + (:words r))
-                                  (update :bytes + (:bytes r))))
-                            {:lines 0 :words 0 :bytes 0 :name "total"}
+                                  (update :bytes + (:bytes r))
+                                  (update :chars + (:chars r))))
+                            {:lines 0 :words 0 :bytes 0 :chars 0 :name "total"}
                             rows))
             lines (mapv fmt-row (if total (concat rows [total]) rows))]
         {:stdout (str (str/join "\n" lines)
@@ -611,18 +665,41 @@
    ["-H" "--with-filename"]
    ["-h" "--no-filename"]
    ["-r" "--recursive"]
-   ["-q" "--quiet"]])
+   ["-q" "--quiet"]
+   ["-w" "--word-regexp"]
+   ["-e" "--regexp PATTERN"
+    :assoc-fn (fn [m k v] (update m k (fnil conj []) v))
+    :default  []]])
 
 (defn- compile-pattern
-  "Build a java.util.regex.Pattern from the grep pattern, honouring
-   -F (literal) and -i. We don't distinguish BRE vs ERE — Java's
-   regex engine is closer to ERE, which is what -E selects and what
-   most modern users expect by default."
-  [pattern {:keys [fixed-strings ignore-case]}]
-  (let [body (if fixed-strings (java.util.regex.Pattern/quote pattern) pattern)
+  "Build a java.util.regex.Pattern from a single grep pattern,
+   honouring -F (literal), -i (case-insensitive), and -w (word-bound).
+   Java's regex engine is ERE-ish, which matches -E and what most
+   modern users expect by default."
+  [pattern {:keys [fixed-strings ignore-case word-regexp]}]
+  (let [body  (if fixed-strings (java.util.regex.Pattern/quote pattern) pattern)
+        body  (if word-regexp (str "\\b(?:" body ")\\b") body)
         flags (cond-> 0
                 ignore-case (bit-or java.util.regex.Pattern/CASE_INSENSITIVE))]
     (java.util.regex.Pattern/compile body flags)))
+
+(defn- collect-patterns
+  "Combine -e PATTERN (possibly repeated) with the positional pattern.
+   Returns [patterns positional-files]."
+  [{:keys [regexp]} pos]
+  (let [e-patterns (or (seq regexp) nil)]
+    (if e-patterns
+      [(vec e-patterns) (vec pos)]
+      (if (seq pos)
+        [[(first pos)] (vec (rest pos))]
+        [nil []]))))
+
+(defn- any-pattern-matches?
+  "True if any compiled pattern matches the line."
+  [^java.util.regex.Pattern compiled-or-coll line]
+  (if (coll? compiled-or-coll)
+    (some #(.find (.matcher ^java.util.regex.Pattern % ^String line)) compiled-or-coll)
+    (.find (.matcher compiled-or-coll ^String line))))
 
 (defn- walk-files
   "Recursively yield {:path … :type :file} maps under target. Uses the
@@ -652,89 +729,98 @@
       :else [])))
 
 (defn grep
-  "POSIX grep, subset: -E -F -i -n -v -c -l -L -H -h -r -q.
+  "POSIX grep, subset: -E -F -i -n -v -c -l -L -H -h -r -q -w -e.
    With no files and stdin available in env, reads stdin. Exit 0 if
    any match, 1 if no match, 2 on usage error."
   [argv fs env]
   (let [{:keys [opts pos err]} (cli-parse argv grep-spec)]
     (cond
       err (usage-err "grep" err)
-      (empty? pos) (usage-err "grep" "missing pattern")
       :else
-      (let [pattern (first pos)
-            files   (rest pos)
-            re      (compile-pattern pattern opts)
-            targets (cond
-                      (and (empty? files) (contains? env :stdin))
-                      [{:path nil :stdin-content (:stdin env)}]
-                      (:recursive opts)
-                      (mapcat (fn [t] (walk-files fs t)) (or (seq files) ["."]))
-                      :else
-                      (mapv (fn [f] {:path f}) (or (seq files) ["-"])))
-            multi?  (> (count targets) 1)
-            show-name? (or (:with-filename opts)
-                           (and multi? (not (:no-filename opts))))
-            stderr  (volatile! "")
-            any-err? (volatile! false)
-            any-match? (volatile! false)
-            stdout  (volatile! [])
-            invert? (:invert-match opts)
-            matches?
-            (fn [line]
-              (let [m (.find (.matcher re line))]
-                (if invert? (not m) m)))]
-        (doseq [{:keys [path stdin-content]} targets]
-          (let [content
-                (cond
-                  (some? stdin-content) stdin-content
-                  (= "-" path) (or (:stdin env) "")
-                  :else
-                  (let [c (fs/read-file fs path)]
-                    (when (nil? c)
-                      (vswap! stderr str "grep: " path ": No such file or directory\n")
-                      (vreset! any-err? true))
-                    c))]
-            (when content
-              (let [lines (str/split-lines content)
-                    hits (keep-indexed
-                          (fn [i ln] (when (matches? ln) {:i (inc i) :line ln}))
-                          lines)]
-                (cond
-                  (:files-with-matches opts)
-                  (when (seq hits)
-                    (vreset! any-match? true)
-                    (vswap! stdout conj path))
-
-                  (:files-without-match opts)
-                  (when (empty? hits)
-                    (vreset! any-match? true)
-                    (vswap! stdout conj path))
-
-                  (:count opts)
-                  (let [n (count hits)]
-                    (when (pos? n) (vreset! any-match? true))
-                    (vswap! stdout conj (if show-name? (str path ":" n) (str n))))
-
-                  :else
-                  (doseq [{:keys [i line]} hits]
-                    (vreset! any-match? true)
-                    (let [pieces (cond-> []
-                                   show-name? (conj path)
-                                   (:line-number opts) (conj (str i))
-                                   true (conj line))]
-                      (vswap! stdout conj (str/join ":" pieces)))))))))
+      (let [[patterns files] (collect-patterns opts pos)]
         (cond
-          (:quiet opts)
-          {:stdout "" :stderr "" :exit (if @any-match? 0 1)}
-
+          (empty? patterns) (usage-err "grep" "missing pattern")
           :else
-          {:stdout (str (str/join "\n" @stdout)
-                       (when (seq @stdout) "\n"))
-           :stderr @stderr
-           :exit (cond
-                   @any-err? 2
-                   @any-match? 0
-                   :else 1)})))))
+          (let [compiled (mapv #(compile-pattern % opts) patterns)
+                stdin-mode? (and (empty? files) (contains? env :stdin))
+                targets (cond
+                          stdin-mode?
+                          [{:path "(standard input)" :show-name? false}]
+                          (:recursive opts)
+                          (mapcat (fn [t] (walk-files fs t)) (or (seq files) ["."]))
+                          :else
+                          (mapv (fn [f] {:path f}) (or (seq files) ["-"])))
+                multi?  (> (count targets) 1)
+                show-name? (or (:with-filename opts)
+                               (and multi? (not (:no-filename opts))
+                                    (not stdin-mode?)))
+                stderr     (volatile! "")
+                any-err?   (volatile! false)
+                any-match? (volatile! false)
+                stdout     (volatile! [])
+                invert?    (:invert-match opts)
+                matches?
+                (fn [line]
+                  (let [m (any-pattern-matches? compiled line)]
+                    (if invert? (not m) (boolean m))))]
+            (doseq [{:keys [path] :as target} targets]
+              (let [content
+                    (cond
+                      stdin-mode? (:stdin env)
+                      (= "-" path) (or (:stdin env) "")
+                      :else
+                      (let [c (fs/read-file fs path)]
+                        (when (nil? c)
+                          (vswap! stderr str "grep: " path ": No such file or directory\n")
+                          (vreset! any-err? true))
+                        c))]
+                (when content
+                  (let [lines (str/split-lines content)
+                        hits  (keep-indexed
+                               (fn [i ln] (when (matches? ln) {:i (inc i) :line ln}))
+                               lines)
+                        ;; In stdin mode -l/-L print "(standard input)";
+                        ;; with explicit "-" file, ditto.
+                        display-path (if stdin-mode? "(standard input)" path)]
+                    (cond
+                      (:files-with-matches opts)
+                      (when (seq hits)
+                        (vreset! any-match? true)
+                        (vswap! stdout conj display-path))
+
+                      (:files-without-match opts)
+                      (when (empty? hits)
+                        (vswap! stdout conj display-path))
+
+                      (:count opts)
+                      (let [n (count hits)]
+                        (when (pos? n) (vreset! any-match? true))
+                        (vswap! stdout conj
+                                (if show-name? (str display-path ":" n) (str n))))
+
+                      :else
+                      (doseq [{:keys [i line]} hits]
+                        (vreset! any-match? true)
+                        (let [pieces (cond-> []
+                                       show-name? (conj display-path)
+                                       (:line-number opts) (conj (str i))
+                                       true (conj line))]
+                          (vswap! stdout conj (str/join ":" pieces)))))))))
+            (cond
+              (:quiet opts)
+              {:stdout "" :stderr "" :exit (if @any-match? 0 1)}
+
+              :else
+              {:stdout (str (str/join "\n" @stdout)
+                            (when (seq @stdout) "\n"))
+               :stderr @stderr
+               :exit (cond
+                       @any-err? 2
+                       ;; -L: success when SOME file had no matches.
+                       (:files-without-match opts)
+                       (if (seq @stdout) 0 1)
+                       @any-match? 0
+                       :else 1)})))))))
 
 ;; ============================================================================
 ;; find — path walker with safe -exec via builtin host
@@ -761,70 +847,152 @@
         (.append sb c)))
     (java.util.regex.Pattern/compile (.toString sb))))
 
-(defn- parse-find-expr
-  "Split argv (after positional paths) into a vector of predicate
-   maps. Recognises -name GLOB, -type c, -maxdepth N, -mindepth N,
-   -print, -exec CMD … ;. Returns {:paths [..] :preds [..] :exec
-   [argv-prefix-with-{}] :err nil|str}."
+;; -- find expression parser -------------------------------------------------
+;;
+;; Grammar (recursive descent, POSIX precedence — `()` > `-not`/`!` > `-a`
+;; (implicit) > `-o`):
+;;
+;;   top   := PATH* expr?
+;;   expr  := and (-o and)*
+;;   and   := not (-a? not)*       ; -a optional / implicit
+;;   not   := (-not | !) not | atom
+;;   atom  := '(' expr ')' | pred
+;;   pred  := -name GLOB | -iname GLOB | -type T | -maxdepth N | -mindepth N
+;;          | -print | -exec ARGS ; | -exec ARGS +
+;;
+;; Tree shape:
+;;   {:kind :pred ...}            — predicate
+;;   {:kind :action :action ...}  — side-effecting action (-print, -exec)
+;;   {:kind :and :a t :b t}
+;;   {:kind :or  :a t :b t}
+;;   {:kind :not :inner t}
+;;   nil                          — empty expression (matches everything,
+;;                                  default action `-print`)
+
+(defn- find-pred?
+  "True if token introduces a predicate/action (starts with `-` or is
+   one of the bool/group tokens)."
+  [t]
+  (or (#{"(" ")" "!" "-not" "-a" "-and" "-o" "-or"} t)
+      (and (string? t) (str/starts-with? t "-"))))
+
+(declare find-parse-or)
+
+(defn- find-parse-pred
+  "Consume one predicate or action from `tokens` at `pos`. Returns
+   [node new-pos err]."
+  [tokens pos]
+  (let [t (nth tokens pos nil)
+        nxt (fn [] (nth tokens (inc pos) nil))]
+    (case t
+      "-name"     (if-let [g (nxt)]
+                    [{:kind :pred :pred :name :pat g :ci? false} (+ pos 2) nil]
+                    [nil pos "find: -name requires an argument"])
+      "-iname"    (if-let [g (nxt)]
+                    [{:kind :pred :pred :name :pat g :ci? true} (+ pos 2) nil]
+                    [nil pos "find: -iname requires an argument"])
+      "-type"     (if-let [v (nxt)]
+                    [{:kind :pred :pred :type :t v} (+ pos 2) nil]
+                    [nil pos "find: -type requires an argument"])
+      "-maxdepth" (if-let [v (nxt)]
+                    [{:kind :pred :pred :maxdepth :n (Long/parseLong v)} (+ pos 2) nil]
+                    [nil pos "find: -maxdepth requires an argument"])
+      "-mindepth" (if-let [v (nxt)]
+                    [{:kind :pred :pred :mindepth :n (Long/parseLong v)} (+ pos 2) nil]
+                    [nil pos "find: -mindepth requires an argument"])
+      "-print"    [{:kind :action :action :print} (inc pos) nil]
+      "-exec"     (loop [p (inc pos) collected (transient [])]
+                    (let [a (nth tokens p nil)]
+                      (cond
+                        (nil? a)
+                        [nil p "find: -exec requires terminating ';' or '+'"]
+                        (or (= ";" a) (= "+" a))
+                        [{:kind :action :action :exec
+                          :argv (persistent! collected)
+                          :batch? (= "+" a)}
+                         (inc p) nil]
+                        :else
+                        (recur (inc p) (conj! collected a)))))
+      [nil pos (str "find: unsupported predicate '" t "'")])))
+
+(defn- find-parse-atom [tokens pos]
+  (let [t (nth tokens pos nil)]
+    (cond
+      (= "(" t)
+      (let [[inner p' err] (find-parse-or tokens (inc pos))]
+        (cond
+          err [nil p' err]
+          (not= ")" (nth tokens p' nil))
+          [nil p' "find: missing ')'"]
+          :else [inner (inc p') nil]))
+      :else
+      (find-parse-pred tokens pos))))
+
+(defn- find-parse-not [tokens pos]
+  (if (#{"-not" "!"} (nth tokens pos nil))
+    (let [[inner p' err] (find-parse-not tokens (inc pos))]
+      (if err [nil p' err]
+          [{:kind :not :inner inner} p' nil]))
+    (find-parse-atom tokens pos)))
+
+(defn- find-parse-and [tokens pos]
+  (loop [[left p err] (find-parse-not tokens pos)]
+    (if err
+      [nil p err]
+      (let [t (nth tokens p nil)]
+        (cond
+          (#{"-a" "-and"} t)
+          (let [[right p' err'] (find-parse-not tokens (inc p))]
+            (if err' [nil p' err']
+                (recur [{:kind :and :a left :b right} p' nil])))
+          (and (some? t) (not (#{"-o" "-or" ")"} t)))
+          ;; Implicit AND when another predicate follows.
+          (let [[right p' err'] (find-parse-not tokens p)]
+            (if err' [nil p' err']
+                (recur [{:kind :and :a left :b right} p' nil])))
+          :else
+          [left p nil])))))
+
+(defn- find-parse-or [tokens pos]
+  (loop [[left p err] (find-parse-and tokens pos)]
+    (if err
+      [nil p err]
+      (let [t (nth tokens p nil)]
+        (if (#{"-o" "-or"} t)
+          (let [[right p' err'] (find-parse-and tokens (inc p))]
+            (if err' [nil p' err']
+                (recur [{:kind :or :a left :b right} p' nil])))
+          [left p nil])))))
+
+(defn- parse-find-args
+  "Top-level: split leading paths from the expression tokens; parse
+   the expression. Returns {:paths [..] :tree expr-tree :err nil|str}."
   [args]
-  (let [paths (transient [])
-        preds (transient [])
-        exec  (atom nil)
-        err   (atom nil)
-        scan  (volatile! args)]
-    (loop []
-      (when (and (seq @scan) (nil? @err))
-        (let [a (first @scan)
-              tail (rest @scan)]
-          (cond
-            (= "-name" a)
-            (if (seq tail)
-              (do (conj! preds {:kind :name :pat (first tail)})
-                  (vreset! scan (rest tail))
-                  (recur))
-              (reset! err "find: -name requires an argument"))
+  (let [[paths exprs] (split-with #(not (find-pred? %)) args)]
+    (if (empty? exprs)
+      {:paths (vec paths) :tree nil :err nil}
+      (let [tokens (vec exprs)
+            [tree pos err] (find-parse-or tokens 0)]
+        (cond
+          err
+          {:paths (vec paths) :tree nil :err err}
+          (< pos (count tokens))
+          {:paths (vec paths) :tree nil
+           :err (str "find: stray token '" (nth tokens pos) "'")}
+          :else
+          {:paths (vec paths) :tree tree :err nil})))))
 
-            (= "-type" a)
-            (if (seq tail)
-              (do (conj! preds {:kind :type :t (first tail)})
-                  (vreset! scan (rest tail))
-                  (recur))
-              (reset! err "find: -type requires an argument"))
-
-            (= "-maxdepth" a)
-            (if (seq tail)
-              (do (conj! preds {:kind :maxdepth :n (Long/parseLong (first tail))})
-                  (vreset! scan (rest tail))
-                  (recur))
-              (reset! err "find: -maxdepth requires an argument"))
-
-            (= "-print" a)
-            (do (vreset! scan tail) (recur))
-
-            (= "-exec" a)
-            (let [;; Collect args until literal `;`
-                  collected (transient [])]
-              (loop [t tail]
-                (cond
-                  (empty? t) (reset! err "find: -exec requires terminating ';'")
-                  (= ";" (first t))
-                  (do (reset! exec (persistent! collected))
-                      (vreset! scan (rest t)))
-                  :else
-                  (do (conj! collected (first t)) (recur (rest t)))))
-              (when (nil? @err) (recur)))
-
-            (str/starts-with? a "-")
-            (reset! err (str "find: unsupported predicate " a))
-
-            :else
-            (do (conj! paths a)
-                (vreset! scan tail)
-                (recur))))))
-    {:paths (persistent! paths)
-     :preds (persistent! preds)
-     :exec  @exec
-     :err   @err}))
+(defn- tree-has-action?
+  "Walk the parsed expr; true if any node is an action (`:print`,
+   `:exec`). Used to decide whether to inject an implicit `-print`."
+  [tree]
+  (cond
+    (nil? tree) false
+    (= :action (:kind tree)) true
+    (#{:and :or} (:kind tree)) (or (tree-has-action? (:a tree))
+                                   (tree-has-action? (:b tree)))
+    (= :not (:kind tree)) (tree-has-action? (:inner tree))
+    :else false))
 
 (defn- find-walk
   "BFS walk under `root`, depth-aware. Yields {:path :type :depth}."
@@ -853,62 +1021,172 @@
             (recur next-pending (into acc child-recs)))
           acc)))))
 
-(defn- pred-match? [{:keys [kind pat t n]} entry]
-  (case kind
-    :name (let [re (glob->re pat)
-                base (last (str/split (:path entry) #"/"))]
-            (.matches (.matcher re (or base ""))))
+(defn- pred-match? [{:keys [pred pat ci? t n]} entry]
+  (case pred
+    :name (let [pat'  (if ci? (str/lower-case pat) pat)
+                re    (glob->re pat')
+                base  (or (last (str/split (:path entry) #"/")) "")
+                base' (if ci? (str/lower-case base) base)]
+            (.matches (.matcher re base')))
     :type (= (:type entry)
              (case t "f" :file "d" :dir "l" :symlink (keyword t)))
     :maxdepth (<= (:depth entry) n)
-    true))
+    :mindepth (>= (:depth entry) n)
+    false))
+
+(defn- spawn-exec-action!
+  "Run an -exec action (single-mode `\\;`) against `path` via *host*.
+   Appends output to the stdout-sb / stderr-sb StringBuilders. Returns
+   the exit code."
+  [{:keys [argv]} path fs-handle stdout-sb stderr-sb]
+  (let [substituted (mapv (fn [a] (str/replace a "{}" path)) argv)
+        out-sink (host/-string-sink *host*)
+        err-sink (host/-string-sink *host*)
+        proc (binding [*depth* (inc *depth*)]
+               (host/-spawn *host*
+                            {:cmd (first substituted)
+                             :args (vec (rest substituted))
+                             :dir (fs/cwd fs-handle)
+                             :session *session*
+                             :out out-sink
+                             :err err-sink}))
+        exit ((:wait proc))
+        out-s (host/-sink->string *host* out-sink)
+        err-s (host/-sink->string *host* err-sink)]
+    (.append stdout-sb ^String out-s)
+    (.append stderr-sb ^String err-s)
+    exit))
+
+(defn- spawn-exec-batch!
+  "Run an -exec action (`+` batched mode): substitute paths in for the
+   sole `{}` arg and pass *all* matching paths in one invocation."
+  [{:keys [argv]} paths fs-handle stdout-sb stderr-sb]
+  (let [;; The {} placeholder becomes all the paths concatenated; in
+        ;; GNU `find -exec ... {} +` semantics they're individual argv
+        ;; elements, not one joined string.
+        substituted (mapcat (fn [a]
+                              (if (= "{}" a) paths [a]))
+                            argv)
+        argv-vec    (vec substituted)
+        out-sink (host/-string-sink *host*)
+        err-sink (host/-string-sink *host*)
+        proc (binding [*depth* (inc *depth*)]
+               (host/-spawn *host*
+                            {:cmd (first argv-vec)
+                             :args (vec (rest argv-vec))
+                             :dir (fs/cwd fs-handle)
+                             :session *session*
+                             :out out-sink
+                             :err err-sink}))
+        exit ((:wait proc))
+        out-s (host/-sink->string *host* out-sink)
+        err-s (host/-sink->string *host* err-sink)]
+    (.append stdout-sb ^String out-s)
+    (.append stderr-sb ^String err-s)
+    exit))
+
+(defn- eval-find-expr
+  "Walk the expression tree against `entry`. Actions have side-effects
+   on the captured state (stdout-sb, stderr-sb, any-err? volatile,
+   batch-paths volatile for `-exec ... +`). Returns boolean — actions
+   always return true so they don't short-circuit downstream `-and`."
+  [tree entry {:keys [fs-handle stdout-sb stderr-sb any-err? batch-paths]}]
+  (cond
+    (nil? tree) true
+
+    (= :pred (:kind tree))
+    (pred-match? tree entry)
+
+    (= :and (:kind tree))
+    (let [l (eval-find-expr (:a tree) entry
+                            {:fs-handle fs-handle :stdout-sb stdout-sb
+                             :stderr-sb stderr-sb :any-err? any-err?
+                             :batch-paths batch-paths})]
+      (if l
+        (eval-find-expr (:b tree) entry
+                        {:fs-handle fs-handle :stdout-sb stdout-sb
+                         :stderr-sb stderr-sb :any-err? any-err?
+                         :batch-paths batch-paths})
+        false))
+
+    (= :or (:kind tree))
+    (or (eval-find-expr (:a tree) entry
+                        {:fs-handle fs-handle :stdout-sb stdout-sb
+                         :stderr-sb stderr-sb :any-err? any-err?
+                         :batch-paths batch-paths})
+        (eval-find-expr (:b tree) entry
+                        {:fs-handle fs-handle :stdout-sb stdout-sb
+                         :stderr-sb stderr-sb :any-err? any-err?
+                         :batch-paths batch-paths}))
+
+    (= :not (:kind tree))
+    (not (eval-find-expr (:inner tree) entry
+                         {:fs-handle fs-handle :stdout-sb stdout-sb
+                          :stderr-sb stderr-sb :any-err? any-err?
+                          :batch-paths batch-paths}))
+
+    (= :action (:kind tree))
+    (case (:action tree)
+      :print (do (.append stdout-sb (str (:path entry) "\n")) true)
+      :exec  (if (:batch? tree)
+               ;; Defer to end: accumulate paths under this action's
+               ;; argv signature (we only support one batched -exec).
+               (do (vswap! batch-paths update :argv (fn [a]
+                                                     (or a (:argv tree))))
+                   (vswap! batch-paths update :paths (fnil conj []) (:path entry))
+                   true)
+               (let [exit (spawn-exec-action! tree (:path entry)
+                                              fs-handle stdout-sb stderr-sb)]
+                 (when (not (zero? exit)) (vreset! any-err? true))
+                 (zero? exit))))
+
+    :else false))
 
 (defn find-fn
-  "POSIX-ish find. Supports paths + -name GLOB, -type {f,d,l},
-   -maxdepth N, -print, -exec CMD [args...] {} \\;.
+  "POSIX find. Supports paths + -name/-iname GLOB, -type {f,d,l},
+   -maxdepth N, -mindepth N, -print, -exec CMD [args] {} \\;,
+   -exec CMD {} +, boolean operators -a (implicit) / -o / -not / !,
+   and grouping with `(` `)`. Default action is `-print`.
 
-   -exec dispatches CMD through *host* — the same builtins + allowlist
-   gates apply to whatever -exec invokes, so it can't escape to system
-   binaries. {} is substituted with the file path."
+   -exec dispatches CMD through *host* — same gates apply, can't
+   escape the builtin/allowlist set."
   [argv _fs _env]
-  (let [args (rest argv)
-        {:keys [paths preds exec err]} (parse-find-expr args)]
+  (let [{:keys [paths tree err]} (parse-find-args (rest argv))]
     (cond
       err (usage-err "find" err)
-      (and exec (nil? *host*)) (err "find: -exec needs a host" 1)
+      (and (tree-has-action? tree) (nil? *host*))
+      (err "find: -exec / -print needs a host" 1)
       (>= *depth* max-shell-depth)
       (err "find: too many nested -exec invocations" 2)
       :else
-      (let [fs-handle  (or (:fs *host*)
-                           (throw (ex-info "find: no fs in host" {})))
-            roots      (if (seq paths) paths ["."])
-            stdout     (volatile! [])
-            stderr     (volatile! "")
-            any-err?   (volatile! false)
-            entries    (mapcat (fn [r] (find-walk fs-handle r)) roots)
-            matched    (filter (fn [e] (every? #(pred-match? % e) preds)) entries)]
-        (doseq [{:keys [path]} matched]
-          (if exec
-            (let [substituted (mapv (fn [a] (if (= "{}" a) path a)) exec)
-                  out-sink (host/-string-sink *host*)
-                  err-sink (host/-string-sink *host*)
-                  proc (binding [*depth* (inc *depth*)]
-                         (host/-spawn *host*
-                                      {:cmd (first substituted)
-                                       :args (vec (rest substituted))
-                                       :dir (fs/cwd fs-handle)
-                                       :session *session*
-                                       :out out-sink
-                                       :err err-sink}))
-                  exit ((:wait proc))
-                  out-s (host/-sink->string *host* out-sink)
-                  err-s (host/-sink->string *host* err-sink)]
-              (when (seq out-s) (vswap! stdout conj (str/trim-newline out-s)))
-              (when (seq err-s) (vswap! stderr str err-s))
-              (when (not (zero? exit)) (vreset! any-err? true)))
-            (vswap! stdout conj path)))
-        {:stdout (str (str/join "\n" @stdout) (when (seq @stdout) "\n"))
-         :stderr @stderr
+      (let [fs-handle (or (:fs *host*)
+                          (throw (ex-info "find: no fs in host" {})))
+            ;; Default action: implicit -print when tree has none.
+            tree (if (tree-has-action? tree)
+                   tree
+                   (let [pr {:kind :action :action :print}]
+                     (if (nil? tree) pr
+                         {:kind :and :a tree :b pr})))
+            roots     (if (seq paths) paths ["."])
+            stdout-sb (StringBuilder.)
+            stderr-sb (StringBuilder.)
+            any-err?  (volatile! false)
+            batch-paths (volatile! {})
+            entries   (mapcat (fn [r] (find-walk fs-handle r)) roots)]
+        (doseq [entry entries]
+          (eval-find-expr tree entry
+                          {:fs-handle fs-handle
+                           :stdout-sb stdout-sb
+                           :stderr-sb stderr-sb
+                           :any-err? any-err?
+                           :batch-paths batch-paths}))
+        ;; Flush deferred `-exec ... +` batch.
+        (when-let [bp (and (seq (:paths @batch-paths)) @batch-paths)]
+          (let [exit (spawn-exec-batch! {:argv (:argv bp)} (:paths bp)
+                                        fs-handle stdout-sb stderr-sb)]
+            (when (not (zero? exit)) (vreset! any-err? true))))
+        {:stdout (.toString stdout-sb)
+         :stderr (.toString stderr-sb)
          :exit (if @any-err? 1 0)}))))
 
 ;; ============================================================================
@@ -920,34 +1198,106 @@
    ["-s" "--squeeze-repeats"]
    ["-c" "--complement"]])
 
+(def ^:private tr-char-classes
+  "POSIX character classes recognised in tr's SETs. Mapped to char
+   sequences. `[:upper:]` and `[:lower:]` are the workhorses; we ship
+   the common ones."
+  {"alpha"  (concat (map char (range (int \a) (inc (int \z))))
+                    (map char (range (int \A) (inc (int \Z)))))
+   "alnum"  (concat (map char (range (int \a) (inc (int \z))))
+                    (map char (range (int \A) (inc (int \Z))))
+                    (map char (range (int \0) (inc (int \9)))))
+   "digit"  (map char (range (int \0) (inc (int \9))))
+   "lower"  (map char (range (int \a) (inc (int \z))))
+   "upper"  (map char (range (int \A) (inc (int \Z))))
+   "space"  [\space \tab \newline \return \formfeed (char 11)]
+   "blank"  [\space \tab]
+   "punct"  (seq "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+   "xdigit" (concat (map char (range (int \0) (inc (int \9))))
+                    (map char (range (int \a) (inc (int \f))))
+                    (map char (range (int \A) (inc (int \F)))))
+   "cntrl"  (concat (map char (range 0 32)) [(char 127)])
+   "print"  (map char (range 32 127))
+   "graph"  (map char (range 33 127))})
+
+(defn- expand-escape
+  "Translate the two-char escape starting with `\\` and the next char.
+   Returns [char-or-nil consumed-count]; nil if not a known escape."
+  [c2]
+  (case c2
+    \n [\newline 2]
+    \t [\tab 2]
+    \r [\return 2]
+    \\ [\\ 2]
+    \/ [\/ 2]
+    \a [(char 7) 2]
+    \b [\backspace 2]
+    \f [\formfeed 2]
+    \v [(char 11) 2]
+    \0 [(char 0) 2]
+    nil))
+
 (defn- expand-set
-  "Expand a tr SET string: supports `a-z` ranges and literal chars.
-   Does NOT support character classes like [:alpha:] in v1."
-  [s]
+  "Expand a tr SET string. Supports:
+   - `a-z` ranges (start ≤ end ASCII)
+   - `\\n \\t \\r \\\\ \\a \\b \\f \\v \\0` C-style escapes
+   - `[:upper:] [:lower:] [:digit:] [:alpha:] [:alnum:] [:space:]
+      [:blank:] [:punct:] [:xdigit:] [:cntrl:] [:print:] [:graph:]`
+      POSIX character classes
+   - literal chars otherwise"
+  [^String s]
   (let [sb (StringBuilder.)
-        cs (vec s)
-        n  (count cs)]
+        n  (.length s)]
     (loop [i 0]
       (when (< i n)
-        (let [c (cs i)]
+        (let [c (.charAt s i)]
           (cond
-            (and (< (+ i 2) n) (= \- (cs (inc i))))
-            (let [start (int c) end (int (cs (+ i 2)))]
-              (doseq [k (range start (inc end))] (.append sb (char k)))
-              (recur (+ i 3)))
+            ;; POSIX char class [:name:]
+            (and (= \[ c)
+                 (< (+ i 1) n)
+                 (= \: (.charAt s (inc i))))
+            (let [end (.indexOf s ":]" (+ i 2))]
+              (if (neg? end)
+                (do (.append sb c) (recur (inc i)))
+                (let [cls-name (subs s (+ i 2) end)]
+                  (if-let [chars (get tr-char-classes cls-name)]
+                    (do (doseq [ch chars] (.append sb ^char ch))
+                        (recur (+ end 2)))
+                    (do (.append sb c) (recur (inc i)))))))
+
+            ;; Escape sequence
+            (and (= \\ c) (< (inc i) n))
+            (if-let [[ch n-consumed] (expand-escape (.charAt s (inc i)))]
+              (do (.append sb ^char ch) (recur (+ i n-consumed)))
+              (do (.append sb c) (recur (inc i))))
+
+            ;; Range a-z
+            (and (< (+ i 2) n) (= \- (.charAt s (inc i))))
+            (let [start (int c) end (int (.charAt s (+ i 2)))]
+              (if (<= start end)
+                (do (doseq [k (range start (inc end))] (.append sb (char k)))
+                    (recur (+ i 3)))
+                (do (.append sb c) (recur (inc i)))))
+
             :else
-            (do (.append sb c) (recur (inc i)))))))
+            (do (.append sb c) (recur (inc i))))))
+      )
     (.toString sb)))
 
 (defn tr
   "POSIX tr, subset: SET1 SET2 transliteration; -d delete SET1;
    -s squeeze runs in SET1 (or SET2 in non-delete mode); -c
-   complement SET1. Reads stdin only."
+   complement SET1. Character classes `[:upper:]` `[:lower:]` etc.
+   and the common escape sequences are supported. Reads stdin only."
   [argv _fs env]
   (let [{:keys [opts pos err]} (cli-parse argv tr-spec)]
     (cond
       err (usage-err "tr" err)
       (empty? pos) (usage-err "tr" "missing operand")
+      (and (:delete opts)
+           (not (:squeeze-repeats opts))
+           (> (count pos) 1))
+      (usage-err "tr" (str "extra operand '" (second pos) "' (only one SET allowed with -d)"))
       :else
       (let [set1-raw (first pos)
             set2-raw (second pos)
@@ -1072,33 +1422,144 @@
    ["-i" "--ignore-case"]
    ["-w" "--ignore-all-space"]])
 
+(def ^:private diff-default-context 3)
+
 (defn- normalise-line [opts line]
   (cond-> line
     (:ignore-case opts)       str/lower-case
     (:ignore-all-space opts)  (str/replace #"\s+" "")))
 
-(defn- render-unified [a-name b-name a-lines b-lines script]
-  "Render a diffit edit-script as a minimal unified-diff. We don't
-   coalesce hunks — each op becomes its own line. Good enough for
-   eyeballing and for tests."
-  (let [header (str "--- " a-name "\n+++ " b-name "\n")
-        body (str/join
-              "\n"
-              (for [op script]
-                (case (first op)
-                  :- (let [[_ i n] op]
-                       (str/join "\n"
-                                 (for [k (range n)]
-                                   (str "-" (nth a-lines (+ i k))))))
-                  :+ (let [[_ _ items] op]
-                       (str/join "\n"
-                                 (for [it items]
-                                   (str "+" it)))))))]
-    (str header body (when (seq body) "\n"))))
+;; ---- LCS-based line diff ---------------------------------------------------
+;;
+;; We compute the standard O(n·m) LCS DP table, then trace back to emit a
+;; sequence of [:keep|:del|:add line] ops in source order. From those we
+;; build standard unified-diff hunks (with `@@ -a,A +b,B @@` headers and
+;; 3 lines of context around each change run). The output is patch(1) /
+;; git apply parseable.
+;;
+;; n, m are file lengths; our agent-facing files are small enough that
+;; O(n·m) memory (an int array of (n+1)·(m+1)) is acceptable.
+
+(defn- lcs-table ^ints [a b]
+  (let [n    (count a)
+        m    (count b)
+        cols (inc m)
+        t    (int-array (* (inc n) cols))]
+    (dotimes [i n]
+      (dotimes [j m]
+        (let [idx (+ (* (inc i) cols) (inc j))
+              up   (aget t (+ (* i cols) (inc j)))
+              left (aget t (+ (* (inc i) cols) j))]
+          (if (= (nth a i) (nth b j))
+            (aset-int t idx (inc (aget t (+ (* i cols) j))))
+            (aset-int t idx (max up left))))))
+    t))
+
+(defn- diff-ops
+  "Return a vector of [op line] pairs (`:keep`/`:del`/`:add`) tracing
+   the LCS table for vectors `a` and `b`. Source order."
+  [a b]
+  (let [t    (lcs-table a b)
+        n    (count a)
+        m    (count b)
+        cols (inc m)
+        get-t (fn [i j] (aget ^ints t (+ (* i cols) j)))
+        out  (java.util.ArrayList.)]
+    (loop [i n j m]
+      (cond
+        (and (pos? i) (pos? j) (= (nth a (dec i)) (nth b (dec j))))
+        (do (.add out [:keep (nth a (dec i))])
+            (recur (dec i) (dec j)))
+
+        (and (pos? j) (or (zero? i) (>= (get-t i (dec j)) (get-t (dec i) j))))
+        (do (.add out [:add (nth b (dec j))])
+            (recur i (dec j)))
+
+        (pos? i)
+        (do (.add out [:del (nth a (dec i))])
+            (recur (dec i) j))
+
+        :else nil))
+    (vec (reverse out))))
+
+(defn- group-hunks
+  "Bundle the linear op stream into unified-diff hunks: runs of
+   non-`:keep` ops with up to `ctx` lines of context above and below
+   each change run, merging adjacent runs whose context regions
+   overlap. Returns a vec of hunks; each hunk has `:a-start` /
+   `:a-len` / `:b-start` / `:b-len` (1-indexed, GNU semantics where a
+   zero-length range has start 0) and `:lines` (the [op line] pairs)."
+  [ops ctx]
+  (let [changed? (fn [[op _]] (not= op :keep))
+        consumes-a? (fn [[op _]] (or (= op :keep) (= op :del)))
+        consumes-b? (fn [[op _]] (or (= op :keep) (= op :add)))
+        n (count ops)
+        ;; Find every change-region — a contiguous run of :del/:add
+        ;; ops. Each region grows to absorb at most `ctx` :keep ops on
+        ;; either side. Overlapping windows merge.
+        regions
+        (loop [i 0 acc (transient [])]
+          (cond
+            (>= i n) (persistent! acc)
+            (changed? (nth ops i))
+            (let [start (loop [s i k 0]
+                          (cond
+                            (zero? s) 0
+                            (changed? (nth ops (dec s))) (recur (dec s) 0)
+                            (>= k ctx) s
+                            :else (recur (dec s) (inc k))))
+                  end (loop [e (inc i) k 0]
+                        (cond
+                          (>= e n) e
+                          (changed? (nth ops e)) (recur (inc e) 0)
+                          (>= k ctx) e
+                          :else (recur (inc e) (inc k))))]
+              (recur end (conj! acc [start end])))
+            :else (recur (inc i) acc)))
+        ;; Merge overlapping regions.
+        merged
+        (reduce (fn [acc [s e]]
+                  (if (and (seq acc) (<= s (peek (peek acc))))
+                    (conj (pop acc) [(first (peek acc)) (max e (peek (peek acc)))])
+                    (conj acc [s e])))
+                []
+                regions)]
+    (mapv (fn [[s e]]
+            (let [hunk-lines (subvec ops s e)
+                  a-prefix   (count (filter consumes-a? (subvec ops 0 s)))
+                  b-prefix   (count (filter consumes-b? (subvec ops 0 s)))
+                  a-len      (count (filter consumes-a? hunk-lines))
+                  b-len      (count (filter consumes-b? hunk-lines))]
+              {:a-start (if (zero? a-len) 0 (inc a-prefix))
+               :a-len   a-len
+               :b-start (if (zero? b-len) 0 (inc b-prefix))
+               :b-len   b-len
+               :lines   hunk-lines}))
+          merged)))
+
+(defn- render-unified
+  "Format hunks as unified-diff bytes. Empty hunks → empty string."
+  [a-name b-name hunks]
+  (if (empty? hunks)
+    ""
+    (let [sb (StringBuilder.)]
+      (.append sb (str "--- " a-name "\n+++ " b-name "\n"))
+      (doseq [{:keys [a-start a-len b-start b-len lines]} hunks]
+        (.append sb (format "@@ -%d,%d +%d,%d @@%n" a-start a-len b-start b-len))
+        (doseq [[op line] lines]
+          (.append sb (case op :keep " " :del "-" :add "+"))
+          (.append sb ^String line)
+          (.append sb "\n")))
+      (.toString sb))))
 
 (defn diff
-  "POSIX diff, subset: -u (unified), -q (brief), -i (case),
-   -w (ignore whitespace). Exit 0 = same, 1 = different, 2 = error."
+  "POSIX diff. Subset: -u (unified, the default), -q (brief),
+   -i (ignore case), -w (ignore all whitespace). Exit 0 = same,
+   1 = different, 2 = error.
+
+   Output is a real unified diff (with `@@ -a,A +b,B @@` hunk
+   headers and 3 lines of context) so `patch` / `git apply` can
+   consume it."
   [argv fs _env]
   (let [{:keys [opts pos err]} (cli-parse argv diff-spec)]
     (cond
@@ -1115,15 +1576,17 @@
           :else
           (let [la (mapv (partial normalise-line opts) (str/split-lines ca))
                 lb (mapv (partial normalise-line opts) (str/split-lines cb))
-                [dist script] (dv/diff la lb)]
+                ops (diff-ops la lb)
+                same? (every? (fn [[op _]] (= op :keep)) ops)]
             (cond
-              (zero? dist) {:stdout "" :stderr "" :exit 0}
+              same? {:stdout "" :stderr "" :exit 0}
               (:brief opts)
               {:stdout (str "Files " fa " and " fb " differ\n")
                :stderr "" :exit 1}
               :else
-              {:stdout (render-unified fa fb la lb script)
-               :stderr "" :exit 1})))))))
+              (let [hunks (group-hunks ops diff-default-context)]
+                {:stdout (render-unified fa fb hunks)
+                 :stderr "" :exit 1}))))))))
 
 ;; ============================================================================
 ;; xargs — read stdin, dispatch CMD with substituted args via host
@@ -1133,14 +1596,33 @@
   [["-0" "--null"]
    ["-n" "--max-args N" :parse-fn #(Long/parseLong %)]
    ["-I" "--replace R"]
-   ["-d" "--delimiter D"]])
+   ["-d" "--delimiter D"]
+   ["-r" "--no-run-if-empty"]])
+
+(defn- xargs-tokens
+  "Split stdin into tokens per xargs's rules:
+   - -0 / --null: NUL-separated
+   - -d D: explicit delimiter D
+   - -I R: each LINE is a token (not whitespace-split)
+   - default: whitespace-split
+
+   Empty tokens are dropped."
+  [stdin {:keys [null delimiter replace]}]
+  (let [raw (cond
+              null      (str/split stdin (re-pattern (java.util.regex.Pattern/quote "\0")))
+              delimiter (str/split stdin (re-pattern (java.util.regex.Pattern/quote delimiter)))
+              replace   (str/split-lines stdin)
+              :else     (str/split stdin #"\s+"))]
+    (->> raw (remove str/blank?) vec)))
 
 (defn xargs
   "POSIX xargs, subset: -0 NUL-separated, -n N args per call,
-   -I R per-call substitution, -d D explicit delimiter.
+   -I R per-call substitution (one whole line per invocation),
+   -d D explicit delimiter, -r / --no-run-if-empty.
 
    Dispatches CMD through *host* — same gates apply, so xargs
-   can't escape the builtin/allowlist set."
+   can't escape the builtin/allowlist set. Subprocess stdout is
+   passed through verbatim (newlines preserved)."
   [argv _fs env]
   (let [{:keys [opts pos err]} (cli-parse argv xargs-spec)]
     (cond
@@ -1150,54 +1632,53 @@
       (err "xargs: too many nested invocations" 2)
       :else
       (let [stdin    (or (:stdin env) "")
-            sep      (cond
-                       (:null opts) "\0"
-                       (:delimiter opts) (:delimiter opts)
-                       :else nil)
-            tokens   (->> (if sep
-                            (str/split stdin (re-pattern (java.util.regex.Pattern/quote sep)))
-                            (str/split stdin #"\s+"))
-                          (remove str/blank?))
+            tokens   (xargs-tokens stdin opts)
             cmd-argv (if (seq pos) pos ["echo"])
             cmd      (first cmd-argv)
             base     (vec (rest cmd-argv))
             replace  (:replace opts)
             max-n    (:max-args opts)
-            stdout   (volatile! [])
-            stderr   (volatile! "")
+            stdout-sb (StringBuilder.)
+            stderr-sb (StringBuilder.)
             any-err? (volatile! false)
             batches  (cond
                        replace (mapv vector tokens)
                        max-n   (vec (partition-all max-n tokens))
                        :else   [tokens])]
-        (doseq [batch batches]
-          (when-not @any-err?
-            (let [args (if replace
-                         (mapv (fn [a]
-                                 (if (= replace a)
-                                   (first batch)
-                                   (str/replace a (re-pattern (java.util.regex.Pattern/quote replace))
-                                                (first batch))))
-                               base)
-                         (into base batch))
-                  out-sink (host/-string-sink *host*)
-                  err-sink (host/-string-sink *host*)
-                  proc (binding [*depth* (inc *depth*)]
-                         (host/-spawn *host*
-                                      {:cmd cmd
-                                       :args args
-                                       :session *session*
-                                       :out out-sink
-                                       :err err-sink}))
-                  exit ((:wait proc))
-                  out-s (host/-sink->string *host* out-sink)
-                  err-s (host/-sink->string *host* err-sink)]
-              (when (seq out-s) (vswap! stdout conj (str/trim-newline out-s)))
-              (when (seq err-s) (vswap! stderr str err-s))
-              (when (not (zero? exit)) (vreset! any-err? true)))))
-        {:stdout (str (str/join "\n" @stdout) (when (seq @stdout) "\n"))
-         :stderr @stderr
-         :exit (if @any-err? 1 0)}))))
+        (cond
+          ;; -r and nothing on stdin → noop
+          (and (:no-run-if-empty opts) (empty? tokens))
+          (ok "")
+
+          :else
+          (do
+            (doseq [batch batches]
+              (when-not @any-err?
+                (let [args (if replace
+                             (mapv (fn [a]
+                                     (str/replace a
+                                                  (re-pattern (java.util.regex.Pattern/quote replace))
+                                                  (first batch)))
+                                   base)
+                             (into base batch))
+                      out-sink (host/-string-sink *host*)
+                      err-sink (host/-string-sink *host*)
+                      proc (binding [*depth* (inc *depth*)]
+                             (host/-spawn *host*
+                                          {:cmd cmd
+                                           :args args
+                                           :session *session*
+                                           :out out-sink
+                                           :err err-sink}))
+                      exit ((:wait proc))
+                      out-s (host/-sink->string *host* out-sink)
+                      err-s (host/-sink->string *host* err-sink)]
+                  (.append stdout-sb ^String out-s)
+                  (.append stderr-sb ^String err-s)
+                  (when (not (zero? exit)) (vreset! any-err? true)))))
+            {:stdout (.toString stdout-sb)
+             :stderr (.toString stderr-sb)
+             :exit (if @any-err? 1 0)}))))))
 
 ;; ============================================================================
 ;; Registry — the canonical builtin map
