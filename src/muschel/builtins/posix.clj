@@ -23,6 +23,7 @@
 
    Reference: uutils-coreutils. Long GNU options not in our spec
    surface as parse errors with a clear message."
+  (:refer-clojure :exclude [cat])
   (:require [clojure.string :as str]
             [clojure.tools.cli :as cli]
             [diffit.vec :as dv]

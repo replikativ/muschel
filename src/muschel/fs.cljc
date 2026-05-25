@@ -22,6 +22,7 @@
    Read-only operations only in v1; write ops come once we've validated
    the read surface against agent behaviour and built the per-fork
    yggdrasil-backed FS for substrate isolation."
+  (:refer-clojure :exclude [resolve exists?])
   (:require [clojure.string :as str]))
 
 (defprotocol FS
