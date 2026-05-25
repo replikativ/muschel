@@ -69,9 +69,9 @@
         {:keys [stdout stderr exit]}
         (try
           (push-thread-bindings
-            {host-var    self
-             session-var (:session opts)
-             depth-var   (or @depth-var 0)})
+           {host-var    self
+            session-var (:session opts)
+            depth-var   (or @depth-var 0)})
           (try (builtin-fn argv fs env)
                (finally (pop-thread-bindings)))
           (catch Throwable t
