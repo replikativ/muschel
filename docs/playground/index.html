@@ -7,9 +7,13 @@
       :root {
         color-scheme: light dark;
         --bg: #0f1419;
+        --bg-pane: #131820;
         --fg: #c5c8c6;
         --accent: #5fb3b3;
+        --accent-2: #f0c674;
         --dim: #717c84;
+        --err: #cc6666;
+        --border: #2a3138;
       }
       * { box-sizing: border-box; }
       html, body { height: 100%; margin: 0; }
@@ -20,9 +24,14 @@
         display: flex;
         flex-direction: column;
       }
+
       header {
-        padding: 12px 16px;
-        border-bottom: 1px solid #2a3138;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--border);
+        flex-wrap: wrap;
       }
       header h1 {
         margin: 0;
@@ -30,23 +39,62 @@
         font-weight: 600;
         color: var(--accent);
       }
-      header p {
-        margin: 4px 0 0;
+      header .hint {
+        margin: 0;
         font-size: 12px;
         color: var(--dim);
+        flex: 1;
+      }
+      header code {
+        background: rgba(255,255,255,0.05);
+        padding: 1px 5px;
+        border-radius: 3px;
+        color: var(--accent-2);
+      }
+      button#reset-btn {
+        background: transparent;
+        color: var(--fg);
+        border: 1px solid var(--border);
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 10px;
+        cursor: pointer;
+        border-radius: 4px;
+      }
+      button#reset-btn:hover {
+        background: rgba(255,255,255,0.05);
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+
+      #main {
+        flex: 1;
+        display: flex;
+        min-height: 0;             /* allow children to scroll */
+      }
+      #terminal {
+        flex: 1 1 60%;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
       }
       #log {
         flex: 1;
         white-space: pre-wrap;
+        word-break: break-word;
         padding: 12px 16px;
         overflow-y: auto;
         font-size: 13px;
         line-height: 1.5;
       }
+      #log .echo  { color: var(--dim); }
+      #log .stderr { color: var(--err); }
+      #log .dim   { color: var(--dim); }
+
       #inputbox {
         display: flex;
         padding: 8px 16px 16px;
-        border-top: 1px solid #2a3138;
+        border-top: 1px solid var(--border);
         align-items: center;
         gap: 6px;
         font-size: 13px;
@@ -60,18 +108,79 @@
         font: inherit;
         outline: none;
       }
+
+      aside#files {
+        flex: 0 0 280px;
+        border-left: 1px solid var(--border);
+        background: var(--bg-pane);
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+      aside#files h2 {
+        margin: 0;
+        padding: 10px 14px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--accent);
+        border-bottom: 1px solid var(--border);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      #files-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 8px 0;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+      #files-list .file-row {
+        padding: 1px 14px;
+        color: var(--fg);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #files-list .file-row.dir { color: var(--accent); }
+      #files-list .file-row.file { color: var(--fg); }
+      #files-list .file-row.symlink { color: var(--accent-2); }
+
+      @media (max-width: 720px) {
+        aside#files { display: none; }
+      }
     </style>
   </head>
   <body>
     <header>
       <h1>muschel — bash in your browser</h1>
-      <p>Try: <code>cat /README.md</code> · <code>ls /</code> · <code>echo "$((2+3))"</code> · <code>for i in 1 2 3; do echo $i; done | wc</code></p>
+      <p class="hint">
+        Try
+        <code>cat README.md</code> ·
+        <code>find . -type f</code> ·
+        <code>awk -F : '{print $1}' /etc/passwd</code> ·
+        <code>echo hi > /tmp/x</code> ·
+        <code>sh -c 'echo nested'</code>
+        — Tab completes, ↑/↓ history, Ctrl-L clears
+      </p>
+      <button id="reset-btn" title="Wipe localStorage and rebuild the default tree">Reset</button>
     </header>
-    <div id="log"></div>
-    <div id="inputbox">
-      <span id="prompt">/ $? 0 > </span>
-      <input id="input" autofocus autocomplete="off" spellcheck="false" placeholder="type a bash command and hit Enter…">
+
+    <div id="main">
+      <section id="terminal">
+        <div id="log"></div>
+        <div id="inputbox">
+          <span id="prompt">/home/user $? 0 > </span>
+          <input id="input" autofocus autocomplete="off" spellcheck="false"
+                 placeholder="type a bash command and hit Enter…">
+        </div>
+      </section>
+
+      <aside id="files">
+        <h2>Virtual FS</h2>
+        <div id="files-list"></div>
+      </aside>
     </div>
+
     <script>
       // Local dev (localhost) loads the freshly-built bundle from
       // dist/npm/playground (served alongside this HTML by shadow-cljs's
