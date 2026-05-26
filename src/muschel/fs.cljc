@@ -69,7 +69,22 @@
      8 MiB).")
 
   (-read-bytes [this path]
-    "Like -read-file but returns a byte array (or nil)."))
+    "Like -read-file but returns a byte array (or nil).")
+
+  (-open-source [this path]
+    "Open `path` for reading. Returns an InputStream (or platform
+     equivalent) if `path` resolves inside the root and exists; nil
+     otherwise. Used by the BuiltinHost to route shell-redirect
+     `< file` reads through the FS.")
+
+  (-open-sink [this path append?]
+    "Open `path` for writing. Returns an OutputStream (or platform
+     equivalent) if `path` resolves inside the root; nil if outside.
+     `append?` controls truncate-vs-append semantics. Used by the
+     BuiltinHost to route shell-redirect `> file` / `>> file` writes.
+
+     For impls that don't otherwise persist (virtual FS), closing the
+     returned stream commits the bytes into the FS's storage."))
 
 ;; ============================================================================
 ;; Public wrappers
@@ -83,6 +98,8 @@
 (defn list-dir  [fs path] (-list-dir fs path))
 (defn read-file [fs path] (-read-file fs path))
 (defn read-bytes [fs path] (-read-bytes fs path))
+(defn open-source [fs path] (-open-source fs path))
+(defn open-sink   [fs path append?] (-open-sink fs path append?))
 
 ;; ============================================================================
 ;; Path utilities (impl-agnostic)

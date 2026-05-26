@@ -112,11 +112,26 @@
   (-sink->string     [_ sink]   (host/-sink->string fallback-host sink))
   (-string-source    [_ s]      (host/-string-source fallback-host s))
 
-  ;; ---- files ---- (delegate; FS layer handles containment separately)
-  (-open-file-sink   [_ p ap?]  (host/-open-file-sink fallback-host p ap?))
-  (-open-file-source [_ p]      (host/-open-file-source fallback-host p))
-  (-file-info        [_ p]      (host/-file-info fallback-host p))
-  (-read-file        [_ p]      (host/-read-file fallback-host p))
+  ;; ---- files ---- routed through FS for containment.
+  ;;
+  ;; Redirect targets (`< file`, `> file`, `>> file`) and direct
+  ;; file_info / read_file callers all go through the FS handle. The
+  ;; FS resolves each path; if it lands outside the root, ops fail
+  ;; with nil — same behaviour as opening a non-existent file. We do
+  ;; NOT delegate to the fallback host: a leaked path would otherwise
+  ;; reach raw java.io and read/write real disk.
+  (-open-file-sink [_ p append?]
+    (or (fs/-open-sink fs p append?)
+        (throw (java.io.FileNotFoundException.
+                (str p " (not in muschel FS root or not writable)")))))
+  (-open-file-source [_ p]
+    (or (fs/-open-source fs p)
+        (throw (java.io.FileNotFoundException.
+                (str p " (not in muschel FS root or missing)")))))
+  (-file-info [_ p]
+    (fs/-stat fs p))
+  (-read-file [_ p]
+    (fs/-read-file fs p))
 
   ;; ---- pipes ----
   (-make-pipe        [_]        (host/-make-pipe fallback-host))

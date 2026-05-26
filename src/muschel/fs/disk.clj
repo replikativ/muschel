@@ -148,7 +148,28 @@
                 buf (byte-array read-size)]
             (with-open [in (Files/newInputStream p (make-array java.nio.file.OpenOption 0))]
               (.readNBytes in buf 0 read-size))
-            buf))))))
+            buf)))))
+
+  (-open-source [_ path]
+    (when-let [resolved (resolve* root @cwd-atom path)]
+      (let [p (str->path resolved)]
+        (when (Files/isRegularFile p follow)
+          (Files/newInputStream p (make-array java.nio.file.OpenOption 0))))))
+
+  (-open-sink [_ path append?]
+    (when-let [resolved (resolve* root @cwd-atom path)]
+      (let [p (str->path resolved)
+            base-opts (if append?
+                        [java.nio.file.StandardOpenOption/CREATE
+                         java.nio.file.StandardOpenOption/APPEND
+                         java.nio.file.StandardOpenOption/WRITE]
+                        [java.nio.file.StandardOpenOption/CREATE
+                         java.nio.file.StandardOpenOption/TRUNCATE_EXISTING
+                         java.nio.file.StandardOpenOption/WRITE])]
+        ;; Defense in depth: re-check containment of the parent
+        ;; directory. If the resolved path's parent escaped root via
+        ;; a symlink, resolve* would have returned nil already.
+        (Files/newOutputStream p (into-array java.nio.file.OpenOption base-opts))))))
 
 (defn make
   "Construct a disk FS pinned to `root`. All paths resolve under root;

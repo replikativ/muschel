@@ -33,6 +33,7 @@
             [muschel.env :as env]
             [muschel.errors :as err]
             [muschel.expand :as expand]
+            [muschel.fs :as mfs]
             [muschel.host :as host]
             #?(:clj [muschel.host.jvm :as host.jvm])
             [muschel.parse :as parse]
@@ -246,16 +247,34 @@
 
 (defn- apply-redirs
   "Apply a sequence of redirections, returning [env' opts' close!-fn]
-   where close!-fn closes everything in reverse order."
+   where close!-fn closes everything in reverse order.
+
+   Any redirect that fails (target outside FS root, unreadable file, …)
+   writes a bash-style \"line N: cmd: file: msg\" line to :err on
+   `opts`, marks env as `:redir-failed?` so the caller can short-circuit
+   the inner command and exit 1, and returns the original env / opts."
   [env redirs opts]
   (let [closers (volatile! [])
+        failure (volatile! nil)
         [env' opts']
         (reduce (fn [[env opts] r]
-                  (let [[env' opts' c] (apply-redir env r opts)]
-                    (vswap! closers conj c)
-                    [env' opts']))
+                  (if @failure
+                    [env opts]
+                    (try
+                      (let [[env' opts' c] (apply-redir env r opts)]
+                        (vswap! closers conj c)
+                        [env' opts'])
+                      (catch #?(:clj Throwable :cljs :default) e
+                        (vreset! failure e)
+                        (host/write-string! (:host opts) (:err opts)
+                                            (str "muschel: redirect: "
+                                                 #?(:clj (.getMessage ^Throwable e)
+                                                    :cljs (.-message e))
+                                                 "\n"))
+                        [env opts]))))
                 [env opts]
-                redirs)]
+                redirs)
+        env' (cond-> env' @failure (assoc :redir-failed? true))]
     [env' opts' (fn [] (doseq [c (reverse @closers)]
                          (try (c) (catch #?(:clj Throwable :cljs :default) _ nil))))]))
 
@@ -2255,15 +2274,23 @@
         [env-r opts-r close!] (apply-redirs env all-redirs opts)
         cmd-without-redirs (dissoc cmd :redirs)]
     (try
-      (let [env' (try
-                   (exec-cmd env-r cmd-without-redirs opts-r)
-                   (catch #?(:clj clojure.lang.ExceptionInfo
-                             :cljs ExceptionInfo) e
-                     (if (= :muschel.expand/param-error
-                            (:type (ex-data e)))
-                       (do (write-line opts-r :err (str (:msg (ex-data e)) "\n"))
-                           (-> env-r (env/record-exit 1) (assoc :exiting? true)))
-                       (throw e))))]
+      (let [env' (cond
+                   ;; A redirect raised (file not found, FS escape, …).
+                   ;; apply-redirs already wrote the error to :err.
+                   ;; Skip the command and exit 1.
+                   (:redir-failed? env-r)
+                   (-> env-r (dissoc :redir-failed?) (env/record-exit 1))
+
+                   :else
+                   (try
+                     (exec-cmd env-r cmd-without-redirs opts-r)
+                     (catch #?(:clj clojure.lang.ExceptionInfo
+                               :cljs ExceptionInfo) e
+                       (if (= :muschel.expand/param-error
+                              (:type (ex-data e)))
+                         (do (write-line opts-r :err (str (:msg (ex-data e)) "\n"))
+                             (-> env-r (env/record-exit 1) (assoc :exiting? true)))
+                         (throw e)))))]
         (let [env' (if (:neg? stmt)
                      (env/record-exit env' (if (zero? (:last-exit env')) 1 0))
                      env')
@@ -2399,6 +2426,17 @@
           :permit permit-result
           :denied-reason (:reason denied)})
        (let [h (or (:host opts) (default-host))
+             ;; A sandbox-aware host carries `:fs` (muschel.fs handle).
+             ;; Thread it into env so expand's pathname expansion walks
+             ;; the FS tree instead of leaking to babashka.fs against
+             ;; real disk. Also align env's :cwd with the FS's notion
+             ;; of cwd so relative-path resolution stays consistent.
+             host-fs (when h (try (:fs h) (catch #?(:clj Throwable :cljs :default) _ nil)))
+             env (cond-> env
+                   host-fs                                    (assoc :fs host-fs)
+                   (and host-fs (not= (:cwd env) (mfs/cwd host-fs)))
+                   (assoc :cwd (mfs/cwd host-fs)
+                          :prev-cwd (mfs/cwd host-fs)))
              opts' (cond-> {:in  (or in #?(:clj System/in :cljs nil))
                             :out (or out #?(:clj System/out :cljs (host/string-sink h)))
                             :err (or err #?(:clj System/err :cljs (host/string-sink h)))

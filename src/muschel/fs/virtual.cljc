@@ -105,7 +105,41 @@
     (when-let [resolved (fs/-resolve this path)]
       (let [entry (get @entries-atom resolved)]
         (when (= :file (:type entry))
-          (:bytes entry))))))
+          (:bytes entry)))))
+
+  (-open-source [this path]
+    #?(:clj
+       (when-let [bs (fs/-read-bytes this path)]
+         (java.io.ByteArrayInputStream.
+          (cond
+            (bytes? bs) bs
+            (string? bs) (.getBytes ^String bs "UTF-8")
+            :else (byte-array 0))))
+       :cljs nil))
+
+  (-open-sink [this path append?]
+    #?(:clj
+       (when-let [resolved (fs/-resolve this path)]
+         ;; Build an in-memory buffer; on close, commit to entries-atom.
+         ;; For append mode, seed with existing bytes if present.
+         (let [existing (when append?
+                          (when-let [e (get @entries-atom resolved)]
+                            (when (= :file (:type e)) (:bytes e))))
+               seed     (cond
+                          (nil? existing) nil
+                          (string? existing) (.getBytes ^String existing "UTF-8")
+                          :else existing)
+               baos     (proxy [java.io.ByteArrayOutputStream] []
+                          (close []
+                            (proxy-super close)
+                            (let [bytes (.toByteArray ^java.io.ByteArrayOutputStream this)]
+                              (swap! entries-atom assoc resolved
+                                     {:type :file
+                                      :bytes bytes
+                                      :mtime-ms (mtime)}))))]
+           (when seed (.write ^java.io.ByteArrayOutputStream baos ^bytes seed 0 (alength ^bytes seed)))
+           baos))
+       :cljs nil)))
 
 (defn make
   "Construct a virtual FS pre-populated with `entries`, a map of

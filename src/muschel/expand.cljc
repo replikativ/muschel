@@ -35,6 +35,7 @@
             #?(:cljs [goog.string.format])
             [muschel.env :as env]
             [muschel.errors :as err]
+            [muschel.fs :as mfs]
             [muschel.lex :as lex]
             #?(:clj [babashka.fs :as fs])
             #?(:clj [clojure.java.shell :as csh])))
@@ -1040,10 +1041,48 @@
       (flush!)
       @out)))
 
+(defn- sandboxed-glob
+  "Walk muschel-fs from `cwd`, expanding `pattern` segment-by-segment
+   (one `/`-delimited piece at a time) by listing each frontier dir
+   and matching basenames against the segment's glob regex. Returns
+   matched paths relative to `cwd` (or absolute when `pattern` starts
+   with `/`), sorted. Empty seq → no matches."
+  [muschel-fs cwd pattern]
+  (let [absolute?    (str/starts-with? pattern "/")
+        all-segs     (str/split (cond-> pattern absolute? (subs 1)) #"/")
+        segs         (vec all-segs)
+        start        (if absolute? "/" (or cwd "/"))
+        cwd-prefix   (str (str/replace (or cwd "/") #"/+$" "") "/")
+        rel-to-cwd   (fn [p]
+                       (cond
+                         absolute?                       p
+                         (= p cwd)                       "."
+                         (str/starts-with? p cwd-prefix) (subs p (count cwd-prefix))
+                         :else                           p))
+        expand-step  (fn [bases ^String seg]
+                       (let [rx (re-pattern (str "^" (glob->regex seg) "$"))]
+                         (mapcat
+                          (fn [b]
+                            (let [children (or (mfs/-list-dir muschel-fs b) [])]
+                              (->> children
+                                   (filter #(re-find rx (:name %)))
+                                   (mapv #(str (str/replace b #"/+$" "") "/" (:name %))))))
+                          bases)))]
+    (loop [bases [start] remaining segs]
+      (if (empty? remaining)
+        (vec (sort (mapv rel-to-cwd bases)))
+        (recur (expand-step bases (first remaining)) (rest remaining))))))
+
 (defn- glob-expand
   "Apply pathname expansion to one word. Returns the original word
    wrapped in a single-element vector if no glob chars or no matches.
    Skipped when env's :noglob option is true.
+
+   When env carries `:fs` (a muschel.fs FS handle — installed by
+   `muschel.exec/run` when the host is sandboxed) the walk goes
+   through that handle, so globs cannot escape the FS root. With no
+   `:fs`, falls back to `babashka.fs/glob` against the real disk
+   (legacy callers / non-sandboxed runs).
 
    bash quirk: leading `./` is preserved in the result (we strip it
    before globbing and re-attach to each match)."
@@ -1054,9 +1093,12 @@
          [word]
          (let [dot-prefix? (str/starts-with? word "./")
                pat (cond-> word dot-prefix? (subs 2))
-               matches (try (fs/glob (:cwd env) pat)
-                            (catch #?(:clj Throwable :cljs :default) _ nil))
-               base (mapv (fn [p] (str (fs/relativize (:cwd env) p))) matches)
+               muschel-fs  (:fs env)
+               base (if muschel-fs
+                      (sandboxed-glob muschel-fs (:cwd env) pat)
+                      (let [matches (try (fs/glob (:cwd env) pat)
+                                         (catch #?(:clj Throwable :cljs :default) _ nil))]
+                        (mapv (fn [p] (str (fs/relativize (:cwd env) p))) matches)))
                strs (mapv #(if dot-prefix? (str "./" %) %) base)]
            (if (seq strs)
              (sort strs)
