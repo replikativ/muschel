@@ -62,6 +62,7 @@ src/muschel/
   builtins/awk_compat.cljc  cross-platform shims (regex, StringBuilder, format, codepoints)
   js_api.cljs               ^:export bindings for the npm bundle
   playground.cljs           browser playground entry point
+  cli.clj                   JVM CLI entry — bash-shaped invocation (-c, script.sh, -s, -n, -x, -o, --) + sandbox flags
 ```
 
 ## Runtimes
@@ -120,6 +121,48 @@ containment so `cat ../etc/passwd` stays inside the root:
               :fallback-allowlist #{"git"}})]  ; allow git, refuse everything else
   (m/run-and-capture (m/new-env) "git status" {:host host}))
 ```
+
+## Quickstart — CLI
+
+`muschel.cli` is a JVM-side command-line entry that mirrors `bash`'s
+invocation surface and adds the sandbox flags on top. From a checkout:
+
+```bash
+clojure -M:cli                                  # interactive shell
+clojure -M:cli -c 'echo hi | grep h'            # one-shot
+clojure -M:cli script.sh foo bar                # run a script ($1=foo $2=bar)
+clojure -M:cli -n script.sh                     # validate syntax only
+clojure -M:cli -o errexit -c 'false; echo no'   # -o sets shell options
+
+# Sandboxed against the current directory:
+clojure -M:cli --sandbox --root . script.sh
+
+# Sandboxed against an in-memory VFS (optionally seeded from edn):
+clojure -M:cli --sandbox --virtual ./fixtures/seed.edn -c 'cat /work/a.txt'
+
+# Let some real-world tools through to the fallback host:
+clojure -M:cli --sandbox --root . --allow git,clojure -c 'git status'
+
+# Custom permit overlay on top of the default ruleset:
+clojure -M:cli --sandbox --root . --permit ./tight.edn -c 'curl example.com'
+
+# Analysis subcommands:
+clojure -M:cli translate -f script.sh           # bash → Clojure form
+clojure -M:cli check     -f script.sh --permit ./tight.edn   # permit dry-run
+clojure -M:cli parse     'echo hi'              # pretty-print AST
+```
+
+Bash positional semantics are honoured: anything after `-c CMD`, after
+a script-file, or after `--` becomes `$0`/`$1`/... and is NOT
+re-interpreted as a flag. So `muschel script.sh -x` runs the script
+with `$1="-x"` — same as bash, NOT with xtrace on.
+
+`--sandbox` requires exactly one of `--root DIR` (DiskFS pinned to
+DIR) or `--virtual [FILE]` (empty VFS, or one seeded from an edn map
+`{"/path" "content", ...}`). Without `--sandbox` the host is `JvmHost`
+— full disk + permissions, no permit gate — same shape as `bb sh`.
+
+`clojure -M:cli --help` has the full flag table.
 
 ## Quickstart — Node.js / JavaScript
 

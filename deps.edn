@@ -33,6 +33,11 @@
                     {:git/sha "7284cda41fb9edc0f3bc6b6185cfb7138fc8a023"}}
        :main-opts ["-m" "cognitect.test-runner"]}
 
+  ;; CLI entry — JVM-only. `clojure -M:cli --help`. Wraps `muschel.cli`
+  ;; which implements bash-shaped invocation (-c, script.sh, -s, ...)
+  ;; plus muschel-specific extensions (--sandbox, --root, ...).
+  :cli {:main-opts ["-m" "muschel.cli"]}
+
   ;; Optional spindel backing for muschel.session.spindel.
   ;; Pull only when you want the JVM-only forkable session impl.
   ;; (Spindel itself has transitive deps that don't load in babashka.)
