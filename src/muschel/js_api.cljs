@@ -29,7 +29,9 @@
             [muschel.fs.virtual :as fs.virtual]
             [muschel.host :as host]
             [muschel.host.browser :as host.browser]
+            [muschel.host.builtin :as host.builtin]
             [muschel.host.node :as host.node]
+            [muschel.builtins.posix :as posix]
             [muschel.parse :as parse]
             [muschel.permit :as permit]
             [muschel.session :as session]))
@@ -40,26 +42,67 @@
 
 (defn- ->js [x] (clj->js x :keyword-fn name))
 
+(def ^:private opt-renames
+  {:posArgs           :pos-args
+   :hostEnv           :host-env?
+   :timeoutMs         :timeout-ms
+   :interruptFn       :interrupt-fn
+   :onTool            :on-tool
+   :onFs              :on-fs
+   :onDeny            :on-deny
+   :fallbackHost      :fallback-host
+   :fallbackAllowlist :fallback-allowlist
+   :maxBytes          :max-bytes})
+
+;; CLJS records (`BuiltinHost`, `BrowserHost`, `AtomSession`, …) carry
+;; their protocol implementations on the JS prototype. A naïve
+;; `(js->clj js-opts :keywordize-keys true)` walks the opts recursively
+;; and — because every CLJS record is also a JS object — rebuilds them
+;; as plain Clojure maps, stripping the prototype. Protocol dispatch
+;; (e.g. `host/-string-sink`) then can't find the impl and bombs with
+;; "No protocol method … defined for type object".
+;;
+;; We need a recursive walk that descends into plain JS data
+;; (`{}` and `[]` literals) but leaves anything class-instance-shaped
+;; alone (CLJS records, deftypes, atoms, functions, native classes).
+;; `plain-js-object?` is the gate: a JS object whose `.constructor` is
+;; `js/Object` (or undefined, for `Object.create(null)`) is plain data;
+;; everything else passes through verbatim.
+(defn- plain-js-object? [x]
+  (and (object? x)
+       (not (array? x))
+       (not (fn? x))
+       (let [ctor (.-constructor x)]
+         (or (nil? ctor)
+             (identical? ctor js/Object)))))
+
+(defn- js->clj-walk
+  "Recursively convert plain JS objects/arrays to Clojure maps/vectors
+   with keywordized keys. CLJS records, deftypes, atoms, fns, and any
+   value that isn't a plain `{}`/`[]` pass through unchanged."
+  [x]
+  (cond
+    (plain-js-object? x)
+    (persistent!
+     (reduce (fn [m k]
+               (let [kw0 (keyword k)
+                     kw  (get opt-renames kw0 kw0)]
+                 (assoc! m kw (js->clj-walk (aget x k)))))
+             (transient {})
+             (js-keys x)))
+
+    (array? x)
+    (mapv js->clj-walk x)
+
+    :else x))
+
 (defn- js-opts->clj
-  "Coerce a JS opts object into a Clojure map with kebab-case keys.
-   Recognises the camelCase keys we use everywhere."
+  "Coerce a JS opts object into a Clojure map with kebab-case keys,
+   recursing through nested plain JS data while preserving CLJS-side
+   handles (hosts, sessions, prompters, interrupt fns)."
   [js-opts]
   (when js-opts
-    (let [m (js->clj js-opts :keywordize-keys true)
-          renames {:posArgs           :pos-args
-                   :hostEnv           :host-env?
-                   :timeoutMs         :timeout-ms
-                   :interruptFn       :interrupt-fn
-                   :onTool            :on-tool
-                   :onFs              :on-fs
-                   :onDeny            :on-deny
-                   :fallbackHost      :fallback-host
-                   :fallbackAllowlist :fallback-allowlist
-                   :maxBytes          :max-bytes}]
-      (reduce-kv (fn [acc k v]
-                   (let [k' (renames k k)]
-                     (-> acc (dissoc k) (assoc k' v))))
-                 m m))))
+    (js->clj-walk js-opts)))
 
 (defn- ->clj-tool-fn [js-fn]
   ;; JS tool fn: (argv, stdin, env) → { stdout, stderr, exit }
@@ -95,8 +138,11 @@
      (->js res))))
 
 (def ^:export defaultRules
-  "The shipped default ruleset (read-only POSIX allow + denylist)."
-  (clj->js permit/default-rules :keyword-fn name))
+  "The shipped default ruleset. Treat as an opaque token — pass it
+   into `m.run({ permit: { rulesets: [m.defaultRules, …] } })`. The
+   underlying value is CLJS data and is preserved verbatim by the
+   opts walker, so its keyword fields survive the JS boundary."
+  permit/default-rules)
 
 (def ^:export denyAllPrompter permit/deny-all-prompter)
 (def ^:export allowAllPrompter permit/allow-all-prompter)
@@ -152,28 +198,63 @@
 (defn ^:export browserHost
   "Create a sandboxed in-memory host. Works in browser AND Node.
 
-   opts: { tools: {name: fn}, files: {path: content},
-           includeStock: bool (default true) }
+   By default this is a `BuiltinHost` over a `BrowserHost` over a
+   `VirtualFS`, which is the full muschel sandbox shape:
 
-   By default we merge in `stockTools()` (cat, wc, grep, head) so a
-   plain `m.browserHost({ files: ... })` can `cat | wc -l` without
-   the caller registering tools. Pass `includeStock: false` to opt
-   out and supply only your own."
+     ┌─ BuiltinHost ────────────────────────────────────┐
+     │  routes every command through the POSIX builtin   │
+     │  registry (~50 tools: cat, ls, grep, find, sed,   │
+     │  awk, cp, mv, tee, sh -c, redirects, pipes, …).   │
+     │  Any user-supplied `tools` are added to the       │
+     │  fallback-allowlist so they're reachable too.     │
+     │                                                   │
+     │   ↓ falls back to                                 │
+     │                                                   │
+     │  BrowserHost  ←  in-memory buffers, virtual tool  │
+     │                  registry, no real spawn          │
+     │                                                   │
+     │   ↓ FS protocol                                   │
+     │                                                   │
+     │  VirtualFS    ←  containment-aware; paths that    │
+     │                  resolve outside the root return  │
+     │                  nil                              │
+     └───────────────────────────────────────────────────┘
+
+   opts: {
+     files:        { path: content },     // VFS seed
+     cwd:          '/path',                // VFS cwd (default '/')
+     tools:        { name: fn },          // external tools (added to allowlist)
+     includeStock: bool                   // default false; legacy stock-tools
+   }
+
+   Set `sandboxed: false` if you want the legacy raw-BrowserHost
+   without BuiltinHost dispatch — sometimes useful for cases where
+   the caller wants every command to go through their own `tools`
+   map. The default is sandboxed."
   [opts]
-  (let [include-stock? (if (and opts (some? (aget opts "includeStock")))
-                         (aget opts "includeStock") true)
-        stock (when include-stock?
-                (into {}
-                      (for [[k v] (host.browser/stock-tools)]
-                        [k v])))
-        tools-js (when opts (aget opts "tools"))
-        user-tools (when tools-js
-                     (into {}
-                           (for [k (js-keys tools-js)]
-                             [k (->clj-tool-fn (aget tools-js k))])))
-        tools (merge stock user-tools)
-        files (or (some-> (and opts (aget opts "files")) js->clj) {})]
-    (host.browser/make :tools tools :files files)))
+  (let [opts            (or opts #js {})
+        sandboxed?      (if (some? (aget opts "sandboxed"))
+                          (aget opts "sandboxed") true)
+        include-stock?  (if (some? (aget opts "includeStock"))
+                          (aget opts "includeStock") false)
+        tools-js        (aget opts "tools")
+        user-tools      (when tools-js
+                          (into {}
+                                (for [k (js-keys tools-js)]
+                                  [k (->clj-tool-fn (aget tools-js k))])))
+        stock           (when include-stock?
+                          (into {} (host.browser/stock-tools)))
+        tools           (merge stock user-tools)
+        files           (or (some-> (aget opts "files") js->clj) {})
+        cwd             (or (aget opts "cwd") "/")]
+    (if sandboxed?
+      (host.builtin/make
+       {:fs (fs.virtual/make files {:cwd cwd})
+        :fallback-host (host.browser/make :tools tools :files {})
+        :builtins posix/standard
+        :fallback-allowlist (set (keys tools))})
+      ;; Legacy raw-BrowserHost path.
+      (host.browser/make :tools tools :files files))))
 
 (defn ^:export virtualFS
   "Construct a VirtualFS from `{path → content}`. Options: { cwd }."
