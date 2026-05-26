@@ -81,6 +81,15 @@
   #?(:clj (Long/parseLong s 16)
      :cljs (js/parseInt s 16)))
 
+(defn parse-long-radix
+  "Parse `s` in the given radix. Portable wrapper around Java's
+   `Long/parseLong(s, radix)` (which `clojure.core/parse-long` does
+   NOT accept) — needed e.g. for `chmod 0755` octal modes."
+  [^String s radix]
+  #?(:clj (Long/parseLong s (int radix))
+     :cljs (let [n (js/parseInt s radix)]
+             (when-not (js/Number.isNaN n) n))))
+
 (defn floor
   "Math/floor — portable."
   [x]
@@ -203,6 +212,18 @@
   [n]
   #?(:clj  (Long/toOctalString (long n))
      :cljs (.toString n 8)))
+
+(defn re-find-any?
+  "True if `re` (a regex compiled via `re-compile`) finds at least
+   one match in `s`."
+  [re ^String s]
+  (some? (re-find-pos re s 0)))
+
+(defn re-pattern-icase
+  "Build a case-insensitive `re-pattern`-style regex by prepending the
+   `(?i)` inline flag. Works on both Java regex and JS regex."
+  [^String pat]
+  (re-pattern (str "(?i)" pat)))
 
 (defn split-by-regex
   "Split `s` everywhere `re` matches, preserving trailing empties (so

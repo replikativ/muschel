@@ -21,7 +21,7 @@
         `re-compile` / `re-quote`.
      3. Convert `java.io.OutputStream` with-open blocks to shims
         (or quarantine behind :clj).
-     4. Convert ~13 `(catch Throwable …)` to
+     4. Convert ~13 `(catch #?(:clj Throwable :cljs :default) …)` to
         `#?(:clj Throwable :cljs :default)`.
      5. Replace `java.util.ArrayList` with `(transient [])`.
      6. Shim `java.util.Calendar`/`Date` in the `date` builtin.
@@ -55,6 +55,7 @@
   (:require [clojure.string :as str]
             [clojure.tools.cli :as cli]
             [muschel.builtins.awk :as awk-impl]
+            [muschel.builtins.awk-compat :as cc]
             [muschel.fs :as fs]
             [muschel.host :as host]))
 
@@ -251,7 +252,7 @@
             files       (if (seq pos) pos ["-"])
             stderr      (volatile! "")
             any-err?    (volatile! false)
-            out         (StringBuilder.)
+            out         (cc/sbuf)
             n           (volatile! 0)
             last-blank? (volatile! false)
             emit-line!
@@ -324,7 +325,7 @@
 (def ^:private head-tail-spec
   [["-n" "--lines N"
     :default 10
-    :parse-fn #(Long/parseLong %)
+    :parse-fn #(parse-long %)
     :validate [#(>= % 0) "must be non-negative"]]])
 
 (defn- finish-lines
@@ -516,23 +517,31 @@
            2)
 
       (:command opts)
-      (let [script (:command opts)
-            host   *host*]
-        (if-not host
-          (err "sh: no host available for nested dispatch" 1)
-          (let [_         (require 'muschel.parse 'muschel.exec 'muschel.env)
-                parse-fn  (resolve 'muschel.parse/parse)
-                run-fn    (resolve 'muschel.exec/run-and-capture)
-                new-env   (resolve 'muschel.env/new-env)
-                e0        (or env (new-env))
-                ast       (parse-fn script)
-                result    (binding [*depth* (inc *depth*)]
-                            (run-fn e0 ast
-                                    (cond-> {:host host}
-                                      *session* (assoc :session *session*))))]
-            {:stdout (or (:stdout result) "")
-             :stderr (or (:stderr result) "")
-             :exit   (or (:exit result) 0)})))
+      #?(:clj
+         (let [script (:command opts)
+               host   *host*]
+           (if-not host
+             (err "sh: no host available for nested dispatch" 1)
+             ;; Dynamic require/resolve breaks an exec↔posix cycle on
+             ;; JVM. CLJS doesn't allow runtime require, so the CLJS
+             ;; branch refuses; once a registry pattern is wired
+             ;; (see posix.cljc docstring step 1) we'll lift this.
+             (let [_         (require 'muschel.parse 'muschel.exec 'muschel.env)
+                   parse-fn  (resolve 'muschel.parse/parse)
+                   run-fn    (resolve 'muschel.exec/run-and-capture)
+                   new-env   (resolve 'muschel.env/new-env)
+                   e0        (or env (new-env))
+                   ast       (parse-fn script)
+                   result    (binding [*depth* (inc *depth*)]
+                               (run-fn e0 ast
+                                       (cond-> {:host host}
+                                         *session* (assoc :session *session*))))]
+               {:stdout (or (:stdout result) "")
+                :stderr (or (:stderr result) "")
+                :exit   (or (:exit result) 0)})))
+         :cljs
+         (err "sh: recursive shell dispatch is not yet supported on CLJS"
+              1))
 
       :else
       (err "sh: only -c SCRIPT mode is supported in muschel builtins" 2))))
@@ -635,10 +644,10 @@
             key-fn (if (:ignore-case opts) str/lower-case identity)
             cmp (if (:numeric-sort opts)
                   (fn [a b]
-                    (let [pa (try (Long/parseLong (str/trim a))
-                                  (catch Exception _ Long/MAX_VALUE))
-                          pb (try (Long/parseLong (str/trim b))
-                                  (catch Exception _ Long/MAX_VALUE))]
+                    (let [pa (try (parse-long (str/trim a))
+                                  (catch Exception _ #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))
+                          pb (try (parse-long (str/trim b))
+                                  (catch Exception _ #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))]
                       (compare pa pb)))
                   (fn [a b] (compare (key-fn a) (key-fn b))))
             sorted (sort cmp lines)
@@ -706,16 +715,15 @@
     :default  []]])
 
 (defn- compile-pattern
-  "Build a java.util.regex.Pattern from a single grep pattern,
-   honouring -F (literal), -i (case-insensitive), and -w (word-bound).
-   Java's regex engine is ERE-ish, which matches -E and what most
-   modern users expect by default."
+  "Build a platform regex from a single grep pattern, honouring
+   -F (literal), -i (case-insensitive), and -w (word-bound). Uses
+   `(?i)` inline flag for case-insensitivity so the same code works
+   on Java regex and JS regex."
   [pattern {:keys [fixed-strings ignore-case word-regexp]}]
-  (let [body  (if fixed-strings (java.util.regex.Pattern/quote pattern) pattern)
+  (let [body  (if fixed-strings (cc/re-quote pattern) pattern)
         body  (if word-regexp (str "\\b(?:" body ")\\b") body)
-        flags (cond-> 0
-                ignore-case (bit-or java.util.regex.Pattern/CASE_INSENSITIVE))]
-    (java.util.regex.Pattern/compile body flags)))
+        body  (if ignore-case  (str "(?i)" body) body)]
+    (cc/re-compile body)))
 
 (defn- collect-patterns
   "Combine -e PATTERN (possibly repeated) with the positional pattern.
@@ -730,10 +738,10 @@
 
 (defn- any-pattern-matches?
   "True if any compiled pattern matches the line."
-  [^java.util.regex.Pattern compiled-or-coll line]
+  [compiled-or-coll line]
   (if (coll? compiled-or-coll)
-    (some #(.find (.matcher ^java.util.regex.Pattern % ^String line)) compiled-or-coll)
-    (.find (.matcher compiled-or-coll ^String line))))
+    (some #(cc/re-find-any? % line) compiled-or-coll)
+    (cc/re-find-any? compiled-or-coll line)))
 
 (defn- walk-files
   "Recursively yield {:path … :type :file} maps under target. Uses the
@@ -861,25 +869,25 @@
 ;; ============================================================================
 
 (defn- glob->re
-  "Translate a POSIX glob (-name) to a Java regex. * → .*, ? → .,
+  "Translate a POSIX glob (-name) to a regex. * → .*, ? → .,
    [abc] passes through. Escapes other regex metacharacters."
   [glob]
-  (let [sb (StringBuilder.)]
+  (let [sb (cc/sbuf)]
     (doseq [c glob]
       (case c
-        \* (.append sb ".*")
-        \? (.append sb ".")
-        \. (.append sb "\\.")
-        \( (.append sb "\\(")
-        \) (.append sb "\\)")
-        \+ (.append sb "\\+")
-        \| (.append sb "\\|")
-        \^ (.append sb "\\^")
-        \$ (.append sb "\\$")
-        \{ (.append sb "\\{")
-        \} (.append sb "\\}")
-        (.append sb c)))
-    (java.util.regex.Pattern/compile (.toString sb))))
+        \* (cc/sappend! sb ".*")
+        \? (cc/sappend! sb ".")
+        \. (cc/sappend! sb "\\.")
+        \( (cc/sappend! sb "\\(")
+        \) (cc/sappend! sb "\\)")
+        \+ (cc/sappend! sb "\\+")
+        \| (cc/sappend! sb "\\|")
+        \^ (cc/sappend! sb "\\^")
+        \$ (cc/sappend! sb "\\$")
+        \{ (cc/sappend! sb "\\{")
+        \} (cc/sappend! sb "\\}")
+        (cc/sappend! sb c)))
+    (cc/re-compile (cc/sbstr sb))))
 
 ;; -- find expression parser -------------------------------------------------
 ;;
@@ -929,10 +937,10 @@
                     [{:kind :pred :pred :type :t v} (+ pos 2) nil]
                     [nil pos "find: -type requires an argument"])
       "-maxdepth" (if-let [v (nxt)]
-                    [{:kind :pred :pred :maxdepth :n (Long/parseLong v)} (+ pos 2) nil]
+                    [{:kind :pred :pred :maxdepth :n (parse-long v)} (+ pos 2) nil]
                     [nil pos "find: -maxdepth requires an argument"])
       "-mindepth" (if-let [v (nxt)]
-                    [{:kind :pred :pred :mindepth :n (Long/parseLong v)} (+ pos 2) nil]
+                    [{:kind :pred :pred :mindepth :n (parse-long v)} (+ pos 2) nil]
                     [nil pos "find: -mindepth requires an argument"])
       "-print"    [{:kind :action :action :print} (inc pos) nil]
       "-exec"     (loop [p (inc pos) collected (transient [])]
@@ -1202,8 +1210,8 @@
                      (if (nil? tree) pr
                          {:kind :and :a tree :b pr})))
             roots     (if (seq paths) paths ["."])
-            stdout-sb (StringBuilder.)
-            stderr-sb (StringBuilder.)
+            stdout-sb (cc/sbuf)
+            stderr-sb (cc/sbuf)
             any-err?  (volatile! false)
             batch-paths (volatile! {})
             entries   (mapcat (fn [r] (find-walk fs-handle r)) roots)]
@@ -1280,7 +1288,7 @@
       POSIX character classes
    - literal chars otherwise"
   [^String s]
-  (let [sb (StringBuilder.)
+  (let [sb (cc/sbuf)
         n  (.length s)]
     (loop [i 0]
       (when (< i n)
@@ -1392,14 +1400,14 @@
                 (fn [p]
                   (cond
                     (re-matches #"\d+" p)
-                    (let [n (Long/parseLong p)] [n n])
+                    (let [n (parse-long p)] [n n])
                     (re-matches #"\d+-\d+" p)
                     (let [[a b] (str/split p #"-")]
-                      [(Long/parseLong a) (Long/parseLong b)])
+                      [(parse-long a) (parse-long b)])
                     (re-matches #"\d+-" p)
-                    [(Long/parseLong (subs p 0 (dec (count p)))) Long/MAX_VALUE]
+                    [(parse-long (subs p 0 (dec (count p)))) #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)]
                     (re-matches #"-\d+" p)
-                    [1 (Long/parseLong (subs p 1))]
+                    [1 (parse-long (subs p 1))]
                     :else
                     (throw (ex-info "bad range" {:part p}))))
                 parts)]
@@ -1429,12 +1437,12 @@
                    (:only-delimited opts)
                    (if-not (str/includes? line delim)
                      nil
-                     (let [parts (str/split line (re-pattern (java.util.regex.Pattern/quote delim)))]
+                     (let [parts (str/split line (re-pattern (cc/re-quote delim)))]
                        (->> parts
                             (keep-indexed (fn [i s] (when (in? (inc i)) s)))
                             (str/join delim))))
                    :else
-                   (let [parts (str/split line (re-pattern (java.util.regex.Pattern/quote delim)))]
+                   (let [parts (str/split line (re-pattern (cc/re-quote delim)))]
                      (->> parts
                           (keep-indexed (fn [i s] (when (in? (inc i)) s)))
                           (str/join delim)))))
@@ -1443,7 +1451,7 @@
           {:stdout (str (str/join "\n" kept) (when (seq kept) "\n"))
            :stderr stderr
            :exit (if err? 1 0)})
-        (catch Throwable t
+        (catch #?(:clj Throwable :cljs :default) t
           (usage-err "cut" (.getMessage t)))))))
 
 ;; ============================================================================
@@ -1576,7 +1584,7 @@
   [a-name b-name hunks]
   (if (empty? hunks)
     ""
-    (let [sb (StringBuilder.)]
+    (let [sb (cc/sbuf)]
       (.append sb (str "--- " a-name "\n+++ " b-name "\n"))
       (doseq [{:keys [a-start a-len b-start b-len lines]} hunks]
         (.append sb (format "@@ -%d,%d +%d,%d @@%n" a-start a-len b-start b-len))
@@ -1628,7 +1636,7 @@
 
 (def ^:private xargs-spec
   [["-0" "--null"]
-   ["-n" "--max-args N" :parse-fn #(Long/parseLong %)]
+   ["-n" "--max-args N" :parse-fn #(parse-long %)]
    ["-I" "--replace R"]
    ["-d" "--delimiter D"]
    ["-r" "--no-run-if-empty"]])
@@ -1643,8 +1651,8 @@
    Empty tokens are dropped."
   [stdin {:keys [null delimiter replace]}]
   (let [raw (cond
-              null      (str/split stdin (re-pattern (java.util.regex.Pattern/quote "\0")))
-              delimiter (str/split stdin (re-pattern (java.util.regex.Pattern/quote delimiter)))
+              null      (str/split stdin (re-pattern (cc/re-quote "\0")))
+              delimiter (str/split stdin (re-pattern (cc/re-quote delimiter)))
               replace   (str/split-lines stdin)
               :else     (str/split stdin #"\s+"))]
     (->> raw (remove str/blank?) vec)))
@@ -1672,8 +1680,8 @@
             base     (vec (rest cmd-argv))
             replace  (:replace opts)
             max-n    (:max-args opts)
-            stdout-sb (StringBuilder.)
-            stderr-sb (StringBuilder.)
+            stdout-sb (cc/sbuf)
+            stderr-sb (cc/sbuf)
             any-err? (volatile! false)
             batches  (cond
                        replace (mapv vector tokens)
@@ -1691,7 +1699,7 @@
                 (let [args (if replace
                              (mapv (fn [a]
                                      (str/replace a
-                                                  (re-pattern (java.util.regex.Pattern/quote replace))
+                                                  (re-pattern (cc/re-quote replace))
                                                   (first batch)))
                                    base)
                              (into base batch))
@@ -2017,8 +2025,8 @@
 (defn- parse-mode-octal
   "Parse `755`, `0755`, `0o755` → integer. Returns nil on malformed."
   [^String s]
-  (try (Long/parseLong (str/replace s #"^0o?" "") 8)
-       (catch Throwable _ nil)))
+  (try (cc/parse-long-radix (str/replace s #"^0o?" "") 8)
+       (catch #?(:clj Throwable :cljs :default) _ nil)))
 
 (defn- apply-symbolic-mode
   "Apply one symbolic mode clause (e.g. `u+x`, `go-w`, `a=r`) to an
@@ -2196,7 +2204,7 @@
                   (.write o (.getBytes ^String stdin "UTF-8")))
                 (do (vswap! stderr str "tee: " f ": cannot open for writing\n")
                     (vreset! any-err? true))))
-            (catch Throwable t
+            (catch #?(:clj Throwable :cljs :default) t
               (vswap! stderr str "tee: " f ": " (.getMessage t) "\n")
               (vreset! any-err? true))))
         {:stdout stdin :stderr @stderr :exit (if @any-err? 1 0)}))))
@@ -2337,14 +2345,14 @@
               (let [last-ch (.charAt spec (dec (count spec)))]
                 (case last-ch
                   (\d \i)
-                  (try (Long/parseLong arg) (catch Throwable _ 0))
+                  (try (parse-long arg) (catch #?(:clj Throwable :cljs :default) _ 0))
                   (\x \X \o)
-                  (try (Long/parseLong arg)
-                       (catch Throwable _
-                         (try (Long/parseLong arg 16)
-                              (catch Throwable _ 0))))
+                  (try (parse-long arg)
+                       (catch #?(:clj Throwable :cljs :default) _
+                         (try (cc/parse-long-radix arg 16)
+                              (catch #?(:clj Throwable :cljs :default) _ 0))))
                   arg)))
-            out (StringBuilder.)]
+            out (cc/sbuf)]
         (cond
           (zero? n)
           ;; No specifiers: emit format once, ignore extra args.
@@ -2362,7 +2370,7 @@
                                       (map-indexed
                                        (fn [i a] (coerce (nth specs i) (str a)))
                                        batch)))
-                  (catch Throwable _
+                  (catch #?(:clj Throwable :cljs :default) _
                     (.append out fmt)))))))
         (ok (.toString out))))))
 
@@ -2403,7 +2411,7 @@
    directive instead of doing global text-replace."
   [^String fmt now cal]
   (let [n (count fmt)
-        out (StringBuilder.)
+        out (cc/sbuf)
         d2 (fn [v] (format "%02d" v))
         d3 (fn [v] (format "%03d" v))
         y  (.get cal java.util.Calendar/YEAR)
@@ -2483,7 +2491,7 @@
       (empty? pos) (usage-err "seq" "missing operand")
       :else
       (try
-        (let [nums (mapv #(Double/parseDouble %) pos)
+        (let [nums (mapv #(parse-double %) pos)
               [start step end] (case (count nums)
                                  1 [1.0 1.0 (first nums)]
                                  2 [(first nums) 1.0 (second nums)]
@@ -2523,7 +2531,7 @@
                                rendered))
                        rendered)]
           (ok (str (str/join sep padded) (when (seq padded) "\n"))))
-        (catch Throwable t
+        (catch #?(:clj Throwable :cljs :default) t
           (usage-err "seq" (str "invalid floating point argument: "
                                 (.getMessage t))))))))
 
@@ -2568,12 +2576,12 @@
           "="   (= a b)
           "=="  (= a b)
           "!="  (not= a b)
-          "-eq" (= (Long/parseLong a) (Long/parseLong b))
-          "-ne" (not= (Long/parseLong a) (Long/parseLong b))
-          "-lt" (< (Long/parseLong a) (Long/parseLong b))
-          "-le" (<= (Long/parseLong a) (Long/parseLong b))
-          "-gt" (> (Long/parseLong a) (Long/parseLong b))
-          "-ge" (>= (Long/parseLong a) (Long/parseLong b))
+          "-eq" (= (parse-long a) (parse-long b))
+          "-ne" (not= (parse-long a) (parse-long b))
+          "-lt" (< (parse-long a) (parse-long b))
+          "-le" (<= (parse-long a) (parse-long b))
+          "-gt" (> (parse-long a) (parse-long b))
+          "-ge" (>= (parse-long a) (parse-long b))
           "-a"  (and (test-eval [a] fs) (test-eval [b] fs))
           "-o"  (or (test-eval [a] fs) (test-eval [b] fs))
           (throw (ex-info (str "test: unknown binary op: " op) {}))))
@@ -2602,7 +2610,7 @@
       (if (test-eval args fs)
         {:stdout "" :stderr "" :exit 0}
         {:stdout "" :stderr "" :exit 1})
-      (catch Throwable t
+      (catch #?(:clj Throwable :cljs :default) t
         (usage-err (or (first argv) "test") (.getMessage t))))))
 
 ;; ============================================================================
@@ -2617,7 +2625,7 @@
   (cond
     (re-find #"^(\d+)" s)
     (let [[_ n] (re-find #"^(\d+)" s)]
-      [{:type :line :n (Long/parseLong n)} (subs s (count n))])
+      [{:type :line :n (parse-long n)} (subs s (count n))])
     (str/starts-with? s "$")
     [{:type :last} (subs s 1)]
     (str/starts-with? s "/")
@@ -2653,7 +2661,7 @@
            \s
            (let [sep (.charAt ^String rest-s 1)
                  ;; Split on the separator (which is char-2). e.g. `s/A/B/g`
-                 parts (str/split (subs rest-s 2) (re-pattern (java.util.regex.Pattern/quote (str sep))) 3)]
+                 parts (str/split (subs rest-s 2) (re-pattern (cc/re-quote (str sep))) 3)]
              {:addr addr :op :s
               :pat   (first parts)
               :repl  (second parts)
@@ -2712,28 +2720,24 @@
         case-insensitive? (str/includes? flags "i")
         global?           (str/includes? flags "g")
         ;; `s/PAT/REPL/N` (N a digit) replaces only the Nth match.
-        ;; Recognise the first digit run as the target index.
         nth-target (when-let [m (re-find #"\d+" flags)]
-                     (Long/parseLong m))
-        pat-flags (cond-> 0
-                    case-insensitive? (bit-or java.util.regex.Pattern/CASE_INSENSITIVE))
-        re (java.util.regex.Pattern/compile pat pat-flags)
-        m  (.matcher re ^String line)]
+                     #?(:clj (parse-long m) :cljs (js/parseInt m 10)))
+        ;; Case-insensitivity via `(?i)` inline flag (cross-platform).
+        body (if case-insensitive? (str "(?i)" pat) pat)
+        re   (cc/re-compile body)]
     (cond
       nth-target
-      (let [sb  (StringBuffer.)
-            cnt (volatile! 0)]
-        (loop []
-          (when (.find m)
-            (vswap! cnt inc)
-            ;; `$0` re-emits the matched text unchanged.
-            (.appendReplacement m sb (if (= @cnt nth-target) repl "$0"))
-            (recur)))
-        (.appendTail m sb)
-        (.toString sb))
+      ;; Nth-only substitution: walk matches, replace the nth.
+      (let [[out _] (cc/re-replace re line
+                                   (let [cnt (volatile! 0)]
+                                     (fn [matched]
+                                       (let [n (vswap! cnt inc)]
+                                         (if (= n nth-target) repl matched))))
+                                   true)]
+        out)
 
-      global?  (.replaceAll m repl)
-      :else    (.replaceFirst m repl))))
+      global?  (first (cc/re-replace re line (fn [_] repl) true))
+      :else    (first (cc/re-replace re line (fn [_] repl) false)))))
 
 (defn sed
   "POSIX sed, subset:
@@ -2766,7 +2770,7 @@
             (fn [^String content]
               (let [lines (str/split-lines content)
                     total (count lines)
-                    out (StringBuilder.)
+                    out (cc/sbuf)
                     ;; Per-command range state for pattern ranges
                     ;; (/a/,/b/). Keyed by cmd-idx.
                     range-state (atom {})]
@@ -2820,7 +2824,7 @@
     (= " " fs-pat)
     (vec (str/split (str/trim line) #"\s+"))
     :else
-    (vec (str/split line (re-pattern (java.util.regex.Pattern/quote fs-pat))))))
+    (vec (str/split line (re-pattern (cc/re-quote fs-pat))))))
 
 (defn- awk-field [fields ^long n]
   (cond
@@ -2842,15 +2846,15 @@
             (mapv (fn [a]
                     (cond
                       (re-matches #"\$\d+" a)
-                      (awk-field fields (Long/parseLong (subs a 1)))
+                      (awk-field fields (parse-long (subs a 1)))
                       (= "NR" a) (str nr)
                       (= "NF" a) (str nf)
                       (re-matches #"\".*\"" a) (subs a 1 (dec (count a)))
                       (re-matches #"\d+" a) a
                       :else a))
                   args)]
-        (.append ^StringBuilder out ^String (str/join " " tokens))
-        (.append ^StringBuilder out "\n")))))
+        (cc/sappend! out (str/join " " tokens))
+        (cc/sappend! out "\n")))))
 
 (defn- awk-parse-program [^String prog]
   "Split program into pattern/action rules. Rule shape:
@@ -2891,10 +2895,10 @@
                 (if (str/starts-with? rest-s "{")
                   (let [close (.indexOf rest-s "}")]
                     (recur (subs rest-s (inc close))
-                           (conj acc {:pattern {:nr-eq (Long/parseLong n)}
+                           (conj acc {:pattern {:nr-eq (parse-long n)}
                                       :action (subs rest-s 1 close)})))
                   (recur rest-s
-                         (conj acc {:pattern {:nr-eq (Long/parseLong n)}
+                         (conj acc {:pattern {:nr-eq (parse-long n)}
                                     :action "print"}))))
 
               :else
@@ -2974,7 +2978,7 @@
               {:stdout (:stdout result)
                :stderr ""
                :exit   (:exit result)})
-            (catch Throwable t
+            (catch #?(:clj Throwable :cljs :default) t
               ;; Let budget interrupts propagate up to run-and-capture.
               (when (and (instance? clojure.lang.ExceptionInfo t)
                          (:muschel/budget (ex-data t)))
@@ -3010,7 +3014,7 @@
   "Split a jq filter expression on `|` at top level (not inside `[...]`
    or `(...)`). Returns a vector of substring filters."
   [^String s]
-  (let [out (StringBuilder.)
+  (let [out (cc/sbuf)
         result (transient [])
         n (count s)
         depth (volatile! 0)]
@@ -3046,15 +3050,15 @@
       :else           nil)
 
     (re-matches #"\[\d+\]" step)
-    (let [n (Long/parseLong (subs step 1 (dec (count step))))]
+    (let [n (parse-long (subs step 1 (dec (count step))))]
       (when (sequential? v) (nth v n nil)))
 
     ;; Full slice `.[a:b]` plus open-ended `.[a:]` / `.[:b]`.
     (re-matches #"\[\d*:\d*\]" step)
     (let [[_ a b] (re-find #"\[(\d*):(\d*)\]" step)
           n  (when (sequential? v) (count v))
-          aa (if (str/blank? a) 0 (Long/parseLong a))
-          bb (if (str/blank? b) (or n 0) (Long/parseLong b))]
+          aa (if (str/blank? a) 0 (parse-long a))
+          bb (if (str/blank? b) (or n 0) (parse-long b))]
       (when n
         (subvec (vec v) (min aa n) (min bb n))))
 
@@ -3066,7 +3070,7 @@
 (defn- jq-split-steps
   "Break `.foo.bar[0].baz[]` into [\".foo\" \".bar\" \"[0]\" \".baz\" \"[]\"]."
   [^String s]
-  (loop [i 0 acc (transient []) buf (StringBuilder.)]
+  (loop [i 0 acc (transient []) buf (cc/sbuf)]
     (cond
       (>= i (count s))
       (let [tail (.toString buf)]
@@ -3196,13 +3200,13 @@
                          (loop [acc []]
                            (let [v (read-fn pbr :eof-error? false :eof-value ::eof)]
                              (if (= ::eof v) acc (recur (conj acc v))))))
-                       (catch Throwable t
+                       (catch #?(:clj Throwable :cljs :default) t
                          (throw (ex-info (str "jq: parse error: " (.getMessage t)) {})))))
             parsed (if (:slurp opts) [parsed] parsed)
             fmt-opts {:compact (:compact-output opts)
                       :raw     (:raw-output opts)}
             outs (mapcat #(jq-run-pipeline % expr) parsed)
-            sb (StringBuilder.)]
+            sb (cc/sbuf)]
         (doseq [o outs]
           (.append sb ^String (jq-format o fmt-opts))
           (.append sb "\n"))
@@ -3289,7 +3293,7 @@
             resp    (try
                       (.send client req
                              (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
-                      (catch Throwable t
+                      (catch #?(:clj Throwable :cljs :default) t
                         (vary-meta {} assoc ::err (.getMessage t))))]
         (if-let [errmsg (::err (meta resp))]
           (err (str "curl: (6) " errmsg) 6)
@@ -3344,7 +3348,7 @@
   (try
     (let [[_ num-s unit] (re-matches #"(?i)^\s*([0-9.]+)\s*(ms|s|m|h|d)?\s*$" s)]
       (when num-s
-        (let [n (Double/parseDouble num-s)
+        (let [n (parse-double num-s)
               mul (case (str/lower-case (or unit "s"))
                     "ms" 1
                     "s"  1000
@@ -3352,7 +3356,7 @@
                     "h"  3600000
                     "d"  86400000)]
           (long (* n mul)))))
-    (catch Throwable _ nil)))
+    (catch #?(:clj Throwable :cljs :default) _ nil)))
 
 (defn sleep
   "POSIX sleep. Accepts integer or decimal seconds; GNU-style suffix
