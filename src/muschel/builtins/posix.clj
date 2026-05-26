@@ -2535,6 +2535,146 @@
         (ok (.toString out))))))
 
 ;; ============================================================================
+;; Network: curl
+;;
+;; A pragmatic curl built on java.net.http (JDK 11+). Output goes
+;; through the FS handle when -o FILE is requested, so writes stay
+;; contained inside the muschel root — even though the network call
+;; itself reaches the open internet.
+;; ============================================================================
+
+(defn- curl-method
+  "Pick the HTTP method from flags. Defaults to GET; -X overrides;
+   -d / --data implies POST unless -X was given."
+  [{:keys [request data]}]
+  (cond
+    request                    request
+    data                       "POST"
+    :else                      "GET"))
+
+(defn- curl-build-request
+  ^java.net.http.HttpRequest
+  [^String url {:keys [request data headers user] :as opts}]
+  (let [b (.. (java.net.http.HttpRequest/newBuilder)
+              (uri (java.net.URI/create url)))
+        method (curl-method opts)
+        body-publisher (if data
+                         (java.net.http.HttpRequest$BodyPublishers/ofString
+                          ^String data)
+                         (java.net.http.HttpRequest$BodyPublishers/noBody))]
+    (.method b ^String method body-publisher)
+    (doseq [h (or headers [])]
+      (let [idx (.indexOf ^String h ":")]
+        (when (pos? idx)
+          (.header b (str/trim (subs h 0 idx)) (str/trim (subs h (inc idx)))))))
+    (when user
+      (let [enc (.encodeToString (java.util.Base64/getEncoder)
+                                 (.getBytes ^String user "UTF-8"))]
+        (.header b "Authorization" (str "Basic " enc))))
+    (.build b)))
+
+(defn curl
+  "POSIX-ish curl. Subset:
+     -X METHOD                custom HTTP method
+     -d DATA / --data DATA    request body (implies POST)
+     -H 'Header: value'       custom header (repeatable)
+     -o FILE                  write body to FILE (via FS handle)
+     -O                       use the URL's basename as FILE
+     -L / --location          follow redirects (on by default)
+     -s / --silent            no progress (always on; we don't print one)
+     -i / --include           include status + response headers
+     -f / --fail              non-zero exit on HTTP error status
+     -u USER:PASS             basic auth
+
+   The URL is the last positional argument. Output goes to stdout
+   unless -o / -O is given. Network access is the agent's
+   responsibility — curl reaches the public internet."
+  [argv fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-X" "--request METHOD"]
+                         ["-d" "--data DATA"]
+                         ["-H" "--header H"
+                          :assoc-fn (fn [m k v] (update m k (fnil conj []) v))
+                          :default []]
+                         ["-o" "--output FILE"]
+                         ["-O" "--remote-name"]
+                         ["-L" "--location"]
+                         ["-s" "--silent"]
+                         ["-i" "--include"]
+                         ["-f" "--fail"]
+                         ["-u" "--user USER:PASS"]])]
+    (cond
+      err (usage-err "curl" err)
+      (empty? pos) (usage-err "curl" "no URL specified")
+      :else
+      (let [url     (last pos)
+            client  (.. (java.net.http.HttpClient/newBuilder)
+                        (followRedirects java.net.http.HttpClient$Redirect/NORMAL)
+                        build)
+            req     (curl-build-request url opts)
+            resp    (try
+                      (.send client req
+                             (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
+                      (catch Throwable t
+                        (vary-meta {} assoc ::err (.getMessage t))))]
+        (if-let [errmsg (::err (meta resp))]
+          (err (str "curl: (6) " errmsg) 6)
+          (let [status (.statusCode ^java.net.http.HttpResponse resp)
+                body   ^bytes (.body ^java.net.http.HttpResponse resp)
+                hdr-out (when (:include opts)
+                          (let [hs (.headers ^java.net.http.HttpResponse resp)]
+                            (str "HTTP/" status "\n"
+                                 (str/join
+                                  ""
+                                  (for [[k vs] (.map hs)
+                                        v vs]
+                                    (str k ": " v "\n")))
+                                 "\n")))
+                target (or (:output opts)
+                           (when (:remote-name opts)
+                             (last (str/split url #"/"))))
+                fail?  (and (:fail opts) (>= status 400))]
+            (cond
+              fail?
+              (err (str "curl: (22) The requested URL returned error: " status) 22)
+
+              target
+              (let [out (fs/open-sink fs target false)]
+                (if (nil? out)
+                  (err (str "curl: cannot write to '" target "'") 23)
+                  (with-open [^java.io.OutputStream o out]
+                    (.write o body)
+                    {:stdout (or hdr-out "")
+                     :stderr ""
+                     :exit 0})))
+
+              :else
+              {:stdout (str (or hdr-out "")
+                            (String. body "UTF-8"))
+               :stderr ""
+               :exit 0})))))))
+
+;; ============================================================================
+;; sleep
+;; ============================================================================
+
+(defn sleep
+  "POSIX sleep. Accepts an integer or decimal number of seconds.
+   Suffix-style durations (10m, 1h) are not implemented."
+  [argv _fs _env]
+  (let [arg (second argv)]
+    (cond
+      (nil? arg) (usage-err "sleep" "missing operand")
+      :else
+      (try
+        (let [secs (Double/parseDouble arg)
+              ms   (long (* secs 1000))]
+          (Thread/sleep (max 0 ms))
+          {:stdout "" :stderr "" :exit 0})
+        (catch Throwable _
+          (usage-err "sleep" (str "invalid time interval: " arg)))))))
+
+;; ============================================================================
 ;; Registry — the canonical builtin map
 ;; ============================================================================
 
@@ -2587,4 +2727,7 @@
           "seq"      seq-fn
           "basename" basename
           "dirname"  dirname
-          "realpath" realpath}))
+          "realpath" realpath
+          ;; network + timing
+          "curl"     curl
+          "sleep"    sleep}))

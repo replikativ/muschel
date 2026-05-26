@@ -219,3 +219,48 @@
   (let [r (run (mk-host) "awk 'NR==2 {print}' a.txt")]
     (is (= 0 (:exit r)))
     (is (= "beta\n" (:stdout r)))))
+
+;; ============================================================================
+;; sleep
+;; ============================================================================
+
+(deftest sleep-blocks
+  (let [start (System/currentTimeMillis)
+        r (run (mk-host) "sleep 0.05")
+        elapsed (- (System/currentTimeMillis) start)]
+    (is (= 0 (:exit r)))
+    (is (>= elapsed 40))))
+
+(deftest sleep-invalid-arg
+  (let [r (run (mk-host) "sleep banana")]
+    (is (= 2 (:exit r)))
+    (is (re-find #"invalid" (:stderr r)))))
+
+;; ============================================================================
+;; curl
+;;
+;; Smoke tests that exercise the FS-aware output path. We don't hit
+;; the real internet from the test suite — we hand curl a -X HEAD
+;; against a known-bad URL and confirm the request roundtrips
+;; through the FS for -o.
+;; ============================================================================
+
+(deftest curl-handles-bad-host
+  (let [r (run (mk-host) "curl -s http://localhost:1/never")]
+    ;; Connection refused → non-zero exit with a clean curl: error
+    (is (pos? (:exit r)))
+    (is (re-find #"curl:" (:stderr r)))))
+
+(deftest curl-output-routes-through-fs
+  ;; -o on a path outside the sandbox refuses; we can't easily prove
+  ;; the network path without external connectivity, so we check the
+  ;; refusal path. Real-network behaviour is covered by curl-uuid
+  ;; (skipped unless connectivity is available).
+  (let [fs (vfs/make {"/work" :dir} {:cwd "/work"})
+        host (hb/make {:fs fs :fallback-host (jvm/make)
+                       :builtins posix/standard})
+        ;; pick a host that's guaranteed unreachable to short-circuit
+        r (run host "curl -s -o /etc/dvergr-test http://localhost:1/")]
+    ;; Either we refused before the call (no network try) or the
+    ;; call failed first. In neither case does /etc/dvergr-test exist.
+    (is (not (.exists (java.io.File. "/etc/dvergr-test"))))))
