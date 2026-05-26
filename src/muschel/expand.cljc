@@ -1091,23 +1091,30 @@
    bash quirk: leading `./` is preserved in the result (we strip it
    before globbing and re-attach to each match)."
   [env word]
-  #?(:clj
-     (let [has-glob? (re-find #"(?<!\\)[*?\[]" word)]
-       (if (or (not has-glob?) (env/option env :noglob))
-         [word]
-         (let [dot-prefix? (str/starts-with? word "./")
-               pat (cond-> word dot-prefix? (subs 2))
-               muschel-fs  (:fs env)
-               base (if muschel-fs
-                      (sandboxed-glob muschel-fs (:cwd env) pat)
+  (let [has-glob? (re-find #"(?<!\\)[*?\[]" word)]
+    (if (or (not has-glob?) (env/option env :noglob))
+      [word]
+      (let [dot-prefix? (str/starts-with? word "./")
+            pat (cond-> word dot-prefix? (subs 2))
+            muschel-fs  (:fs env)
+            base (cond
+                   muschel-fs
+                   (sandboxed-glob muschel-fs (:cwd env) pat)
+
+                   :else
+                   #?(:clj
                       (let [matches (try (fs/glob (:cwd env) pat)
-                                         (catch #?(:clj Throwable :cljs :default) _ nil))]
-                        (mapv (fn [p] (str (fs/relativize (:cwd env) p))) matches)))
-               strs (mapv #(if dot-prefix? (str "./" %) %) base)]
-           (if (seq strs)
-             (sort strs)
-             [word]))))
-     :cljs [word]))
+                                         (catch Throwable _ nil))]
+                        (mapv (fn [p] (str (fs/relativize (:cwd env) p))) matches))
+                      :cljs
+                      ;; CLJS without a sandboxed fs: refuse to glob the
+                      ;; real disk. Caller passed in a permissive host
+                      ;; — let them deal with the literal word.
+                      nil))
+            strs (mapv #(if dot-prefix? (str "./" %) %) (or base []))]
+        (if (seq strs)
+          (sort strs)
+          [word])))))
 
 ;; ============================================================================
 ;; Public API

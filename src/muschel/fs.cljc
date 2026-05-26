@@ -174,16 +174,18 @@
          true)
        :cljs
        (cond
+         ;; Canonical shape: a Clojure map with an :acc atom (matches
+         ;; muschel.fs.virtual and muschel.host.browser sinks).
+         (and (map? sink) (instance? cljs.core/Atom (:acc sink)))
+         (do (if append?
+               (swap! (:acc sink) str content)
+               (reset! (:acc sink) content))
+             true)
+
          (instance? cljs.core/Atom sink)
          (do (if append?
                (swap! sink str content)
                (reset! sink content))
-             true)
-
-         (and (some? sink) (some? (aget sink "acc")))
-         (do (if append?
-               (swap! (aget sink "acc") str content)
-               (reset! (aget sink "acc") content))
              true)
 
          :else true))))

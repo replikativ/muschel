@@ -38,8 +38,16 @@
 (defn- ->sink [] {::buf :sink :acc (atom "")})
 (defn- ->source [s] {::buf :source :remaining (atom (str s))})
 
-(defn- sink? [x] (and (map? x) (= :sink (::buf x))))
-(defn- source? [x] (and (map? x) (= :source (::buf x))))
+;; A sink/source is recognised structurally: any map carrying an
+;; `:acc` (writable) or `:remaining` (readable) atom is acceptable.
+;; This lets muschel.fs.virtual hand us back a sink it constructed
+;; without the two namespaces having to share a keyword namespace
+;; (or, worse, a circular require). The original `::buf` tag is
+;; still set on host-internal buffers — we accept either shape.
+(defn- sink?   [x] (and (map? x) (some? (:acc x))
+                        (instance? cljs.core/Atom (:acc x))))
+(defn- source? [x] (and (map? x) (some? (:remaining x))
+                        (instance? cljs.core/Atom (:remaining x))))
 
 ;; ============================================================================
 ;; Virtual filesystem

@@ -12,12 +12,13 @@
    - `ls /etc/*` used to glob the real filesystem via
      babashka.fs/glob.
    - `cat ../etc/passwd` used to traverse out of the virtual root."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [muschel.builtins.posix :as posix]
             [muschel.core :as m]
             [muschel.fs.virtual :as vfs]
             [muschel.host.builtin :as hb]
-            [muschel.host.jvm :as jvm]))
+            [muschel.test-helpers :as th]))
 
 (defn- mk-host
   ([] (mk-host {}))
@@ -26,7 +27,7 @@
                        {:cwd "/work"})
           allowlist #{}}}]
    (hb/make {:fs fs
-             :fallback-host (jvm/make)
+             :fallback-host (th/fallback-host)
              :builtins posix/standard-read-only
              :fallback-allowlist allowlist})))
 
@@ -46,20 +47,23 @@
   (let [r (run (mk-host) "wc -l < ../../etc/passwd")]
     (is (= 1 (:exit r)))))
 
-(deftest redirect-output-cannot-write-real-disk
-  ;; Even if the sandbox accepted the write (it would route to the
-  ;; vfs), no file lands on the real FS.
-  (let [marker (str "/tmp/muschel-sandbox-test-marker-"
-                    (System/currentTimeMillis))]
-    (try
-      (let [r (run (mk-host) (str "echo PWNED > " marker))]
-        ;; Either we refused (preferred) or we accepted by writing into
-        ;; the vfs — either way, no real file.
-        (is (not (.exists (java.io.File. marker)))
-            "real /tmp file must not be created"))
-      (finally
-        ;; Defensive cleanup
-        (try (.delete (java.io.File. marker)) (catch Throwable _))))))
+#?(:clj
+   (deftest redirect-output-cannot-write-real-disk
+     ;; JVM-only because it asserts AGAINST real-disk side effects via
+     ;; java.io.File. The cross-platform equivalent — that the redirect
+     ;; doesn't leak — is covered by `legit-redirect-output-into-vfs`
+     ;; below (which proves the write went to the vfs, not the host).
+     (let [marker (str "/tmp/muschel-sandbox-test-marker-"
+                       (System/currentTimeMillis))]
+       (try
+         (let [_r (run (mk-host) (str "echo PWNED > " marker))]
+           ;; Either we refused (preferred) or we accepted by writing into
+           ;; the vfs — either way, no real file.
+           (is (not (.exists (java.io.File. marker)))
+               "real /tmp file must not be created"))
+         (finally
+           ;; Defensive cleanup
+           (try (.delete (java.io.File. marker)) (catch Throwable _)))))))
 
 (deftest builtin-cat-cannot-read-outside-root
   (let [r (run (mk-host) "cat /etc/passwd")]
@@ -87,9 +91,9 @@
                      {:cwd "/work"})
         r  (run (mk-host {:fs fs}) "ls *.txt")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "foo.txt"))
-    (is (.contains ^String (:stdout r) "bar.txt"))
-    (is (not (.contains ^String (:stdout r) "baz.md")))
+    (is (str/includes? (:stdout r) "foo.txt"))
+    (is (str/includes? (:stdout r) "bar.txt"))
+    (is (not (str/includes? (:stdout r) "baz.md")))
     ;; And no real-disk file made it in:
     (is (not (re-find #"deps\.edn|LICENSE" (:stdout r))))))
 
@@ -113,7 +117,7 @@
         r2 (run host "cat new.txt")]
     (is (= 0 (:exit r1)))
     (is (= 0 (:exit r2)))
-    (is (.contains ^String (:stdout r2) "hi"))))
+    (is (str/includes? (:stdout r2) "hi"))))
 
 (deftest legit-redirect-append-into-vfs
   (let [host (mk-host)]
@@ -121,5 +125,5 @@
     (run host "echo second >> log.txt")
     (let [r (run host "cat log.txt")]
       (is (= 0 (:exit r)))
-      (is (.contains ^String (:stdout r) "first"))
-      (is (.contains ^String (:stdout r) "second")))))
+      (is (str/includes? (:stdout r) "first"))
+      (is (str/includes? (:stdout r) "second")))))

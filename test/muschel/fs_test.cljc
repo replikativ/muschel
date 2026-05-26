@@ -114,10 +114,6 @@
   ;; Writes to one fork must not affect the other.
   (let [fs1 (vfs/make {"/x" "v1"} {:cwd "/"})
         fs2 (vfs/restore (vfs/snapshot fs1))]
-    (let [out (fs/open-sink fs2 "/x" false)]
-      #?(:clj  (with-open [^java.io.OutputStream o out]
-                 (.write o (.getBytes "v2" "UTF-8")))
-         :cljs (do ((.-write out) "v2")
-                   ((.-close out)))))
+    (fs/write-string! fs2 "/x" "v2" false)
     (is (= "v1" (fs/read-file fs1 "/x")) "parent fork unchanged")
     (is (= "v2" (fs/read-file fs2 "/x")) "child fork has the write")))
