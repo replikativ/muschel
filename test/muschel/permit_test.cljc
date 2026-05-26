@@ -1,10 +1,13 @@
 (ns muschel.permit-test
+  "Permit-layer tests: parse-time gating, runtime hook, rule
+   validation. Cross-platform — uses run-and-capture with a sandboxed
+   BuiltinHost instead of raw `exec/run` + JVM streams."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [muschel.env :as env]
-            [muschel.exec :as exec]
+            [muschel.core :as m]
             [muschel.parse :as parse]
-            [muschel.permit :as permit]))
+            [muschel.permit :as permit]
+            [muschel.test-helpers :as th]))
 
 (defn- check
   ([src] (check src {}))
@@ -12,6 +15,19 @@
    (permit/check {:rulesets (or rulesets [permit/default-rules])
                   :ast (parse/parse src)
                   :prompter (or prompter permit/deny-all-prompter)})))
+
+(defn- run-perm
+  "Execute `src` against a sandboxed builtin host with the given
+   permit config. Returns {:exit :stdout :stderr :permit :env}."
+  ([src permit-cfg] (run-perm src permit-cfg {}))
+  ([src permit-cfg extra-opts]
+   (m/run-and-capture
+    (m/new-env) src
+    (merge {:host (th/mk-host)
+            :permit (merge {:rulesets [permit/default-rules]
+                            :prompter permit/deny-all-prompter}
+                           permit-cfg)}
+           extra-opts))))
 
 ;; ============================================================================
 ;; Defaults: auto-allow
@@ -230,27 +246,20 @@
 ;; ============================================================================
 
 (deftest exec-blocks-on-deny
-  (let [r (exec/run (env/new-env) "rm -rf /tmp/test-no-real-deletion"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}})]
+  (let [r (run-perm "rm -rf /tmp/test-no-real-deletion" {})]
     (is (= 126 (:exit r)) "exec returns 126 (permission denied)")
     (is (= :deny (-> r :permit :decision)))))
 
 (deftest exec-runs-on-allow
-  (let [r (exec/run (env/new-env) "echo hi"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "echo hi" {})]
     (is (zero? (:exit r)))
     (is (= :allow (-> r :permit :decision)))))
 
 (deftest exec-ask-with-prompter-allow
-  (let [r (exec/run (env/new-env) "make help"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter (fn [_] {:result :allow-once})}
-                     :out (java.io.ByteArrayOutputStream.)})]
-    ;; make help would fail (no Makefile) but permit check passes,
-    ;; so the exec path runs (with non-zero exit from make itself)
+  (let [r (run-perm "make help" {:prompter (fn [_] {:result :allow-once})})]
+    ;; `make` isn't a builtin and isn't allowlisted on the sandboxed
+    ;; host — the BuiltinHost refuses it after the permit gate, but
+    ;; permit's own decision is what we're asserting here.
     (is (= :allow (-> r :permit :decision)))))
 
 ;; ============================================================================
@@ -280,52 +289,29 @@
 ;; the runtime path catches what static parse-time check can't.
 
 (deftest runtime-hook-blocks-inner-cmd-subst-rm
-  (let [r (exec/run (env/new-env) "echo \"$(rm -rf /)\""
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out (java.io.ByteArrayOutputStream.)
-                     :err (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "echo \"$(rm -rf /)\"" {})]
     ;; The outer echo runs (exit 0), but the inner rm was blocked.
-    (is (zero? (:exit r)) "outer echo succeeds")
-    ;; The captured stderr (via opts :err that wasn't visible here) would
-    ;; have shown the permit denial. We verify behavior by checking the
-    ;; env's :last-exit reflects what bash would do.
-    ))
+    (is (zero? (:exit r)) "outer echo succeeds")))
 
 (deftest runtime-hook-blocks-inner-sudo
-  (let [err-buf (java.io.ByteArrayOutputStream.)
-        out-buf (java.io.ByteArrayOutputStream.)
-        _ (exec/run (env/new-env) "echo $(sudo whoami)"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out out-buf
-                     :err err-buf})
-        err (.toString err-buf "UTF-8")]
-    (is (str/includes? err "runtime permit denied `sudo`"))))
+  (let [r (run-perm "echo $(sudo whoami)" {})]
+    (is (str/includes? (:stderr r) "runtime permit denied `sudo`"))))
 
 (deftest runtime-hook-blocks-dynamic-command
   ;; cmd=rm; $cmd … — the literal cmd-name `rm` only resolves at runtime.
   ;; Parse-time permit can't see it (the first arg is a var-ref); the
   ;; runtime hook catches it at the spawn site.
-  (let [r (exec/run (env/new-env) "cmd=ls; $cmd /nonexistent-thing-12345"
-                    {:permit {:rulesets
-                              [permit/default-rules
-                               ;; explicit deny on ls to demonstrate hook
-                               [{:tool :bash
-                                 :pattern {:kind :cmd-name :name "ls"}
-                                 :action :deny
-                                 :reason "test override"}]]
-                              :prompter permit/deny-all-prompter}
-                     :out (java.io.ByteArrayOutputStream.)
-                     :err (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "cmd=ls; $cmd /nonexistent-thing-12345"
+                    {:rulesets
+                     [permit/default-rules
+                      ;; explicit deny on ls to demonstrate hook
+                      [{:tool :bash
+                        :pattern {:kind :cmd-name :name "ls"}
+                        :action :deny
+                        :reason "test override"}]]})]
     (is (= 126 (:exit r)) "runtime hook denied the dynamically-resolved ls")))
 
 (deftest runtime-hook-allows-inner-when-rules-allow
-  (let [out-buf (java.io.ByteArrayOutputStream.)
-        r (exec/run (env/new-env) "echo \"date is: $(date +%Y)\""
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out out-buf
-                     :err (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "echo \"date is: $(date +%Y)\"" {})]
     (is (zero? (:exit r)))
-    (is (str/includes? (.toString out-buf "UTF-8") "date is: 20"))))
+    (is (str/includes? (:stdout r) "date is: 20"))))
