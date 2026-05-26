@@ -2133,11 +2133,11 @@
   "Symbolic link via `-s` only. Hard links aren't meaningful inside
    the sandbox; refusing them keeps the surface tight."
   [argv fs _env]
-  (let [{:keys [opts pos err]}
+  (let [{:keys [opts pos] parse-err :err}
         (cli-parse argv [["-s" "--symbolic"]
                          ["-f" "--force"]])]
     (cond
-      err                       (usage-err "ln" err)
+      parse-err                 (usage-err "ln" parse-err)
       (not (:symbolic opts))    (usage-err "ln" "only -s (symbolic) is supported")
       (not= 2 (count pos))      (usage-err "ln" "exactly TARGET LINK_NAME required")
       :else
@@ -2343,14 +2343,30 @@
 ;; ============================================================================
 
 (defn env-fn
-  "Print environment as `KEY=VAL` lines. v1 doesn't implement the
-   `env VAR=val CMD` form (would need a process spawn through host)."
-  [_argv _fs env]
-  (let [vars (or (:vars env) {})
-        out  (str/join "\n"
-                       (for [[k v] (sort-by key vars)]
-                         (str k "=" v)))]
-    (ok (if (seq out) (str out "\n") ""))))
+  "Print environment as `KEY=VAL` lines. Honours `-i` (clear env
+   before printing) and `-u VAR` (unset VAR). v1 doesn't implement
+   the `env VAR=val CMD` form (would need a process spawn through
+   host)."
+  [argv _fs env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-i" "--ignore-environment"]
+                         ["-u" "--unset NAME"
+                          :assoc-fn (fn [m k v] (update m k (fnil conj #{}) v))
+                          :default #{}]])
+        ignore? (:ignore-environment opts)
+        unsets  (or (:unset opts) #{})]
+    (cond
+      err (usage-err "env" err)
+      ;; Refuse `env VAR=val CMD` form — pos args after flags imply
+      ;; a command to execute, which we'd need to spawn through host.
+      (seq pos) (usage-err "env" "running commands not supported (use the command directly)")
+      :else
+      (let [src-vars (if ignore? {} (or (:vars env) {}))
+            vars    (apply dissoc src-vars unsets)
+            out     (str/join "\n"
+                              (for [[k v] (sort-by key vars)]
+                                (str k "=" v)))]
+        (ok (if (seq out) (str out "\n") ""))))))
 
 (defn- date-translate
   "Walk the format string once, emitting each substitution. This is
@@ -2426,8 +2442,10 @@
      seq FIRST STEP LAST
 
    Numbers may be integer or decimal (`seq 0.5 0.5 2.0`). -w pads
-   to equal width with leading zeros."
-  [argv _fs _env]
+   to equal width with leading zeros. Calls the env's `:interrupt-fn`
+   (if any) every 256 iterations so a runaway `seq 1 1000000000` is
+   bounded by the caller's budget instead of OOMing the host."
+  [argv _fs env]
   (let [{:keys [opts pos err]}
         (cli-parse argv [["-s" "--separator S" :default "\n"]
                          ["-w" "--equal-width"]
@@ -2445,14 +2463,18 @@
                                  (throw (ex-info "too many operands" {})))
               sep (:separator opts)
               positive-step? (pos? step)
+              ifn (:interrupt-fn env)
               ;; Use a small epsilon to defend against float drift.
               eps 1e-9
-              values (loop [v start acc []]
+              values (loop [v start acc (transient []) i 0]
                        (cond
-                         (zero? step) acc
-                         (and positive-step? (> v (+ end eps))) acc
-                         (and (not positive-step?) (< v (- end eps))) acc
-                         :else (recur (+ v step) (conj acc v))))
+                         (zero? step) (persistent! acc)
+                         (and positive-step? (> v (+ end eps))) (persistent! acc)
+                         (and (not positive-step?) (< v (- end eps))) (persistent! acc)
+                         :else
+                         (do
+                           (when (and ifn (zero? (bit-and i 255))) (ifn))
+                           (recur (+ v step) (conj! acc v) (inc i)))))
               all-int? (every? seq-format-int? values)
               fmt-one (fn [v]
                         (if all-int?

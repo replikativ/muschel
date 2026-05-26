@@ -52,17 +52,19 @@
 
 (deftest awk-record-loop-honours-interrupt
   (testing "awk's per-record loop calls interrupt-fn"
-    (let [host (mk-host)
+    (let [;; Pre-seed a VFS file with N lines so awk reads from a file
+          ;; (no seq-piped allocation that could trip budgets first).
+          input-lines (apply str (for [i (range 1000)] (str i "\n")))
+          fs (vfs/make {"/input.txt" input-lines} {:cwd "/"})
+          host (hb/make {:fs fs
+                        :fallback-host (jvm/make)
+                        :builtins posix/standard})
           ex (try
-               ;; Feed awk many records via seq + pipe. Note: bash's
-               ;; pipe stages each tick the interrupt-fn too; we make
-               ;; the budget generous enough that awk starts running
-               ;; but tight enough that its record loop is what fires.
                (m/run-and-capture
                 (m/new-env)
-                "seq 1 10000 | awk '{print NR}'"
+                "awk '{print NR}' /input.txt"
                 {:host host
-                 :interrupt-fn (bud/step-interrupt 15)})
+                 :interrupt-fn (bud/step-interrupt 20)})
                nil
                (catch clojure.lang.ExceptionInfo e e))]
       (is (some? ex)

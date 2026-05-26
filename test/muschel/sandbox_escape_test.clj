@@ -226,3 +226,36 @@
           (is (not (str/includes? (:stdout r) "/tmp"))
               (str "glob ../* leaked host paths: " (pr-str (:stdout r)))))
         (finally (cleanup root))))))
+
+;; ============================================================================
+;; Host env leak — the re-audit critical finding. `new-env` must NOT
+;; inherit (System/getenv) by default; secrets in the launching
+;; process must not be visible from inside a sandboxed run.
+;; ============================================================================
+
+(deftest host-env-not-leaked-by-default
+  (testing "echo $PATH inside sandbox returns empty (host PATH must NOT leak)"
+    (let [[root host _] (mk-sandbox)]
+      (try
+        ;; Set a known canary in the JVM process env via Java reflection
+        ;; — alas can't really do that, so instead read a var we KNOW
+        ;; exists on the host. PATH is always there on Linux.
+        (let [host-path (System/getenv "PATH")
+              r (run host "echo $PATH")]
+          (is (some? host-path) "test prerequisite: host has $PATH")
+          (is (not= (str host-path "\n") (:stdout r))
+              (str "host $PATH leaked into sandbox: " (pr-str (:stdout r)))))
+        (finally (cleanup root))))))
+
+(deftest env-builtin-does-not-dump-host-vars
+  (testing "the `env` builtin inside sandbox returns only sandbox-set vars"
+    (let [[root host _] (mk-sandbox)]
+      (try
+        (let [r (run host "env")
+              lines (str/split-lines (:stdout r))]
+          ;; With no host-env inheritance, env should print PWD (and
+          ;; maybe a couple of muschel-set vars) but NOT 90+ host
+          ;; vars like SSH_AUTH_SOCK / DBUS_SESSION_BUS_ADDRESS / etc.
+          (is (< (count lines) 10)
+              (str "env dumped " (count lines) " vars — looks like host env leaked")))
+        (finally (cleanup root))))))
