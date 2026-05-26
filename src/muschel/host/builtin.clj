@@ -51,17 +51,18 @@
    xargs, …). We resolve :in eagerly via the fallback host's
    -read-all-string — fine for the bounded inputs builtins handle.
 
-   Also forwards `:interrupt-fn` so long-running builtins (awk's
-   record loop, find recursion, xargs per-arg, etc.) can honour the
-   caller's resource budget."
-  [{:keys [dir extra-env in interrupt-fn]} fallback-host fallback-fs]
+   Also forwards `:interrupt-fn` (resource budget) and `:trace` (the
+   introspection state) so builtins / awk can record their own
+   events when needed."
+  [{:keys [dir extra-env in interrupt-fn trace]} fallback-host fallback-fs]
   (let [stdin (when in
                 (try (host/-read-all-string fallback-host in)
                      (catch Throwable _ nil)))]
     (cond-> {:cwd  (or dir (fs/cwd fallback-fs))
              :vars (or extra-env {})}
       stdin        (assoc :stdin stdin)
-      interrupt-fn (assoc :interrupt-fn interrupt-fn))))
+      interrupt-fn (assoc :interrupt-fn interrupt-fn)
+      trace        (assoc :trace trace))))
 
 (defn- invoke-builtin!
   "Run a builtin fn synchronously, write its stdout/stderr to the
@@ -73,11 +74,20 @@
    the same gates."
   [self fallback-host builtin-fn opts fs]
   (require 'muschel.builtins.posix)
+  (require 'muschel.trace)
+  (require 'muschel.fs.traced)
   (let [argv (argv-of opts)
+        ;; If the caller installed a trace state, wrap fs so every
+        ;; protocol op the builtin makes is recorded. The wrap is per
+        ;; call so it doesn't leak between invocations.
+        wrap-fn (resolve 'muschel.fs.traced/wrap)
+        fs (if-let [ts (:trace opts)] (wrap-fn fs ts) fs)
         env  (build-env opts fallback-host fs)
         host-var    (resolve 'muschel.builtins.posix/*host*)
         session-var (resolve 'muschel.builtins.posix/*session*)
         depth-var   (resolve 'muschel.builtins.posix/*depth*)
+        record-tool! (resolve 'muschel.trace/record-tool!)
+        started-at  (System/currentTimeMillis)
         {:keys [stdout stderr exit]}
         (try
           (push-thread-bindings
@@ -95,6 +105,15 @@
             {:stdout ""
              :stderr (str (:cmd opts) ": " (.getMessage t) "\n")
              :exit 1}))]
+    ;; Record into the trace state if one is installed on the env.
+    (record-tool! (:trace opts)
+                  {:type :tool
+                   :name (:cmd opts)
+                   :argv argv
+                   :exit (or exit 0)
+                   :stdout-bytes (count (or stdout ""))
+                   :stderr-bytes (count (or stderr ""))
+                   :duration-ms (- (System/currentTimeMillis) started-at)})
     (host/write-string! fallback-host (:out opts) (or stdout ""))
     (host/write-string! fallback-host (:err opts) (or stderr ""))
     {:wait   (fn [] (or exit 0))
