@@ -78,6 +78,35 @@
     (is (= 1 (:exit r)) "usage errors exit 1 (GNU coreutils convention)")
     (is (re-find #"Missing required argument" (:stderr r)))))
 
+(deftest sh-script-file-runs
+  ;; `sh FILE` reads the script through the FS protocol and runs it.
+  ;; Used in the playground (`sh script.sh` against the seeded VFS).
+  (let [h (hb/make {:fs (vfs/make {"/work/script.sh"
+                                   "echo hi from script\necho line 2\n"}
+                                  {:cwd "/work"})
+                    :fallback-host (th/fallback-host)
+                    :builtins posix/standard
+                    :fallback-allowlist #{}})
+        r (run h "sh script.sh")]
+    (is (= 0 (:exit r)) (:stderr r))
+    (is (= "hi from script\nline 2\n" (:stdout r)))))
+
+(deftest sh-script-file-positional-args
+  ;; Script args become $1, $2, …
+  (let [h (hb/make {:fs (vfs/make {"/work/s.sh" "echo \"$1 then $2\"\n"}
+                                  {:cwd "/work"})
+                    :fallback-host (th/fallback-host)
+                    :builtins posix/standard
+                    :fallback-allowlist #{}})
+        r (run h "sh s.sh hello world")]
+    (is (= 0 (:exit r)) (:stderr r))
+    (is (= "hello then world\n" (:stdout r)))))
+
+(deftest sh-script-file-missing-127
+  (let [r (run (mk-host) "sh missing.sh")]
+    (is (= 127 (:exit r)))
+    (is (re-find #"No such file or directory" (:stderr r)))))
+
 (deftest bash-alias-works
   (let [r (run (mk-host) "bash -c \"echo bashing\"")]
     (is (= 0 (:exit r)))

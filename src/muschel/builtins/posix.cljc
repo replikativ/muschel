@@ -522,15 +522,52 @@
    ["-l" "--login"]
    ["-s" "--stdin"]])
 
-(defn sh
-  "Builtin sh / bash. Supports -c SCRIPT — the only mode we need.
-   Parses SCRIPT with muschel.parse and runs it through the same
-   host the outer invocation is on."
-  [argv _fs env]
-  (let [{:keys [opts err]} (cli-parse argv sh-spec)]
+(defn- run-nested-script
+  "Parse `script` and run it through the same host as the outer
+   invocation. `script-args` becomes the nested shell's positional
+   parameters ($1, $2, …). Returns the builtin result shape."
+  [script script-args env]
+  (let [host     *host*
+        parse-fn @rt/parse-fn
+        run-fn   @rt/run-fn
+        new-env  @rt/new-env-fn]
     (cond
-      err
-      (usage-err "sh" err)
+      (not host)
+      (err "sh: no host available for nested dispatch" 1)
+
+      (or (nil? parse-fn) (nil? run-fn) (nil? new-env))
+      (err (str "sh: muschel.exec is not loaded — recursive shell "
+                "dispatch requires (require 'muschel.exec)")
+           1)
+
+      :else
+      (let [e0     (cond-> (or env (new-env))
+                     (seq script-args) (assoc :pos-args (vec script-args)))
+            ast    (parse-fn script)
+            result (binding [*depth* (inc *depth*)]
+                     (run-fn e0 ast
+                             (cond-> {:host host}
+                               *session* (assoc :session *session*))))]
+        {:stdout (or (:stdout result) "")
+         :stderr (or (:stderr result) "")
+         :exit   (or (:exit result) 0)}))))
+
+(defn sh
+  "Builtin sh / bash. Two forms:
+     - `sh -c SCRIPT`   — run SCRIPT inline (`bash -c` convention).
+     - `sh FILE [args]` — read FILE through the FS protocol and run
+                          it; `[args]` become the script's `$1`, `$2`, …
+
+   Both parse with muschel.parse and execute through the same host
+   the outer invocation is on (so containment, permits, and tracing
+   carry through into the sub-shell)."
+  [argv fs env]
+  ;; Don't shadow the local `err` helper with the cli-parse `:err`
+  ;; field — `cond`'s `:else` branch needs to call `(err …)`.
+  (let [{:keys [opts pos] cli-err :err} (cli-parse argv sh-spec)]
+    (cond
+      cli-err
+      (usage-err "sh" cli-err)
 
       (>= *depth* max-shell-depth)
       (err (str "sh: too many nested shell invocations (depth >= "
@@ -538,33 +575,18 @@
            2)
 
       (:command opts)
-      (let [script   (:command opts)
-            host     *host*
-            parse-fn @rt/parse-fn
-            run-fn   @rt/run-fn
-            new-env  @rt/new-env-fn]
-        (cond
-          (not host)
-          (err "sh: no host available for nested dispatch" 1)
+      (run-nested-script (:command opts) (rest pos) env)
 
-          (or (nil? parse-fn) (nil? run-fn) (nil? new-env))
-          (err (str "sh: muschel.exec is not loaded — recursive shell "
-                    "dispatch requires (require 'muschel.exec)")
-               1)
-
-          :else
-          (let [e0     (or env (new-env))
-                ast    (parse-fn script)
-                result (binding [*depth* (inc *depth*)]
-                         (run-fn e0 ast
-                                 (cond-> {:host host}
-                                   *session* (assoc :session *session*))))]
-            {:stdout (or (:stdout result) "")
-             :stderr (or (:stderr result) "")
-             :exit   (or (:exit result) 0)})))
+      (seq pos)
+      (let [script-path (first pos)
+            script-args (rest pos)
+            content     (fs/read-file fs script-path)]
+        (if (nil? content)
+          (err (str "sh: " script-path ": No such file or directory") 127)
+          (run-nested-script content script-args env)))
 
       :else
-      (err "sh: only -c SCRIPT mode is supported in muschel builtins" 2))))
+      (err "sh: missing operand — expected `sh -c SCRIPT` or `sh FILE`" 2))))
 
 ;; ============================================================================
 ;; stat — file metadata as text
