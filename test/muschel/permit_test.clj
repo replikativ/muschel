@@ -46,6 +46,39 @@
     (is (= :allow (:decision r)))
     (is (= 1 (count (:prompted r))))))
 
+(deftest defaults-argv-shape-git-push
+  ;; `git push` is allowed; force-push variants deny.
+  (is (= :allow (:decision (check "git push origin main"))))
+  (is (= :deny  (:decision (check "git push --force origin main"))))
+  (is (= :deny  (:decision (check "git push -f"))))
+  (is (= :deny  (:decision (check "git push --force-with-lease"))))
+  (is (= :deny  (:decision (check "git push origin --force main")))))
+
+(deftest defaults-argv-shape-git-history-wipes
+  (is (= :deny (:decision (check "git reset --hard HEAD"))))
+  (is (= :deny (:decision (check "git clean -fd"))))
+  (is (= :deny (:decision (check "git clean -fdx")))))
+
+(deftest defaults-argv-shape-chmod-octals
+  ;; Explicit octals: 0755 allowed, 0777 / 0666 denied.
+  (is (= :allow (:decision (check "chmod 0755 script.sh"))))
+  (is (= :deny  (:decision (check "chmod 0777 some.sh"))))
+  (is (= :deny  (:decision (check "chmod 666 readable.txt")))))
+
+(deftest defaults-argv-shape-rm-system-paths
+  (is (= :deny (:decision (check "rm -rf /"))))
+  (is (= :deny (:decision (check "rm -rf /etc"))))
+  (is (= :deny (:decision (check "rm -rf /usr")))))
+
+(deftest defaults-argv-shape-shell-c
+  ;; `sh -c \"…\"` is allowed (muschel re-parses through the same gates);
+  ;; bare `sh` asks.
+  (is (= :allow (:decision (check "sh -c \"echo hi\""))))
+  (is (= :allow (:decision (check "bash -c \"git status\""))))
+  (let [r (check "sh" {:prompter (fn [_] {:result :allow-once})})]
+    (is (= :allow (:decision r)))
+    (is (= 1 (count (:prompted r))))))
+
 ;; ============================================================================
 ;; Matcher kinds
 ;; ============================================================================
