@@ -2273,29 +2273,45 @@
 ;; sed — basic substitution + simple addresses
 ;; ============================================================================
 
+(defn- sed-parse-single-addr
+  "Parse one address token from the start of `s`. Returns `[addr rest]`
+   where `addr` is `{:type :line :n N}`, `{:type :last}`, or
+   `{:type :regex :pat P}`. If no address matches, returns `[nil s]`."
+  [^String s]
+  (cond
+    (re-find #"^(\d+)" s)
+    (let [[_ n] (re-find #"^(\d+)" s)]
+      [{:type :line :n (Long/parseLong n)} (subs s (count n))])
+    (str/starts-with? s "$")
+    [{:type :last} (subs s 1)]
+    (str/starts-with? s "/")
+    (let [end (.indexOf s "/" 1)]
+      (if (neg? end)
+        [nil s]
+        [{:type :regex :pat (subs s 1 end)} (subs s (inc end))]))
+    :else [nil s]))
+
 (defn- parse-sed-script
   "Translate a sed script string into a vector of `{:addr ... :op ...}`
    commands. Supported ops: s (substitute), d (delete), p (print).
-   Addresses: line number, `$` (last), `/REGEX/`, or none."
+   Addresses can be:
+     N           line N
+     $           last line
+     /REGEX/     pattern match
+     N,M / N,$ / /PAT/,/PAT/  range (inclusive)
+     (none)      always"
   [^String script]
   (let [scripts (str/split script #";")]
     (mapv
      (fn [s]
        (let [s (str/triml s)
+             [from rest-s] (sed-parse-single-addr s)
+             ;; If a comma follows, parse the second address.
              [addr rest-s]
-             (cond
-               (re-find #"^(\d+)" s)
-               (let [[_ n] (re-find #"^(\d+)" s)]
-                 [{:type :line :n (Long/parseLong n)} (subs s (count n))])
-               (str/starts-with? s "$")
-               [{:type :last} (subs s 1)]
-               (str/starts-with? s "/")
-               (let [end (.indexOf s "/" 1)]
-                 (if (neg? end)
-                   [nil s]
-                   [{:type :regex :pat (subs s 1 end)} (subs s (inc end))]))
-               :else [nil s])
-             rest-s (str/triml rest-s)
+             (if (and from (str/starts-with? rest-s ","))
+               (let [[to rest-s'] (sed-parse-single-addr (subs rest-s 1))]
+                 [{:type :range :from from :to to} (str/triml rest-s')])
+               [from (str/triml rest-s)])
              op (first rest-s)]
          (case op
            \s
@@ -2311,12 +2327,49 @@
            {:addr addr :op :unknown :raw rest-s})))
      scripts)))
 
-(defn- sed-addr-match? [{:keys [type n pat] :as _addr} line line-idx total]
+(defn- sed-single-addr-match? [{:keys [type n pat]} line line-idx total]
   (case type
     nil      true
     :line    (= n line-idx)
     :last    (= line-idx total)
     :regex   (boolean (re-find (re-pattern pat) line))))
+
+(defn- sed-addr-match?
+  "True if `addr` (single or range) matches the current line.
+
+   Range matching is *stateful* for pattern ranges (`/a/,/b/`) — once
+   `/a/` matches we're inside the range until `/b/` matches (inclusive).
+   Numeric ranges (`N,M`) are stateless. The caller passes an atom
+   `in-range?-state` keyed by command index for stateful tracking."
+  [addr line line-idx total cmd-idx in-range-state]
+  (case (:type addr)
+    nil      true
+    :line    (= (:n addr) line-idx)
+    :last    (= line-idx total)
+    :regex   (boolean (re-find (re-pattern (:pat addr)) line))
+    :range
+    (let [{:keys [from to]} addr]
+      ;; Numeric: simple bounds check.
+      (cond
+        (and (= :line (:type from)) (= :line (:type to)))
+        (and (>= line-idx (:n from)) (<= line-idx (:n to)))
+
+        (and (= :line (:type from)) (= :last (:type to)))
+        (>= line-idx (:n from))
+
+        :else
+        ;; Pattern-based or mixed: track per-cmd state.
+        (let [active? (get @in-range-state cmd-idx false)
+              start?  (sed-single-addr-match? from line line-idx total)
+              end?    (sed-single-addr-match? to   line line-idx total)]
+          (cond
+            (and (not active?) start?)
+            (do (swap! in-range-state assoc cmd-idx (not end?))
+                true)
+            active?
+            (do (when end? (swap! in-range-state assoc cmd-idx false))
+                true)
+            :else false))))))
 
 (defn- sed-do-substitute [line {:keys [pat repl flags]}]
   (let [flags (or flags "")
@@ -2361,15 +2414,20 @@
             (fn [^String content]
               (let [lines (str/split-lines content)
                     total (count lines)
-                    out (StringBuilder.)]
+                    out (StringBuilder.)
+                    ;; Per-command range state for pattern ranges
+                    ;; (/a/,/b/). Keyed by cmd-idx.
+                    range-state (atom {})]
                 (loop [i 0]
                   (when (< i total)
                     (let [orig (nth lines i)
                           line (volatile! orig)
                           deleted? (volatile! false)
                           force-print? (volatile! false)]
-                      (doseq [cmd cmds :when (not @deleted?)]
-                        (when (sed-addr-match? (:addr cmd) @line (inc i) total)
+                      (doseq [[cmd-idx cmd] (map-indexed vector cmds)
+                              :when (not @deleted?)]
+                        (when (sed-addr-match? (:addr cmd) @line (inc i)
+                                               total cmd-idx range-state)
                           (case (:op cmd)
                             :s (vreset! line (sed-do-substitute @line cmd))
                             :d (vreset! deleted? true)
@@ -2533,6 +2591,229 @@
                     :when (awk-pattern-match? pattern line nr)]
               (awk-eval-action action {:fields fields :nr nr :nf nf :out out}))))
         (ok (.toString out))))))
+
+;; ============================================================================
+;; jq — JSON projection & filtering
+;;
+;; A practical subset of jq, useful for what agents actually do with
+;; JSON output (project a field out of an API response, iterate an
+;; array, count length). Built on org.clojure/data.json so containment
+;; is preserved (no real-disk reads except through fs/read-file).
+;;
+;; Supported filters:
+;;   .                    identity
+;;   .key                 object field
+;;   .key.nested          chained
+;;   .[N]                 array index
+;;   .[]                  iterate (each elem becomes a separate output)
+;;   .[K:M]               array slice
+;;   length               array / object / string length
+;;   keys                 object keys (sorted)
+;;   values               object values
+;;   type                 \"string\" \"number\" \"object\" \"array\" \"boolean\" \"null\"
+;;   first / last         array first / last element
+;;   |                    pipe (compose)
+;; ============================================================================
+
+(declare jq-apply-filter)
+
+(defn- jq-tokenize-pipeline
+  "Split a jq filter expression on `|` at top level (not inside `[...]`
+   or `(...)`). Returns a vector of substring filters."
+  [^String s]
+  (let [out (StringBuilder.)
+        result (transient [])
+        n (count s)
+        depth (volatile! 0)]
+    (loop [i 0]
+      (when (< i n)
+        (let [c (.charAt s i)]
+          (cond
+            (or (= c \[) (= c \()) (do (.append out c) (vswap! depth inc))
+            (or (= c \]) (= c \))) (do (.append out c) (vswap! depth dec))
+            (and (= c \|) (zero? @depth))
+            (do (conj! result (str/trim (.toString out)))
+                (.setLength out 0))
+            :else (.append out c)))
+        (recur (inc i))))
+    (conj! result (str/trim (.toString out)))
+    (vec (persistent! result))))
+
+(defn- jq-step
+  "Apply one chained step (e.g. `.field` or `[N]` or `[]`) to a value.
+   Returns either a single value, or `[:multi v1 v2 …]` for `[]` which
+   fans out."
+  [v ^String step]
+  (cond
+    ;; Bare `.` is the identity-step that appears whenever a filter
+    ;; starts with `.` (the chain splitter emits it as its first
+    ;; element). Pass through.
+    (= step ".") v
+
+    (= step "[]")
+    (cond
+      (sequential? v) (into [:multi] v)
+      (map? v)        (into [:multi] (vals v))
+      :else           nil)
+
+    (re-matches #"\[\d+\]" step)
+    (let [n (Long/parseLong (subs step 1 (dec (count step))))]
+      (when (sequential? v) (nth v n nil)))
+
+    (re-matches #"\[\d+:\d+\]" step)
+    (let [[_ a b] (re-find #"\[(\d+):(\d+)\]" step)
+          aa (Long/parseLong a) bb (Long/parseLong b)]
+      (when (sequential? v) (subvec (vec v) (min aa (count v)) (min bb (count v)))))
+
+    ;; .field — strip the leading dot if present
+    :else
+    (let [k (cond-> step (str/starts-with? step ".") (subs 1))]
+      (when (and v (map? v)) (get v k)))))
+
+(defn- jq-split-steps
+  "Break `.foo.bar[0].baz[]` into [\".foo\" \".bar\" \"[0]\" \".baz\" \"[]\"]."
+  [^String s]
+  (loop [i 0 acc (transient []) buf (StringBuilder.)]
+    (cond
+      (>= i (count s))
+      (let [tail (.toString buf)]
+        (cond-> (persistent! acc)
+          (seq tail) (conj tail)))
+
+      (= \. (.charAt s i))
+      (let [tail (.toString buf)
+            acc' (cond-> acc (seq tail) (conj! tail))]
+        (.setLength buf 0)
+        (.append buf \.)
+        (recur (inc i) acc' buf))
+
+      (= \[ (.charAt s i))
+      (let [tail (.toString buf)
+            acc' (cond-> acc (seq tail) (conj! tail))
+            close (.indexOf s "]" i)
+            chunk (subs s i (inc close))]
+        (.setLength buf 0)
+        (recur (inc close) (conj! acc' chunk) buf))
+
+      :else
+      (do (.append buf (.charAt s i))
+          (recur (inc i) acc buf)))))
+
+(defn- jq-builtin-fn [^String fname]
+  (case fname
+    "length" (fn [v]
+               (cond (string? v) (count v)
+                     (sequential? v) (count v)
+                     (map? v) (count v)
+                     :else 0))
+    "keys"   (fn [v] (when (map? v) (vec (sort (map name (keys v))))))
+    "values" (fn [v] (when (map? v) (vec (vals v))))
+    "type"   (fn [v]
+               (cond (nil? v) "null"
+                     (boolean? v) "boolean"
+                     (number? v) "number"
+                     (string? v) "string"
+                     (sequential? v) "array"
+                     (map? v) "object"
+                     :else "object"))
+    "first"  (fn [v] (when (sequential? v) (first v)))
+    "last"   (fn [v] (when (sequential? v) (last v)))
+    nil))
+
+(defn- jq-apply-filter
+  "Apply a single (no-pipe) filter string to v. Returns a vector of
+   results (jq can produce multiple outputs from a single input)."
+  [v ^String f]
+  (let [f (str/trim f)]
+    (cond
+      (= "." f) [v]
+
+      ;; Builtin function name
+      (jq-builtin-fn f)
+      [((jq-builtin-fn f) v)]
+
+      ;; Chain of .field / [N] / [] steps
+      :else
+      (let [steps (jq-split-steps f)]
+        (loop [vs [v] [step & more] steps]
+          (if (nil? step)
+            vs
+            (let [vs' (->> vs
+                           (mapcat (fn [v]
+                                     (let [r (jq-step v step)]
+                                       (cond
+                                         (and (vector? r) (= :multi (first r))) (rest r)
+                                         :else [r])))))]
+              (recur (vec vs') more))))))))
+
+(defn- jq-run-pipeline
+  "Apply a `|`-piped filter expression to a parsed JSON value."
+  [v ^String expr]
+  (let [filters (jq-tokenize-pipeline expr)]
+    (reduce
+     (fn [vs f]
+       (vec (mapcat #(jq-apply-filter % f) vs)))
+     [v]
+     filters)))
+
+(defn- jq-format
+  "Render a value as JSON output. Honours -c (compact) and -r (raw —
+   strip surrounding quotes on string outputs)."
+  [v {:keys [compact raw]}]
+  (require 'clojure.data.json)
+  (let [json-write (resolve 'clojure.data.json/write-str)]
+    (cond
+      (and raw (string? v)) v
+      compact (json-write v)
+      :else (json-write v :indent true))))
+
+(defn jq
+  "Practical jq subset: `.`, `.field`, `.[N]`, `.[]`, `.[A:B]`,
+   `length`, `keys`, `values`, `type`, `first`, `last`, and `|`
+   composition. Reads JSON from stdin or files."
+  [argv fs env]
+  (require 'clojure.data.json)
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-c" "--compact-output"]
+                         ["-r" "--raw-output"]
+                         ["-s" "--slurp"]
+                         ["-n" "--null-input"]])]
+    (cond
+      err (usage-err "jq" err)
+      (empty? pos) (usage-err "jq" "missing filter")
+      :else
+      (let [expr  (first pos)
+            files (rest pos)
+            stdin (or (:stdin env) "")
+            input-text (cond
+                         (:null-input opts) "null"
+                         (seq files)
+                         (str/join "\n" (for [f files] (or (fs/read-file fs f) "")))
+                         :else stdin)
+            read-fn (resolve 'clojure.data.json/read)
+            ;; Multiple JSON values separated by whitespace; slurp
+            ;; puts them in one array. Pushback buffer needs ~64
+            ;; bytes — data.json reads ahead more than 1.
+            parsed (if (str/blank? input-text)
+                     []
+                     (try
+                       (let [pbr (java.io.PushbackReader.
+                                  (java.io.StringReader. input-text)
+                                  64)]
+                         (loop [acc []]
+                           (let [v (read-fn pbr :eof-error? false :eof-value ::eof)]
+                             (if (= ::eof v) acc (recur (conj acc v))))))
+                       (catch Throwable t
+                         (throw (ex-info (str "jq: parse error: " (.getMessage t)) {})))))
+            parsed (if (:slurp opts) [parsed] parsed)
+            fmt-opts {:compact (:compact-output opts)
+                      :raw     (:raw-output opts)}
+            outs (mapcat #(jq-run-pipeline % expr) parsed)
+            sb (StringBuilder.)]
+        (doseq [o outs]
+          (.append sb ^String (jq-format o fmt-opts))
+          (.append sb "\n"))
+        (ok (.toString sb))))))
 
 ;; ============================================================================
 ;; Network: curl
@@ -2728,6 +3009,8 @@
           "basename" basename
           "dirname"  dirname
           "realpath" realpath
+          ;; data
+          "jq"       jq
           ;; network + timing
           "curl"     curl
           "sleep"    sleep}))

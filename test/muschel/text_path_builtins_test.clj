@@ -221,6 +221,77 @@
     (is (= "beta\n" (:stdout r)))))
 
 ;; ============================================================================
+;; sed — range addresses
+;; ============================================================================
+
+(deftest sed-range-numeric
+  ;; sed -n '3,5p' prints lines 3 through 5 inclusive. Most-common
+  ;; idiom in my own bash history.
+  (let [fs (vfs/make {"/work/n.txt" (apply str (for [i (range 1 11)] (str i "\n")))}
+                     {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "sed -n '3,5p' n.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "3\n4\n5\n" (:stdout r)))))
+
+(deftest sed-range-to-last
+  (let [fs (vfs/make {"/work/n.txt" (apply str (for [i (range 1 11)] (str i "\n")))}
+                     {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "sed -n '8,$p' n.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "8\n9\n10\n" (:stdout r)))))
+
+(deftest sed-range-delete
+  (let [fs (vfs/make {"/work/n.txt" "a\nb\nc\nd\ne\n"} {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "sed '2,4d' n.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "a\ne\n" (:stdout r)))))
+
+;; ============================================================================
+;; jq
+;; ============================================================================
+
+(defn- jq-fs []
+  (vfs/make {"/work/obj.json"  "{\"name\":\"alice\",\"age\":30,\"tags\":[\"a\",\"b\",\"c\"]}"
+             "/work/list.json" "[{\"n\":1},{\"n\":2},{\"n\":3}]"}
+            {:cwd "/work"}))
+
+(deftest jq-identity
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -c . obj.json")]
+    (is (= 0 (:exit r)))
+    (is (.contains ^String (:stdout r) "alice"))))
+
+(deftest jq-field
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r .name obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "alice\n" (:stdout r)))))
+
+(deftest jq-iter
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r '.tags[]' obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "a\nb\nc\n" (:stdout r)))))
+
+(deftest jq-pipe-length
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq '.tags | length' obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "3\n" (:stdout r)))))
+
+(deftest jq-keys
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -c keys obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "[\"age\",\"name\",\"tags\"]\n" (:stdout r)))))
+
+(deftest jq-type
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r type obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "object\n" (:stdout r)))))
+
+(deftest jq-iter-then-field
+  ;; .[] | .n on a list-of-objects → each n on its own line.
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r '.[] | .n' list.json")]
+    (is (= 0 (:exit r)))
+    (is (= "1\n2\n3\n" (:stdout r)))))
+
+;; ============================================================================
 ;; sleep
 ;; ============================================================================
 
