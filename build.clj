@@ -102,18 +102,25 @@
               :class-dir class-dir}))
 
 (defn npm-version
-  "Stamp the current git-derived version into the root package.json."
+  "Render `npm-package/package.template.json` → `npm-package/package.json`
+   with `{{VERSION}}` substituted to the git-derived version
+   `(format \"0.1.%s\" (b/git-count-revs nil))`.
+
+   Pattern matches datahike's tools.npm — single source of truth is
+   build.clj's `version`, rendered into the package.json on each
+   publish.
+
+   The root package.json (dev scripts) is left alone."
   [_]
-  (let [path "package.json"
-        pkg (slurp path)
-        updated (str/replace pkg
-                             #"\"version\"\s*:\s*\"[^\"]+\""
-                             (str "\"version\": \"" version "\""))]
-    (spit path updated)
-    (println (str path " version set to " version))))
+  (let [template-path "npm-package/package.template.json"
+        out-path      "npm-package/package.json"
+        tmpl          (slurp template-path)
+        rendered      (str/replace tmpl "{{VERSION}}" version)]
+    (spit out-path rendered)
+    (println (str out-path " generated from template with version " version))))
 
 (defn build-npm
-  "Build the shadow-cljs :npm target into dist/muschel.js."
+  "Build the shadow-cljs :npm target into npm-package/muschel.js."
   [_]
   (println "Building :npm via shadow-cljs...")
   (let [ret (b/process {:command-args ["npx" "shadow-cljs" "release" "npm"]})]
@@ -134,15 +141,24 @@
   (b/delete {:path "dist/playground/manifest.edn"}))
 
 (defn npm-publish
-  "Bump version, build the npm bundle + browser playground, then
-   `npm publish` from the repo root. Requires npx + npm on PATH and
-   an authenticated npm session (with --otp if 2FA is enabled)."
+  "Bump version, build the npm bundle, then `npm publish` from
+   `npm-package/`. Requires npx + npm on PATH and an authenticated
+   npm session (with --otp if 2FA is enabled).
+
+   Layout (datahike pattern):
+
+     npm-package/
+       package.template.json  ← source of truth + {{VERSION}}
+       package.json           ← generated each publish from template
+       muschel.js             ← shadow-cljs :npm output
+       index.d.ts             ← hand-authored TS types
+       README.md, LICENSE     ← shipped as `files`"
   [_]
-  (npm-version nil)
-  (build-npm nil)
-  (build-playground nil)
-  (println "Publishing to npm...")
-  (let [ret (b/process {:command-args ["npm" "publish" "--access" "public"]})]
+  (build-npm nil)               ; produce muschel.js first
+  (npm-version nil)             ; then stamp package.json
+  (println "Publishing to npm from npm-package/...")
+  (let [ret (b/process {:command-args ["npm" "publish" "--access" "public"]
+                        :dir "npm-package"})]
     (when (not= 0 (:exit ret))
       (throw (ex-info "npm publish failed" {:exit (:exit ret)}))))
   (println (str "Published muschel " version " to npm.")))

@@ -31,19 +31,35 @@
                              :init-fn muschel.playground/start}}
    :compiler-options {:infer-externs true}}
 
-  ;; npm module — usable from plain JS / TypeScript.
-  ;; Shipped via root package.json's "files" field.
+  ;; npm module — usable from plain JS / TypeScript. Compiled into
+  ;; `npm-package/` (the directory `npm publish` is run from).
   :npm
   {:target    :node-library
-   :output-to "dist/muschel.js"
-   :exports   {:parse        muschel.js-api/parse
-               :check        muschel.js-api/check
-               :nodeHost     muschel.js-api/nodeHost
-               :browserHost  muschel.js-api/browserHost
-               :stockTools   muschel.js-api/stockTools
-               :session      muschel.js-api/session
-               :run          muschel.js-api/run
-               :setVar       muschel.js-api/setVar
-               :getVar       muschel.js-api/getVar
-               :cwd          muschel.js-api/cwd}
+   :output-to "npm-package/muschel.js"
+   :exports   {;; Parsing + permit
+               :parse              muschel.js-api/parse
+               :check              muschel.js-api/check
+               :defaultRules       muschel.js-api/defaultRules
+               :denyAllPrompter    muschel.js-api/denyAllPrompter
+               :allowAllPrompter   muschel.js-api/allowAllPrompter
+
+               ;; Env + session
+               :newEnv             muschel.js-api/newEnv
+               :getVar             muschel.js-api/getVar
+               :setVar             muschel.js-api/setVar
+               :atomSession        muschel.js-api/atomSession
+               :sessionCwd         muschel.js-api/sessionCwd
+
+               ;; Hosts + filesystems
+               :nodeHost           muschel.js-api/nodeHost
+               :browserHost        muschel.js-api/browserHost
+               :virtualFS          muschel.js-api/virtualFS
+               :stockTools         muschel.js-api/stockTools
+
+               ;; Nested objects: fs.*, budget.*
+               :fs                 muschel.js-api/fs
+               :budget             muschel.js-api/budget
+
+               ;; Execution
+               :run                muschel.js-api/run}
    :compiler-options {:infer-externs true}}}}
