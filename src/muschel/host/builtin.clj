@@ -129,7 +129,25 @@
         (throw (java.io.FileNotFoundException.
                 (str p " (not in muschel FS root or missing)")))))
   (-file-info [_ p]
-    (fs/-stat fs p))
+    ;; Translate the muschel.fs stat shape into the predicate-style
+    ;; map the rest of muschel (test/[, redirect open-checks, …)
+    ;; consume. Outside-root or missing paths return `:exists? false`,
+    ;; matching the jvm host's behaviour for a missing file.
+    (if-let [s (fs/-stat fs p)]
+      {:exists?     true
+       :file?       (= :file (:type s))
+       :dir?        (= :dir  (:type s))
+       :symlink?    (= :symlink (:type s))
+       ;; muschel.fs doesn't model unix-style perm bits richly enough
+       ;; to distinguish r/w/x. Treat all in-root files as readable +
+       ;; writable; executable only if the FS reports it via mode bits.
+       :readable?   true
+       :writable?   true
+       :executable? (when-let [m (:perms-mode s)]
+                      (pos? (bit-and m 0111)))
+       :size        (:size s)
+       :mtime-ms    (:mtime-ms s)}
+      {:exists? false}))
   (-read-file [_ p]
     (fs/-read-file fs p))
 

@@ -23,7 +23,7 @@
 
    Reference: uutils-coreutils. Long GNU options not in our spec
    surface as parse errors with a clear message."
-  (:refer-clojure :exclude [cat])
+  (:refer-clojure :exclude [cat printf])
   (:require [clojure.string :as str]
             [clojure.tools.cli :as cli]
             [muschel.fs :as fs]
@@ -1991,6 +1991,550 @@
         {:stdout stdin :stderr @stderr :exit (if @any-err? 1 0)}))))
 
 ;; ============================================================================
+;; Path tools: basename, dirname, realpath
+;; ============================================================================
+
+(defn basename
+  "POSIX basename PATH [SUFFIX]."
+  [argv _fs _env]
+  (let [args (rest argv)]
+    (cond
+      (empty? args) (usage-err "basename" "missing operand")
+      :else
+      (let [[path suffix] args
+            ;; Strip trailing slashes, then take the last segment.
+            trimmed (str/replace path #"/+$" "")
+            base    (or (last (str/split trimmed #"/")) "")
+            base'   (if (and suffix
+                             (not= base suffix)
+                             (str/ends-with? base suffix))
+                      (subs base 0 (- (count base) (count suffix)))
+                      base)]
+        (ok (str base' "\n"))))))
+
+(defn dirname
+  "POSIX dirname PATH... (one or more)."
+  [argv _fs _env]
+  (let [paths (rest argv)]
+    (cond
+      (empty? paths) (usage-err "dirname" "missing operand")
+      :else
+      (let [out (str/join "\n"
+                          (for [p paths]
+                            (let [trimmed (str/replace p #"/+$" "")
+                                  idx     (.lastIndexOf ^String trimmed "/")]
+                              (cond
+                                (neg? idx)        "."
+                                (zero? idx)       "/"
+                                :else             (subs trimmed 0 idx)))))]
+        (ok (str out "\n"))))))
+
+(defn realpath
+  "Canonicalise a path through the FS. Outside-root paths produce an
+   error. We don't follow symlinks any deeper than the FS does."
+  [argv fs _env]
+  (let [paths (rest argv)]
+    (cond
+      (empty? paths) (usage-err "realpath" "missing operand")
+      :else
+      (let [stderr   (volatile! "")
+            any-err? (volatile! false)
+            lines
+            (mapv (fn [p]
+                    (if-let [resolved (fs/resolve fs p)]
+                      resolved
+                      (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
+                          (vreset! any-err? true)
+                          nil)))
+                  paths)]
+        {:stdout (str/join "" (for [l lines :when l] (str l "\n")))
+         :stderr @stderr
+         :exit (if @any-err? 1 0)}))))
+
+;; ============================================================================
+;; printf
+;; ============================================================================
+
+(defn- printf-process-escapes
+  "Translate the `\\n \\t \\r \\\\ \\\"` escapes printf interprets in
+   both format and arg strings."
+  [^String s]
+  (-> s
+      (str/replace "\\n" "\n")
+      (str/replace "\\t" "\t")
+      (str/replace "\\r" "\r")
+      (str/replace "\\\\" "\\")))
+
+(defn printf
+  "POSIX printf FORMAT [ARG]...
+
+   Recognised specifiers: %s %d %i %x %o %c %% with width/precision.
+   Format string is reused if there are more args than placeholders."
+  [argv _fs _env]
+  (let [args (rest argv)]
+    (cond
+      (empty? args) (usage-err "printf" "usage: printf FORMAT [ARG]...")
+      :else
+      (let [fmt   (printf-process-escapes (first args))
+            xs    (vec (rest args))
+            specs (re-seq #"%[-+# 0]*\d*(?:\.\d+)?[sdiouxXc%]" fmt)
+            n     (count specs)
+            ;; Format takes a string per %s, long per %d/%x/%o/%i, etc.
+            coerce
+            (fn [^String spec ^String arg]
+              (let [last-ch (.charAt spec (dec (count spec)))]
+                (case last-ch
+                  (\d \i)
+                  (try (Long/parseLong arg) (catch Throwable _ 0))
+                  (\x \X \o)
+                  (try (Long/parseLong arg)
+                       (catch Throwable _
+                         (try (Long/parseLong arg 16)
+                              (catch Throwable _ 0))))
+                  arg)))
+            ;; If no args and no specs, format runs once.
+            ;; If args, batch (count specs) per cycle.
+            cycles (if (zero? n)
+                     [[]]
+                     (mapv vec (partition-all n (concat xs (repeat (rem n (max 1 (count xs))) "")))))
+            out (StringBuilder.)]
+        (doseq [batch cycles]
+          (try
+            (.append out (apply format fmt
+                                (map-indexed (fn [i a] (coerce (nth specs (mod i (max 1 n))) (str a)))
+                                             batch)))
+            (catch Throwable t
+              (.append out (printf-process-escapes fmt))
+              (binding [*err* *err*] (println "printf:" (.getMessage t))))))
+        (ok (.toString out))))))
+
+;; ============================================================================
+;; env, date, seq
+;; ============================================================================
+
+(defn env-fn
+  "Print environment as `KEY=VAL` lines. v1 doesn't implement the
+   `env VAR=val CMD` form (would need a process spawn through host)."
+  [_argv _fs env]
+  (let [vars (or (:vars env) {})
+        out  (str/join "\n"
+                       (for [[k v] (sort-by key vars)]
+                         (str k "=" v)))]
+    (ok (if (seq out) (str out "\n") ""))))
+
+(defn date-fn
+  "POSIX date. With +FORMAT prints the current time per format
+   string; without args, prints a default \"Day Mon DD HH:MM:SS\" form.
+
+   Format directives supported: %Y %m %d %H %M %S %j %F %T %s %% (a
+   pragmatic subset agents reach for)."
+  [argv _fs _env]
+  (let [args (rest argv)
+        fmt-arg (first args)
+        now (java.util.Date.)
+        cal (doto (java.util.Calendar/getInstance) (.setTime now))
+        translate
+        (fn [^String f]
+          (-> f
+              (str/replace "%Y" (str (.get cal java.util.Calendar/YEAR)))
+              (str/replace "%m" (format "%02d" (inc (.get cal java.util.Calendar/MONTH))))
+              (str/replace "%d" (format "%02d" (.get cal java.util.Calendar/DAY_OF_MONTH)))
+              (str/replace "%H" (format "%02d" (.get cal java.util.Calendar/HOUR_OF_DAY)))
+              (str/replace "%M" (format "%02d" (.get cal java.util.Calendar/MINUTE)))
+              (str/replace "%S" (format "%02d" (.get cal java.util.Calendar/SECOND)))
+              (str/replace "%j" (format "%03d" (.get cal java.util.Calendar/DAY_OF_YEAR)))
+              (str/replace "%F" (format "%04d-%02d-%02d"
+                                        (.get cal java.util.Calendar/YEAR)
+                                        (inc (.get cal java.util.Calendar/MONTH))
+                                        (.get cal java.util.Calendar/DAY_OF_MONTH)))
+              (str/replace "%T" (format "%02d:%02d:%02d"
+                                        (.get cal java.util.Calendar/HOUR_OF_DAY)
+                                        (.get cal java.util.Calendar/MINUTE)
+                                        (.get cal java.util.Calendar/SECOND)))
+              (str/replace "%s" (str (quot (.getTime now) 1000)))
+              (str/replace "%%" "%")))]
+    (cond
+      (and fmt-arg (str/starts-with? fmt-arg "+"))
+      (ok (str (translate (subs fmt-arg 1)) "\n"))
+      :else
+      (ok (str (translate "%F %T") "\n")))))
+
+(defn seq-fn
+  "POSIX seq:
+     seq LAST                start=1, step=1
+     seq FIRST LAST          step=1
+     seq FIRST STEP LAST"
+  [argv _fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-s" "--separator S" :default "\n"]
+                         ["-w" "--equal-width"]])]
+    (cond
+      err (usage-err "seq" err)
+      (empty? pos) (usage-err "seq" "missing operand")
+      :else
+      (try
+        (let [nums (mapv #(Long/parseLong %) pos)
+              [start step end] (case (count nums)
+                                 1 [1 1 (first nums)]
+                                 2 [(first nums) 1 (second nums)]
+                                 3 [(first nums) (second nums) (nth nums 2)]
+                                 (throw (ex-info "too many operands" {})))
+              sep (:separator opts)
+              positive-step? (pos? step)
+              values (loop [v start acc []]
+                       (cond
+                         (zero? step) acc
+                         (and positive-step? (> v end)) acc
+                         (and (not positive-step?) (< v end)) acc
+                         :else (recur (+ v step) (conj acc v))))]
+          (ok (str (str/join sep values) (when (seq values) "\n"))))
+        (catch Throwable t
+          (usage-err "seq" (.getMessage t)))))))
+
+;; ============================================================================
+;; test / [ — file-and-string predicates
+;; ============================================================================
+
+(defn- test-eval
+  "Evaluate a parsed test/[ argv. Returns true/false. Throws on
+   malformed expression."
+  [args fs]
+  (let [n (count args)]
+    (cond
+      (zero? n) false
+      ;; Single arg: true iff non-empty
+      (= 1 n)
+      (not (= "" (first args)))
+
+      ;; Two args: -OP operand
+      (= 2 n)
+      (let [[op a] args]
+        (case op
+          "!"  (not (test-eval [a] fs))
+          "-z" (= "" a)
+          "-n" (not (= "" a))
+          "-e" (boolean (fs/exists? fs a))
+          "-f" (= :file (:type (fs/stat fs a)))
+          "-d" (= :dir  (:type (fs/stat fs a)))
+          "-h" (= :symlink (:type (fs/stat fs a)))
+          "-L" (= :symlink (:type (fs/stat fs a)))
+          "-r" (boolean (fs/exists? fs a))   ;; perms ignored in v1
+          "-w" (boolean (fs/exists? fs a))
+          "-x" (boolean (fs/exists? fs a))
+          "-s" (let [s (fs/stat fs a)]
+                 (and s (pos? (or (:size s) 0))))
+          (throw (ex-info (str "test: unary op required, got: " op) {}))))
+
+      ;; Three args: a OP b
+      (= 3 n)
+      (let [[a op b] args]
+        (case op
+          "="   (= a b)
+          "=="  (= a b)
+          "!="  (not= a b)
+          "-eq" (= (Long/parseLong a) (Long/parseLong b))
+          "-ne" (not= (Long/parseLong a) (Long/parseLong b))
+          "-lt" (< (Long/parseLong a) (Long/parseLong b))
+          "-le" (<= (Long/parseLong a) (Long/parseLong b))
+          "-gt" (> (Long/parseLong a) (Long/parseLong b))
+          "-ge" (>= (Long/parseLong a) (Long/parseLong b))
+          "-a"  (and (test-eval [a] fs) (test-eval [b] fs))
+          "-o"  (or (test-eval [a] fs) (test-eval [b] fs))
+          (throw (ex-info (str "test: unknown binary op: " op) {}))))
+
+      :else
+      (throw (ex-info (str "test: too many arguments (got " n ")") {})))))
+
+(defn test-fn
+  "POSIX test / `[`. Exit 0 = true, 1 = false, 2 = malformed.
+
+   Supports the common subset:
+     -z STR / -n STR
+     -e/-f/-d/-h/-r/-w/-x/-s FILE
+     STR = STR  / STR == STR / STR != STR
+     INT -eq -ne -lt -le -gt -ge INT
+     EXPR -a EXPR / EXPR -o EXPR / ! EXPR
+
+   Invoked as `[ ... ]` muschel.exec strips the closing `]` for us."
+  [argv fs _env]
+  (let [args (vec (rest argv))
+        ;; `[ ... ]` form: drop the trailing literal `]`
+        args (if (and (= "[" (first argv)) (= "]" (peek args)))
+               (pop args)
+               args)]
+    (try
+      (if (test-eval args fs)
+        {:stdout "" :stderr "" :exit 0}
+        {:stdout "" :stderr "" :exit 1})
+      (catch Throwable t
+        (usage-err (or (first argv) "test") (.getMessage t))))))
+
+;; ============================================================================
+;; sed — basic substitution + simple addresses
+;; ============================================================================
+
+(defn- parse-sed-script
+  "Translate a sed script string into a vector of `{:addr ... :op ...}`
+   commands. Supported ops: s (substitute), d (delete), p (print).
+   Addresses: line number, `$` (last), `/REGEX/`, or none."
+  [^String script]
+  (let [scripts (str/split script #";")]
+    (mapv
+     (fn [s]
+       (let [s (str/triml s)
+             [addr rest-s]
+             (cond
+               (re-find #"^(\d+)" s)
+               (let [[_ n] (re-find #"^(\d+)" s)]
+                 [{:type :line :n (Long/parseLong n)} (subs s (count n))])
+               (str/starts-with? s "$")
+               [{:type :last} (subs s 1)]
+               (str/starts-with? s "/")
+               (let [end (.indexOf s "/" 1)]
+                 (if (neg? end)
+                   [nil s]
+                   [{:type :regex :pat (subs s 1 end)} (subs s (inc end))]))
+               :else [nil s])
+             rest-s (str/triml rest-s)
+             op (first rest-s)]
+         (case op
+           \s
+           (let [sep (.charAt ^String rest-s 1)
+                 ;; Split on the separator (which is char-2). e.g. `s/A/B/g`
+                 parts (str/split (subs rest-s 2) (re-pattern (java.util.regex.Pattern/quote (str sep))) 3)]
+             {:addr addr :op :s
+              :pat   (first parts)
+              :repl  (second parts)
+              :flags (or (nth parts 2 nil) "")})
+           \d {:addr addr :op :d}
+           \p {:addr addr :op :p}
+           {:addr addr :op :unknown :raw rest-s})))
+     scripts)))
+
+(defn- sed-addr-match? [{:keys [type n pat] :as _addr} line line-idx total]
+  (case type
+    nil      true
+    :line    (= n line-idx)
+    :last    (= line-idx total)
+    :regex   (boolean (re-find (re-pattern pat) line))))
+
+(defn- sed-do-substitute [line {:keys [pat repl flags]}]
+  (let [flags (or flags "")
+        case-insensitive? (str/includes? flags "i")
+        global?           (str/includes? flags "g")
+        pat-flags (cond-> 0
+                    case-insensitive? (bit-or java.util.regex.Pattern/CASE_INSENSITIVE))
+        re (java.util.regex.Pattern/compile pat pat-flags)
+        m  (.matcher re ^String line)]
+    (if global?
+      (.replaceAll m repl)
+      (.replaceFirst m repl))))
+
+(defn sed
+  "POSIX sed, subset:
+     s/PAT/REPL/[gi]            substitute
+     /PAT/d   N d   $ d         delete line
+     /PAT/p   N p   $ p         print line (with -n: only matches)
+   Flags: -n quiet, -e SCRIPT (repeatable), -i (in-place)."
+  [argv fs env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-n" "--quiet"]
+                         ["-e" "--expression SCRIPT"
+                          :assoc-fn (fn [m k v] (update m k (fnil conj []) v))
+                          :default  []]
+                         ["-i" "--in-place"]])]
+    (cond
+      err (usage-err "sed" err)
+      :else
+      (let [e-scripts (:expression opts)
+            [script-s files]
+            (if (seq e-scripts)
+              [(str/join ";" e-scripts) pos]
+              (if (seq pos)
+                [(first pos) (rest pos)]
+                ["" []]))
+            cmds (parse-sed-script script-s)
+            stdin (or (:stdin env) "")
+            stderr (volatile! "")
+            any-err? (volatile! false)
+            process-text
+            (fn [^String content]
+              (let [lines (str/split-lines content)
+                    total (count lines)
+                    out (StringBuilder.)]
+                (loop [i 0]
+                  (when (< i total)
+                    (let [orig (nth lines i)
+                          line (volatile! orig)
+                          deleted? (volatile! false)
+                          force-print? (volatile! false)]
+                      (doseq [cmd cmds :when (not @deleted?)]
+                        (when (sed-addr-match? (:addr cmd) @line (inc i) total)
+                          (case (:op cmd)
+                            :s (vreset! line (sed-do-substitute @line cmd))
+                            :d (vreset! deleted? true)
+                            :p (vreset! force-print? true)
+                            nil)))
+                      (when (or @force-print?
+                                (and (not (:quiet opts)) (not @deleted?)))
+                        (.append out ^String @line)
+                        (.append out "\n")))
+                    (recur (inc i))))
+                (.toString out)))]
+        (if (seq files)
+          (let [results
+                (mapv
+                 (fn [f]
+                   (if-let [c (fs/read-file fs f)]
+                     (let [out (process-text c)]
+                       (when (:in-place opts)
+                         (with-open [^java.io.OutputStream o (fs/open-sink fs f false)]
+                           (.write o (.getBytes ^String out "UTF-8"))))
+                       (if (:in-place opts) nil out))
+                     (do (vswap! stderr str "sed: " f ": No such file or directory\n")
+                         (vreset! any-err? true)
+                         nil)))
+                 files)]
+            {:stdout (apply str (remove nil? results))
+             :stderr @stderr
+             :exit (if @any-err? 1 0)})
+          (ok (process-text stdin)))))))
+
+;; ============================================================================
+;; awk — minimal subset: `{print …}` / `/PAT/ {…}` / `NR==N`
+;; ============================================================================
+
+(defn- awk-split-line [^String line ^String fs-pat]
+  (cond
+    (= "" line) [""]
+    (= " " fs-pat)
+    (vec (str/split (str/trim line) #"\s+"))
+    :else
+    (vec (str/split line (re-pattern (java.util.regex.Pattern/quote fs-pat))))))
+
+(defn- awk-field [fields ^long n]
+  (cond
+    (zero? n) (str/join " " fields)
+    (or (neg? n) (> n (count fields))) ""
+    :else (nth fields (dec n))))
+
+(defn- awk-eval-action
+  "Tiny action evaluator. Supports `print` with comma-separated
+   $N | $0 | NR | NF | string-literal | int-literal args."
+  [action {:keys [fields nr nf out]}]
+  (let [action (str/trim action)]
+    (when (str/starts-with? action "print")
+      (let [args-s (str/trim (subs action 5))
+            args   (if (= "" args-s)
+                     [(str/join " " fields)]
+                     (mapv str/trim (str/split args-s #",")))
+            tokens
+            (mapv (fn [a]
+                    (cond
+                      (re-matches #"\$\d+" a)
+                      (awk-field fields (Long/parseLong (subs a 1)))
+                      (= "NR" a) (str nr)
+                      (= "NF" a) (str nf)
+                      (re-matches #"\".*\"" a) (subs a 1 (dec (count a)))
+                      (re-matches #"\d+" a) a
+                      :else a))
+                  args)]
+        (.append ^StringBuilder out ^String (str/join " " tokens))
+        (.append ^StringBuilder out "\n")))))
+
+(defn- awk-parse-program [^String prog]
+  "Split program into pattern/action rules. Rule shape:
+     {:pattern :all | {:regex ...} | {:nr-eq N} | nil
+      :action  STRING (the inside-{}-text)}
+   With no `{ }` the implicit action is `{print}`."
+  (let [prog (str/trim prog)
+        rules
+        (loop [s prog acc []]
+          (let [s (str/triml s)]
+            (cond
+              (empty? s) acc
+
+              (str/starts-with? s "/")
+              (let [end (.indexOf s "/" 1)]
+                (if (neg? end)
+                  acc
+                  (let [pat (subs s 1 end)
+                        rest-s (str/triml (subs s (inc end)))]
+                    (if (str/starts-with? rest-s "{")
+                      (let [close (.indexOf rest-s "}")]
+                        (recur (subs rest-s (inc close))
+                               (conj acc {:pattern {:regex pat}
+                                          :action (subs rest-s 1 close)})))
+                      (recur rest-s
+                             (conj acc {:pattern {:regex pat}
+                                        :action "print"}))))))
+
+              (str/starts-with? s "{")
+              (let [close (.indexOf s "}")]
+                (recur (subs s (inc close))
+                       (conj acc {:pattern :all
+                                  :action (subs s 1 close)})))
+
+              (re-find #"^NR==\d+" s)
+              (let [[_ n] (re-find #"^NR==(\d+)" s)
+                    rest-s (str/triml (subs s (count (str "NR==" n))))]
+                (if (str/starts-with? rest-s "{")
+                  (let [close (.indexOf rest-s "}")]
+                    (recur (subs rest-s (inc close))
+                           (conj acc {:pattern {:nr-eq (Long/parseLong n)}
+                                      :action (subs rest-s 1 close)})))
+                  (recur rest-s
+                         (conj acc {:pattern {:nr-eq (Long/parseLong n)}
+                                    :action "print"}))))
+
+              :else
+              ;; Skip unrecognised input rather than crash.
+              (recur "" acc))))]
+    rules))
+
+(defn- awk-pattern-match? [pattern line nr]
+  (cond
+    (= :all pattern) true
+    (nil? pattern) true
+    (:regex pattern) (boolean (re-find (re-pattern (:regex pattern)) line))
+    (:nr-eq pattern) (= (:nr-eq pattern) nr)
+    :else false))
+
+(defn awk
+  "Minimal awk:
+     awk '/PAT/'         print matching lines (implicit `{print}`)
+     awk '/PAT/ {…}'     run action on matches
+     awk '{print $N}'    field-printing
+     awk 'NR==N'         N-th line
+   -F SEP sets the field separator (default whitespace)."
+  [argv fs env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-F" "--field-separator SEP" :default " "]])]
+    (cond
+      err (usage-err "awk" err)
+      (empty? pos) (usage-err "awk" "missing program")
+      :else
+      (let [prog (first pos)
+            ;; File args after the program; stdin if none. Reads go
+            ;; through the FS handle so awk respects containment.
+            files (rest pos)
+            rules (awk-parse-program prog)
+            stdin (or (:stdin env) "")
+            content (if (seq files)
+                      (str/join "\n" (map (fn [f] (or (fs/read-file fs f) "")) files))
+                      stdin)
+            lines (str/split-lines content)
+            out (StringBuilder.)]
+        (doseq [[idx ^String line] (map-indexed vector lines)]
+          (let [nr (inc idx)
+                fields (awk-split-line line (:field-separator opts))
+                nf (count fields)]
+            (doseq [{:keys [pattern action]} rules
+                    :when (awk-pattern-match? pattern line nr)]
+              (awk-eval-action action {:fields fields :nr nr :nf nf :out out}))))
+        (ok (.toString out))))))
+
+;; ============================================================================
 ;; Registry — the canonical builtin map
 ;; ============================================================================
 
@@ -2021,16 +2565,26 @@
 
 (def standard
   "Full standard set: read builtins plus write builtins (touch, mkdir,
-   rmdir, rm, cp, mv, chmod, ln, tee). All routed through the FS for
-   containment. Use as :builtins on a BuiltinHost when the agent
-   should be able to author files in the sandbox."
+   rmdir, rm, cp, mv, chmod, ln, tee), plus text/path tools (sed, awk,
+   printf, env, date, seq, basename, dirname, realpath, test/[).
+   All routed through the FS for containment."
   (merge standard-read-only
-         {"touch" touch
-          "mkdir" mkdir
-          "rmdir" rmdir
-          "rm"    rm
-          "cp"    cp
-          "mv"    mv
-          "chmod" chmod
-          "ln"    ln
-          "tee"   tee}))
+         {"touch"    touch
+          "mkdir"    mkdir
+          "rmdir"    rmdir
+          "rm"       rm
+          "cp"       cp
+          "mv"       mv
+          "chmod"    chmod
+          "ln"       ln
+          "tee"      tee
+          ;; text + path
+          "sed"      sed
+          "awk"      awk
+          "printf"   printf
+          "env"      env-fn
+          "date"     date-fn
+          "seq"      seq-fn
+          "basename" basename
+          "dirname"  dirname
+          "realpath" realpath}))
