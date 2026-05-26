@@ -777,9 +777,13 @@
     (cond
       (str/blank? s) [0.0 false]
       :else
-      (let [;; nan / inf
-            m-nan (re-find #"^[+-]?(?i:nan)" s)
-            m-inf (re-find #"^([+-]?)(?i:infinity|inf)" s)
+      (let [;; nan / inf — JS RegExp doesn't accept `(?i:…)` inline-flag
+            ;; groups, so we spell the case-insensitive letter set out
+            ;; with character classes. Identical match set on JVM.
+            m-nan (re-find #"^[+-]?[nN][aA][nN]" s)
+            m-inf (re-find
+                   #"^([+-]?)(?:[iI][nN][fF][iI][nN][iI][tT][yY]|[iI][nN][fF])"
+                   s)
             m-hex (re-find #"^([+-]?)0[xX]([0-9a-fA-F]+)" s)
             m-dec (re-find #"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?" s)]
         (cond
