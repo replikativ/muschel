@@ -22,7 +22,7 @@
             [muschel.parse :as parse]
             [muschel.permit :as permit]
             [muschel.session :as session]
-            #?(:clj  [muschel.host.builtin :as host.builtin])
+            [muschel.host.builtin :as host.builtin]
             #?(:clj  [muschel.host.jvm :as host.jvm])
             #?(:clj  [muschel.fs.disk :as fs.disk])))
 
@@ -104,16 +104,19 @@
       contained sandbox."
      host.jvm/make))
 
-#?(:clj
-   (def builtin-host
-     "Build a BuiltinHost — wraps a fallback host with FS-aware builtin
-      dispatch. This is the muschel sandbox model. Options:
-        :fs                 — required, a muschel.fs handle
-        :fallback-host      — required, e.g. `(jvm-host)`
-        :builtins           — map cmd-name → fn (default: posix/standard)
-        :fallback-allowlist — set of cmd-names the fallback may run
-                              (default empty; agents only see builtins)"
-     host.builtin/make))
+(def builtin-host
+  "Build a BuiltinHost — wraps a fallback host with FS-aware builtin
+   dispatch. This is the muschel sandbox model. Cross-platform
+   (JVM + Node + browser).
+
+   Options:
+     :fs                 — required, a muschel.fs handle
+     :fallback-host      — required, e.g. `(jvm-host)`, `(node-host)`,
+                            `(browser-host)`
+     :builtins           — map cmd-name → fn (default: posix/standard)
+     :fallback-allowlist — set of cmd-names the fallback may run
+                            (default empty; agents only see builtins)"
+  host.builtin/make)
 
 ;; ============================================================================
 ;; Filesystems

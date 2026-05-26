@@ -40,6 +40,7 @@
             #?(:clj [muschel.host.jvm :as host.jvm])
             [muschel.parse :as parse]
             [muschel.permit :as permit]
+            [muschel.runtime :as rt]
             [muschel.session :as session]
             [muschel.trace :as trace]))
 
@@ -2560,3 +2561,11 @@
               :stderr (host/sink->string h err-buf)}
        permit (assoc :permit permit)
        trace  (assoc :trace trace)))))
+
+;; Late-bound registration: lets the `sh` builtin call back into the
+;; executor without a static require of `muschel.exec` from
+;; `muschel.builtins.posix` (which would form a cycle), and without
+;; the JVM-only `(require …) + (resolve …)` trick (which CLJS forbids).
+(rt/register! {:parse   parse/parse
+               :run     run-and-capture
+               :new-env env/new-env})

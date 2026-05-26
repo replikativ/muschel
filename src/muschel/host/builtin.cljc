@@ -32,10 +32,45 @@
 
    All other Host operations (file I/O, pipes, async, buffers) are
    delegated to `:fallback-host`. The builtin host's only override
-   is `-spawn`. Hosts compose."
-  (:require [clojure.string :as str]
+   is `-spawn`. Hosts compose.
+
+   ## Cross-platform
+
+   This namespace compiles to JVM, ClojureScript and (via the :clj
+   branch) babashka. The few platform-specific bits — currentTimeMillis,
+   the executable-bit octal mask, `/dev/null` stream impls — sit
+   behind reader conditionals."
+  (:require [muschel.builtins.awk-compat :as cc]
+            [muschel.builtins.posix :as posix]
+            [muschel.fs :as fs]
+            [muschel.fs.traced :as fs.traced]
             [muschel.host :as host]
-            [muschel.fs :as fs]))
+            [muschel.trace :as trace]))
+
+;; ============================================================================
+;; Platform helpers
+;; ============================================================================
+
+(defn- now-ms []
+  #?(:clj  (System/currentTimeMillis)
+     :cljs (.now js/Date)))
+
+(defn- budget-ex? [t]
+  (and (instance? #?(:clj clojure.lang.ExceptionInfo
+                     :cljs cljs.core/ExceptionInfo) t)
+       (:muschel/budget (ex-data t))))
+
+;; `/dev/null` semantics, portably: we want any agent writing to
+;; `2>/dev/null` to succeed and any read from `< /dev/null` to yield
+;; empty. JVM previously used java.io stream impls; here we delegate
+;; to the fallback host's neutral buffers — a write-only string sink
+;; (writes are accepted but never read) and an empty string source.
+(defn- dev-null-sink   [fallback-host] (host/-string-sink   fallback-host))
+(defn- dev-null-source [fallback-host] (host/-string-source fallback-host ""))
+
+(defn- not-in-root-ex [path verb]
+  (ex-info (str path " (not in muschel FS root or " verb ")")
+           {:type ::not-in-root :path path}))
 
 ;; ============================================================================
 ;; Builtin invocation
@@ -57,7 +92,7 @@
   [{:keys [dir extra-env in interrupt-fn trace]} fallback-host fallback-fs]
   (let [stdin (when in
                 (try (host/-read-all-string fallback-host in)
-                     (catch Throwable _ nil)))]
+                     (catch #?(:clj Throwable :cljs :default) _ nil)))]
     (cond-> {:cwd  (or dir (fs/cwd fallback-fs))
              :vars (or extra-env {})}
       stdin        (assoc :stdin stdin)
@@ -68,52 +103,42 @@
   "Run a builtin fn synchronously, write its stdout/stderr to the
    sinks, return a wait-fn that yields the exit code.
 
-   Binds muschel.builtins.posix/*host* / *session* / *depth* around
-   the call so builtins that need to dispatch recursively (e.g. `sh`
-   re-running its -c script, or `find -exec`) can re-enter through
-   the same gates."
+   Binds `muschel.builtins.posix/*host*` / `*session*` / `*depth*`
+   around the call so builtins that need to dispatch recursively
+   (e.g. `sh` re-running its -c script, `find -exec`) can re-enter
+   through the same gates."
   [self fallback-host builtin-fn opts fs]
-  (require 'muschel.builtins.posix)
-  (require 'muschel.trace)
-  (require 'muschel.fs.traced)
   (let [argv (argv-of opts)
         ;; If the caller installed a trace state, wrap fs so every
-        ;; protocol op the builtin makes is recorded. The wrap is per
-        ;; call so it doesn't leak between invocations.
-        wrap-fn (resolve 'muschel.fs.traced/wrap)
-        fs (if-let [ts (:trace opts)] (wrap-fn fs ts) fs)
+        ;; protocol op the builtin makes is recorded. Wrap is per-call
+        ;; so it doesn't leak between invocations.
+        fs   (if-let [ts (:trace opts)] (fs.traced/wrap fs ts) fs)
         env  (build-env opts fallback-host fs)
-        host-var    (resolve 'muschel.builtins.posix/*host*)
-        session-var (resolve 'muschel.builtins.posix/*session*)
-        depth-var   (resolve 'muschel.builtins.posix/*depth*)
-        record-tool! (resolve 'muschel.trace/record-tool!)
-        started-at  (System/currentTimeMillis)
-        {:keys [stdout stderr exit]}
+        started-at (now-ms)
+        result
         (try
-          (push-thread-bindings
-           {host-var    self
-            session-var (:session opts)
-            depth-var   (or @depth-var 0)})
-          (try (builtin-fn argv fs env)
-               (finally (pop-thread-bindings)))
-          (catch Throwable t
+          (binding [posix/*host*    self
+                    posix/*session* (:session opts)
+                    posix/*depth*   (or posix/*depth* 0)]
+            (builtin-fn argv fs env))
+          (catch #?(:clj Throwable :cljs :default) t
             ;; Don't swallow resource-budget interrupts — those need
             ;; to propagate so the caller's run-and-capture can abort.
-            (when (and (instance? clojure.lang.ExceptionInfo t)
-                       (:muschel/budget (ex-data t)))
-              (throw t))
+            (when (budget-ex? t) (throw t))
             {:stdout ""
-             :stderr (str (:cmd opts) ": " (.getMessage t) "\n")
-             :exit 1}))]
-    ;; Record into the trace state if one is installed on the env.
-    (record-tool! (:trace opts)
-                  {:type :tool
-                   :name (:cmd opts)
-                   :argv argv
-                   :exit (or exit 0)
-                   :stdout-bytes (count (or stdout ""))
-                   :stderr-bytes (count (or stderr ""))
-                   :duration-ms (- (System/currentTimeMillis) started-at)})
+             :stderr (str (:cmd opts) ": "
+                          (or (ex-message t) (str t)) "\n")
+             :exit 1}))
+        {:keys [stdout stderr exit]} result]
+    (trace/record-tool!
+     (:trace opts)
+     {:type :tool
+      :name (:cmd opts)
+      :argv argv
+      :exit (or exit 0)
+      :stdout-bytes (count (or stdout ""))
+      :stderr-bytes (count (or stderr ""))
+      :duration-ms (- (now-ms) started-at)})
     (host/write-string! fallback-host (:out opts) (or stdout ""))
     (host/write-string! fallback-host (:err opts) (or stderr ""))
     {:wait   (fn [] (or exit 0))
@@ -122,10 +147,38 @@
 (defn- refuse!
   "Write a denial message to :err and return exit 126."
   [fallback-host opts reason]
-  (let [msg (format "muschel: %s: %s\n" (:cmd opts) reason)]
+  (let [msg (cc/fmt-many "muschel: %s: %s\n" [(:cmd opts) reason])]
     (host/write-string! fallback-host (:err opts) msg))
   {:wait   (fn [] 126)
    :handle ::refused})
+
+;; ============================================================================
+;; File-info translation
+;; ============================================================================
+
+(defn- stat->info
+  "Translate the muschel.fs `:stat` shape into the predicate-style
+   map the rest of muschel (test/[, redirect open-checks, …) consumes.
+   Outside-root or missing paths return `:exists? false`, matching the
+   jvm host's behaviour for a missing file."
+  [s]
+  (if s
+    {:exists?     true
+     :file?       (= :file (:type s))
+     :dir?        (= :dir  (:type s))
+     :symlink?    (= :symlink (:type s))
+     ;; muschel.fs doesn't model unix-style perm bits richly enough
+     ;; to distinguish r/w/x. Treat all in-root files as readable +
+     ;; writable; executable only if the FS reports it via mode bits.
+     :readable?   true
+     :writable?   true
+     ;; 0o111 = 73 (any-exec mask). Use a decimal literal so CLJS
+     ;; doesn't choke on the JVM-style octal `0111`.
+     :executable? (when-let [m (:perms-mode s)]
+                    (pos? (bit-and m 73)))
+     :size        (:size s)
+     :mtime-ms    (:mtime-ms s)}
+    {:exists? false}))
 
 ;; ============================================================================
 ;; Host wrapping
@@ -134,12 +187,12 @@
 (defrecord BuiltinHost [fallback-host builtins fs fallback-allowlist]
   host/Host
   ;; ---- buffers ----
-  (-write-string!    [_ sink s] (host/-write-string! fallback-host sink s))
-  (-read-all-string  [_ source] (host/-read-all-string fallback-host source))
-  (-close!           [_ io]     (host/-close! fallback-host io))
-  (-string-sink      [_]        (host/-string-sink fallback-host))
-  (-sink->string     [_ sink]   (host/-sink->string fallback-host sink))
-  (-string-source    [_ s]      (host/-string-source fallback-host s))
+  (-write-string!    [_ sink s] (host/-write-string!    fallback-host sink s))
+  (-read-all-string  [_ source] (host/-read-all-string  fallback-host source))
+  (-close!           [_ io]     (host/-close!           fallback-host io))
+  (-string-sink      [_]        (host/-string-sink      fallback-host))
+  (-sink->string     [_ sink]   (host/-sink->string     fallback-host sink))
+  (-string-source    [_ s]      (host/-string-source    fallback-host s))
 
   ;; ---- files ---- routed through FS for containment.
   ;;
@@ -148,58 +201,32 @@
   ;; FS resolves each path; if it lands outside the root, ops fail
   ;; with nil — same behaviour as opening a non-existent file. We do
   ;; NOT delegate to the fallback host: a leaked path would otherwise
-  ;; reach raw java.io and read/write real disk.
+  ;; reach raw java.io / fs and read/write real disk.
   ;;
   ;; Special case: `/dev/null` is the universal write-and-discard /
   ;; read-zero-bytes sink. Agents reach for `2>/dev/null` in almost
   ;; every pipeline. Refusing it would force `2>&1 | grep -v error`
   ;; gymnastics. We model it as a stream that swallows writes /
   ;; produces no bytes, regardless of FS containment.
-  (-open-file-sink [_ p append?]
+  (-open-file-sink [_ p _append?]
     (cond
-      (= "/dev/null" p)
-      (proxy [java.io.OutputStream] []
-        (write
-          ([_b])
-          ([_b _o _l]))
-        (flush []))
+      (= "/dev/null" p) (dev-null-sink fallback-host)
       :else
-      (or (fs/-open-sink fs p append?)
-          (throw (java.io.FileNotFoundException.
-                  (str p " (not in muschel FS root or not writable)"))))))
+      (or (fs/-open-sink fs p _append?)
+          (throw (not-in-root-ex p "not writable")))))
   (-open-file-source [_ p]
     (cond
-      (= "/dev/null" p)
-      (java.io.ByteArrayInputStream. (byte-array 0))
+      (= "/dev/null" p) (dev-null-source fallback-host)
       :else
       (or (fs/-open-source fs p)
-          (throw (java.io.FileNotFoundException.
-                  (str p " (not in muschel FS root or missing)"))))))
+          (throw (not-in-root-ex p "missing")))))
   (-file-info [_ p]
-    ;; Translate the muschel.fs stat shape into the predicate-style
-    ;; map the rest of muschel (test/[, redirect open-checks, …)
-    ;; consume. Outside-root or missing paths return `:exists? false`,
-    ;; matching the jvm host's behaviour for a missing file.
     (cond
       (= "/dev/null" p)
       {:exists? true :file? true :dir? false :symlink? false
        :readable? true :writable? true :executable? false :size 0}
       :else
-      (if-let [s (fs/-stat fs p)]
-        {:exists?     true
-         :file?       (= :file (:type s))
-         :dir?        (= :dir  (:type s))
-         :symlink?    (= :symlink (:type s))
-         ;; muschel.fs doesn't model unix-style perm bits richly enough
-         ;; to distinguish r/w/x. Treat all in-root files as readable +
-         ;; writable; executable only if the FS reports it via mode bits.
-         :readable?   true
-         :writable?   true
-         :executable? (when-let [m (:perms-mode s)]
-                        (pos? (bit-and m 0111)))
-         :size        (:size s)
-         :mtime-ms    (:mtime-ms s)}
-        {:exists? false})))
+      (stat->info (fs/-stat fs p))))
   (-read-file [_ p]
     (cond
       (= "/dev/null" p) ""
@@ -223,9 +250,10 @@
         ;; Refuse anything else.
         :else
         (refuse! fallback-host opts
-                 (format "not a builtin and not in fallback-allowlist (allowed: %s)"
-                         (pr-str (sort (concat (keys builtins)
-                                               fallback-allowlist))))))))
+                 (cc/fmt-many
+                  "not a builtin and not in fallback-allowlist (allowed: %s)"
+                  [(pr-str (sort (concat (keys builtins)
+                                         fallback-allowlist)))])))))
 
   ;; ---- async ----
   (-async [_ thunk] (host/-async fallback-host thunk))
@@ -238,7 +266,7 @@
      :fs                   the muschel.fs/FS handle the builtins read
                            through (containment + cwd)
      :fallback-host        a host impl to delegate non-builtin /
-                           non-spawn ops to (typically jvm host)
+                           non-spawn ops to (typically jvm/node host)
 
    Optional:
      :builtins             map of cmd-name → builtin-fn (default:
@@ -250,8 +278,6 @@
   {:pre [(some? fs) (some? fallback-host)]}
   (->BuiltinHost
    fallback-host
-   (or builtins
-       (do (require 'muschel.builtins.posix)
-           @(resolve 'muschel.builtins.posix/standard-read-only)))
+   (or builtins posix/standard-read-only)
    fs
    fallback-allowlist))

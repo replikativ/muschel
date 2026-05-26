@@ -57,7 +57,8 @@
             [muschel.builtins.awk :as awk-impl]
             [muschel.builtins.awk-compat :as cc]
             [muschel.fs :as fs]
-            [muschel.host :as host]))
+            [muschel.host :as host]
+            [muschel.runtime :as rt]))
 
 ;; ============================================================================
 ;; Dynamic context — set by muschel.host.builtin around every dispatch
@@ -175,7 +176,7 @@
             :symlink "l"
             "?")
         size (or (:size entry) 0)]
-    (format "%s %10d %s" t size (:name entry))))
+    (cc/fmt-many "%s %10d %s" [t size (:name entry)])))
 
 (defn ls
   "POSIX ls, subset: -a (show dotfiles), -l (long format), -1
@@ -266,10 +267,10 @@
                                   num-nb?
                                   (if is-blank? shown
                                       (do (vswap! n inc)
-                                          (format "%6d\t%s" @n shown)))
+                                          (cc/fmt-many "%6d\t%s" [@n shown])))
                                   num-all?
                                   (do (vswap! n inc)
-                                      (format "%6d\t%s" @n shown))
+                                      (cc/fmt-many "%6d\t%s" [@n shown]))
                                   :else shown)]
                     (.append out ^String labeled)
                     (when trailing-nl? (.append out "\n"))))))
@@ -296,8 +297,9 @@
                   (vreset! any-err? true))
                 (process-content (if (string? bytes)
                                    bytes
-                                   (String. ^bytes bytes "UTF-8")))))))
-        {:stdout (.toString out)
+                                   #?(:clj (String. ^bytes bytes "UTF-8")
+                                      :cljs (str bytes))))))))
+        {:stdout (cc/sbstr out)
          :stderr @stderr
          :exit (if @any-err? 1 0)}))))
 
@@ -431,15 +433,34 @@
    ["-c" "--bytes"]
    ["-m" "--chars"]])
 
+(defn- utf8-byte-count
+  "Byte length of `s` when encoded as UTF-8. JVM uses java.lang.String#getBytes;
+   CLJS uses a portable Unicode walk (1-byte for U+0000..7F, 2-byte to U+07FF,
+   3-byte to U+FFFF, 4-byte for surrogate pairs)."
+  [^String s]
+  #?(:clj  (alength (.getBytes s "UTF-8"))
+     :cljs (let [n (.-length s)]
+             (loop [i 0, acc 0]
+               (if (>= i n)
+                 acc
+                 (let [c (.charCodeAt s i)]
+                   (cond
+                     (< c 0x80)   (recur (inc i) (+ acc 1))
+                     (< c 0x800)  (recur (inc i) (+ acc 2))
+                     ;; high surrogate — pair codes a 4-byte codepoint.
+                     (and (>= c 0xD800) (<= c 0xDBFF))
+                     (recur (+ i 2) (+ acc 4))
+                     :else        (recur (inc i) (+ acc 3)))))))))
+
 (defn- count-stats
   "Count lines (newline occurrences — GNU semantics, so trailing-nl-less
    content yields one fewer line than chunks), words (whitespace-separated
    runs), bytes (UTF-8), and chars (codepoints / String length)."
   [^String s]
-  (let [byte-count (count (.getBytes s "UTF-8"))
+  (let [byte-count (utf8-byte-count s)
         word-count (count (re-seq #"\S+" s))
         line-count (count (filter #(= \newline %) s))
-        char-count (.length s)]
+        char-count #?(:clj (.length s) :cljs (.-length s))]
     {:lines line-count :words word-count :bytes byte-count :chars char-count}))
 
 (defn wc
@@ -471,10 +492,10 @@
                   files)
             fmt-row (fn [{:keys [lines words bytes chars name]}]
                       (str/trim
-                       (str (when show-l? (format "%8d " lines))
-                            (when show-w? (format "%8d " words))
-                            (when show-c? (format "%8d " bytes))
-                            (when show-m? (format "%8d " chars))
+                       (str (when show-l? (cc/fmt1 "%8d " lines))
+                            (when show-w? (cc/fmt1 "%8d " words))
+                            (when show-c? (cc/fmt1 "%8d " bytes))
+                            (when show-m? (cc/fmt1 "%8d " chars))
                             (when (and name (not= "-" name)) name))))
             total (when (> (count rows) 1)
                     (reduce (fn [acc r]
@@ -517,31 +538,30 @@
            2)
 
       (:command opts)
-      #?(:clj
-         (let [script (:command opts)
-               host   *host*]
-           (if-not host
-             (err "sh: no host available for nested dispatch" 1)
-             ;; Dynamic require/resolve breaks an exec↔posix cycle on
-             ;; JVM. CLJS doesn't allow runtime require, so the CLJS
-             ;; branch refuses; once a registry pattern is wired
-             ;; (see posix.cljc docstring step 1) we'll lift this.
-             (let [_         (require 'muschel.parse 'muschel.exec 'muschel.env)
-                   parse-fn  (resolve 'muschel.parse/parse)
-                   run-fn    (resolve 'muschel.exec/run-and-capture)
-                   new-env   (resolve 'muschel.env/new-env)
-                   e0        (or env (new-env))
-                   ast       (parse-fn script)
-                   result    (binding [*depth* (inc *depth*)]
-                               (run-fn e0 ast
-                                       (cond-> {:host host}
-                                         *session* (assoc :session *session*))))]
-               {:stdout (or (:stdout result) "")
-                :stderr (or (:stderr result) "")
-                :exit   (or (:exit result) 0)})))
-         :cljs
-         (err "sh: recursive shell dispatch is not yet supported on CLJS"
-              1))
+      (let [script   (:command opts)
+            host     *host*
+            parse-fn @rt/parse-fn
+            run-fn   @rt/run-fn
+            new-env  @rt/new-env-fn]
+        (cond
+          (not host)
+          (err "sh: no host available for nested dispatch" 1)
+
+          (or (nil? parse-fn) (nil? run-fn) (nil? new-env))
+          (err (str "sh: muschel.exec is not loaded — recursive shell "
+                    "dispatch requires (require 'muschel.exec)")
+               1)
+
+          :else
+          (let [e0     (or env (new-env))
+                ast    (parse-fn script)
+                result (binding [*depth* (inc *depth*)]
+                         (run-fn e0 ast
+                                 (cond-> {:host host}
+                                   *session* (assoc :session *session*))))]
+            {:stdout (or (:stdout result) "")
+             :stderr (or (:stderr result) "")
+             :exit   (or (:exit result) 0)})))
 
       :else
       (err "sh: only -c SCRIPT mode is supported in muschel builtins" 2))))
@@ -560,7 +580,7 @@
         lines
         (mapv (fn [f]
                 (if-let [s (fs/stat fs f)]
-                  (format "%10d %s %s" (:size s) (name (or (:type s) :unknown)) f)
+                  (cc/fmt-many "%10d %s %s" [(:size s) (name (or (:type s) :unknown)) f])
                   (do
                     (vswap! stderr str "stat: cannot stat '" f "': No such file or directory\n")
                     (vreset! any-err? true)
@@ -645,9 +665,9 @@
             cmp (if (:numeric-sort opts)
                   (fn [a b]
                     (let [pa (try (parse-long (str/trim a))
-                                  (catch Exception _ #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))
+                                  (catch #?(:clj Exception :cljs :default) _ #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))
                           pb (try (parse-long (str/trim b))
-                                  (catch Exception _ #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))]
+                                  (catch #?(:clj Exception :cljs :default) _ #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))]
                       (compare pa pb)))
                   (fn [a b] (compare (key-fn a) (key-fn b))))
             sorted (sort cmp lines)
@@ -684,7 +704,7 @@
                        :else grouped)
             rendered (mapv (fn [{:keys [line n]}]
                              (if (:count opts)
-                               (format "%7d %s" n line)
+                               (cc/fmt-many "%7d %s" [n line])
                                line))
                            filtered)]
         {:stdout (str (str/join "\n" rendered)
@@ -1044,7 +1064,9 @@
       (nil? stat) []
       (not= :dir (:type stat)) [{:path root :type (:type stat) :depth 0}]
       :else
-      (loop [pending (conj clojure.lang.PersistentQueue/EMPTY {:path root :depth 0})
+      (loop [pending (conj #?(:clj clojure.lang.PersistentQueue/EMPTY
+                              :cljs cljs.core/PersistentQueue.EMPTY)
+                           {:path root :depth 0})
              acc     [{:path root :type :dir :depth 0}]]
         (if-let [{:keys [path depth]} (peek pending)]
           (let [pending  (pop pending)
@@ -1244,20 +1266,20 @@
   "POSIX character classes recognised in tr's SETs. Mapped to char
    sequences. `[:upper:]` and `[:lower:]` are the workhorses; we ship
    the common ones."
-  {"alpha"  (concat (map char (range (int \a) (inc (int \z))))
-                    (map char (range (int \A) (inc (int \Z)))))
-   "alnum"  (concat (map char (range (int \a) (inc (int \z))))
-                    (map char (range (int \A) (inc (int \Z))))
-                    (map char (range (int \0) (inc (int \9)))))
-   "digit"  (map char (range (int \0) (inc (int \9))))
-   "lower"  (map char (range (int \a) (inc (int \z))))
-   "upper"  (map char (range (int \A) (inc (int \Z))))
+  {"alpha"  (concat (map char (range 97 123))
+                    (map char (range 65 91)))
+   "alnum"  (concat (map char (range 97 123))
+                    (map char (range 65 91))
+                    (map char (range 48 58)))
+   "digit"  (map char (range 48 58))
+   "lower"  (map char (range 97 123))
+   "upper"  (map char (range 65 91))
    "space"  [\space \tab \newline \return \formfeed (char 11)]
    "blank"  [\space \tab]
    "punct"  (seq "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
-   "xdigit" (concat (map char (range (int \0) (inc (int \9))))
-                    (map char (range (int \a) (inc (int \f))))
-                    (map char (range (int \A) (inc (int \F)))))
+   "xdigit" (concat (map char (range 48 58))
+                    (map char (range 97 103))
+                    (map char (range 65 71)))
    "cntrl"  (concat (map char (range 0 32)) [(char 127)])
    "print"  (map char (range 32 127))
    "graph"  (map char (range 33 127))})
@@ -1482,20 +1504,30 @@
 ;; n, m are file lengths; our agent-facing files are small enough that
 ;; O(n·m) memory (an int array of (n+1)·(m+1)) is acceptable.
 
-(defn- lcs-table ^ints [a b]
+(defn- lcs-table
+  "Compute the LCS DP table for vectors `a` and `b`. Returns a
+   transient vector treated as a flat (n+1)·(m+1) row-major grid;
+   cross-platform (no int-array)."
+  [a b]
   (let [n    (count a)
         m    (count b)
-        cols (inc m)
-        t    (int-array (* (inc n) cols))]
-    (dotimes [i n]
-      (dotimes [j m]
-        (let [idx (+ (* (inc i) cols) (inc j))
-              up   (aget t (+ (* i cols) (inc j)))
-              left (aget t (+ (* (inc i) cols) j))]
-          (if (= (nth a i) (nth b j))
-            (aset-int t idx (inc (aget t (+ (* i cols) j))))
-            (aset-int t idx (max up left))))))
-    t))
+        cols (inc m)]
+    (loop [i 0
+           t (let [empty-row (vec (repeat (* (inc n) cols) 0))]
+               (transient empty-row))]
+      (if (= i n)
+        (persistent! t)
+        (recur (inc i)
+               (loop [j 0 t t]
+                 (if (= j m)
+                   t
+                   (let [idx (+ (* (inc i) cols) (inc j))
+                         up   (nth t (+ (* i cols) (inc j)))
+                         left (nth t (+ (* (inc i) cols) j))
+                         val  (if (= (nth a i) (nth b j))
+                                (inc (nth t (+ (* i cols) j)))
+                                (max up left))]
+                     (recur (inc j) (assoc! t idx val))))))))))
 
 (defn- diff-ops
   "Return a vector of [op line] pairs (`:keep`/`:del`/`:add`) tracing
@@ -1505,24 +1537,19 @@
         n    (count a)
         m    (count b)
         cols (inc m)
-        get-t (fn [i j] (aget ^ints t (+ (* i cols) j)))
-        out  (java.util.ArrayList.)]
-    (loop [i n j m]
+        get-t (fn [i j] (nth t (+ (* i cols) j)))]
+    (loop [i n j m acc (transient [])]
       (cond
         (and (pos? i) (pos? j) (= (nth a (dec i)) (nth b (dec j))))
-        (do (.add out [:keep (nth a (dec i))])
-            (recur (dec i) (dec j)))
+        (recur (dec i) (dec j) (conj! acc [:keep (nth a (dec i))]))
 
         (and (pos? j) (or (zero? i) (>= (get-t i (dec j)) (get-t (dec i) j))))
-        (do (.add out [:add (nth b (dec j))])
-            (recur i (dec j)))
+        (recur i (dec j) (conj! acc [:add (nth b (dec j))]))
 
         (pos? i)
-        (do (.add out [:del (nth a (dec i))])
-            (recur (dec i) j))
+        (recur (dec i) j (conj! acc [:del (nth a (dec i))]))
 
-        :else nil))
-    (vec (reverse out))))
+        :else (vec (reverse (persistent! acc)))))))
 
 (defn- group-hunks
   "Bundle the linear op stream into unified-diff hunks: runs of
@@ -1587,7 +1614,7 @@
     (let [sb (cc/sbuf)]
       (.append sb (str "--- " a-name "\n+++ " b-name "\n"))
       (doseq [{:keys [a-start a-len b-start b-len lines]} hunks]
-        (.append sb (format "@@ -%d,%d +%d,%d @@%n" a-start a-len b-start b-len))
+        (.append sb (cc/fmt-many "@@ -%d,%d +%d,%d @@\n" [a-start a-len b-start b-len]))
         (doseq [[op line] lines]
           (.append sb (case op :keep " " :del "-" :add "+"))
           (.append sb ^String line)
@@ -2364,10 +2391,10 @@
             (doseq [grp groups]
               (let [batch (vec (take n (concat grp (repeat ""))))]
                 (try
-                  (.append out (apply format fmt
-                                      (map-indexed
-                                       (fn [i a] (coerce (nth specs i) (str a)))
-                                       batch)))
+                  (.append out (cc/fmt-many fmt
+                                            (map-indexed
+                                             (fn [i a] (coerce (nth specs i) (str a)))
+                                             batch)))
                   (catch #?(:clj Throwable :cljs :default) _
                     (.append out fmt)))))))
         (ok (.toString out))))))
@@ -2402,23 +2429,45 @@
                                 (str k "=" v)))]
         (ok (if (seq out) (str out "\n") ""))))))
 
+(defn- date-parts-now
+  "Return a `{:y :mo :d :h :mi :s :j :epoch-ms}` snapshot of the
+   current local time. Cross-platform: JVM uses Calendar/Date,
+   CLJS uses js/Date."
+  []
+  #?(:clj
+     (let [now (java.util.Date.)
+           cal (doto (java.util.Calendar/getInstance) (.setTime now))]
+       {:y  (.get cal java.util.Calendar/YEAR)
+        :mo (inc (.get cal java.util.Calendar/MONTH))
+        :d  (.get cal java.util.Calendar/DAY_OF_MONTH)
+        :h  (.get cal java.util.Calendar/HOUR_OF_DAY)
+        :mi (.get cal java.util.Calendar/MINUTE)
+        :s  (.get cal java.util.Calendar/SECOND)
+        :j  (.get cal java.util.Calendar/DAY_OF_YEAR)
+        :epoch-ms (.getTime now)})
+     :cljs
+     (let [now (js/Date.)
+           jan-1 (js/Date. (.getFullYear now) 0 1)
+           ms-since-jan-1 (- (.getTime now) (.getTime jan-1))]
+       {:y  (.getFullYear now)
+        :mo (inc (.getMonth now))
+        :d  (.getDate now)
+        :h  (.getHours now)
+        :mi (.getMinutes now)
+        :s  (.getSeconds now)
+        :j  (inc (Math/floor (/ ms-since-jan-1 (* 1000 60 60 24))))
+        :epoch-ms (.getTime now)})))
+
 (defn- date-translate
-  "Walk the format string once, emitting each substitution. This is
-   a left-to-right pass — unlike sequential str/replace, `%%` can't
-   collide with `%S`/`%T` etc. because we consume two chars per
-   directive instead of doing global text-replace."
-  [^String fmt now cal]
-  (let [n (count fmt)
+  "Walk the format string once, emitting each substitution. Left-to-
+   right pass — `%%` can't collide with `%S`/`%T` etc. because we
+   consume two chars per directive. `parts` is a date-parts-now map."
+  [^String fmt parts]
+  (let [{:keys [y mo d h mi s j epoch-ms]} parts
+        n (count fmt)
         out (cc/sbuf)
-        d2 (fn [v] (format "%02d" v))
-        d3 (fn [v] (format "%03d" v))
-        y  (.get cal java.util.Calendar/YEAR)
-        mo (inc (.get cal java.util.Calendar/MONTH))
-        d  (.get cal java.util.Calendar/DAY_OF_MONTH)
-        h  (.get cal java.util.Calendar/HOUR_OF_DAY)
-        mi (.get cal java.util.Calendar/MINUTE)
-        s  (.get cal java.util.Calendar/SECOND)
-        j  (.get cal java.util.Calendar/DAY_OF_YEAR)]
+        d2 (fn [v] (cc/fmt1 "%02d" v))
+        d3 (fn [v] (cc/fmt1 "%03d" v))]
     (loop [i 0]
       (when (< i n)
         (let [c (.charAt fmt i)]
@@ -2426,27 +2475,27 @@
             (and (= c \%) (< (inc i) n))
             (let [d2c (.charAt fmt (inc i))]
               (case d2c
-                \%   (do (.append out \%) (recur (+ i 2)))
-                \Y   (do (.append out (str y))      (recur (+ i 2)))
-                \m   (do (.append out (d2 mo))      (recur (+ i 2)))
-                \d   (do (.append out (d2 d))       (recur (+ i 2)))
-                \H   (do (.append out (d2 h))       (recur (+ i 2)))
-                \M   (do (.append out (d2 mi))      (recur (+ i 2)))
-                \S   (do (.append out (d2 s))       (recur (+ i 2)))
-                \j   (do (.append out (d3 j))       (recur (+ i 2)))
-                \F   (do (.append out (format "%04d-%02d-%02d" y mo d))
+                \%   (do (cc/sappend! out \%) (recur (+ i 2)))
+                \Y   (do (cc/sappend! out (str y))      (recur (+ i 2)))
+                \m   (do (cc/sappend! out (d2 mo))      (recur (+ i 2)))
+                \d   (do (cc/sappend! out (d2 d))       (recur (+ i 2)))
+                \H   (do (cc/sappend! out (d2 h))       (recur (+ i 2)))
+                \M   (do (cc/sappend! out (d2 mi))      (recur (+ i 2)))
+                \S   (do (cc/sappend! out (d2 s))       (recur (+ i 2)))
+                \j   (do (cc/sappend! out (d3 j))       (recur (+ i 2)))
+                \F   (do (cc/sappend! out (cc/fmt-many "%04d-%02d-%02d" [y mo d]))
                          (recur (+ i 2)))
-                \T   (do (.append out (format "%02d:%02d:%02d" h mi s))
+                \T   (do (cc/sappend! out (cc/fmt-many "%02d:%02d:%02d" [h mi s]))
                          (recur (+ i 2)))
-                \s   (do (.append out (str (quot (.getTime ^java.util.Date now) 1000)))
+                \s   (do (cc/sappend! out (str (quot epoch-ms 1000)))
                          (recur (+ i 2)))
-                \n   (do (.append out \newline) (recur (+ i 2)))
-                \t   (do (.append out \tab)     (recur (+ i 2)))
+                \n   (do (cc/sappend! out \newline) (recur (+ i 2)))
+                \t   (do (cc/sappend! out \tab)     (recur (+ i 2)))
                 ;; unknown directive: pass through literally
-                (do (.append out c) (.append out d2c) (recur (+ i 2)))))
+                (do (cc/sappend! out c) (cc/sappend! out d2c) (recur (+ i 2)))))
             :else
-            (do (.append out c) (recur (inc i)))))))
-    (.toString out)))
+            (do (cc/sappend! out c) (recur (inc i)))))))
+    (cc/sbstr out)))
 
 (defn date-fn
   "POSIX date. With +FORMAT prints the current time per format
@@ -2457,17 +2506,18 @@
   [argv _fs _env]
   (let [args (rest argv)
         fmt-arg (first args)
-        now (java.util.Date.)
-        cal (doto (java.util.Calendar/getInstance) (.setTime now))]
+        parts (date-parts-now)]
     (cond
       (and fmt-arg (str/starts-with? fmt-arg "+"))
-      (ok (str (date-translate (subs fmt-arg 1) now cal) "\n"))
+      (ok (str (date-translate (subs fmt-arg 1) parts) "\n"))
       :else
-      (ok (str (date-translate "%F %T" now cal) "\n")))))
+      (ok (str (date-translate "%F %T" parts) "\n")))))
 
 (defn- seq-format-int? [n]
   ;; Whole number that's representable losslessly as a long.
-  (and (== n (long n)) (Double/isFinite n)))
+  (and (== n (long n))
+       #?(:clj  (Double/isFinite (double n))
+          :cljs (js/Number.isFinite n))))
 
 (defn seq-fn
   "POSIX seq:
@@ -2514,7 +2564,7 @@
                         (if all-int?
                           (str (long v))
                           ;; Strip trailing zeros for tidy output
-                          (let [s (format "%.10f" (double v))
+                          (let [s (cc/fmt1 "%.10f" (double v))
                                 s (str/replace s #"0+$" "")
                                 s (str/replace s #"\.$" "")]
                             s)))
@@ -2977,10 +3027,12 @@
                :exit   (:exit result)})
             (catch #?(:clj Throwable :cljs :default) t
               ;; Let budget interrupts propagate up to run-and-capture.
-              (when (and (instance? clojure.lang.ExceptionInfo t)
+              (when (and (instance? #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core/ExceptionInfo) t)
                          (:muschel/budget (ex-data t)))
                 (throw t))
-              (err (str "awk: " (.getMessage t)) 2))))))))
+              (err (str "awk: " #?(:clj (.getMessage t)
+                                   :cljs (or (ex-message t) (str t)))) 2))))))))
 
 ;; ============================================================================
 ;; jq — JSON projection & filtering
@@ -3154,19 +3206,43 @@
   "Render a value as JSON output. Honours -c (compact) and -r (raw —
    strip surrounding quotes on string outputs)."
   [v {:keys [compact raw]}]
-  (require 'clojure.data.json)
-  (let [json-write (resolve 'clojure.data.json/write-str)]
-    (cond
-      (and raw (string? v)) v
-      compact (json-write v)
-      :else (json-write v :indent true))))
+  #?(:clj
+     (do (require 'clojure.data.json)
+         (let [json-write (resolve 'clojure.data.json/write-str)]
+           (cond
+             (and raw (string? v)) v
+             compact (json-write v)
+             :else (json-write v :indent true))))
+     :cljs
+     (cond
+       (and raw (string? v)) v
+       compact (.stringify js/JSON (clj->js v))
+       :else (.stringify js/JSON (clj->js v) nil 2))))
+
+(defn- jq-parse
+  "Parse the input text into a vector of JSON values. JVM uses
+   `clojure.data.json` (handles multi-value whitespace-separated
+   streams). CLJS uses `js/JSON.parse` (single value only — jq
+   `--slurp` covers most multi-value workflows the agent needs)."
+  [^String input-text]
+  (if (str/blank? input-text)
+    []
+    #?(:clj
+       (do (require 'clojure.data.json)
+           (let [read-fn (resolve 'clojure.data.json/read)
+                 pbr (java.io.PushbackReader.
+                      (java.io.StringReader. input-text) 64)]
+             (loop [acc []]
+               (let [v (read-fn pbr :eof-error? false :eof-value ::eof)]
+                 (if (= ::eof v) acc (recur (conj acc v)))))))
+       :cljs
+       [(js->clj (.parse js/JSON input-text) :keywordize-keys false)])))
 
 (defn jq
   "Practical jq subset: `.`, `.field`, `.[N]`, `.[]`, `.[A:B]`,
    `length`, `keys`, `values`, `type`, `first`, `last`, and `|`
    composition. Reads JSON from stdin or files."
   [argv fs env]
-  (require 'clojure.data.json)
   (let [{:keys [opts pos err]}
         (cli-parse argv [["-c" "--compact-output"]
                          ["-r" "--raw-output"]
@@ -3184,30 +3260,20 @@
                          (seq files)
                          (str/join "\n" (for [f files] (or (fs/read-file fs f) "")))
                          :else stdin)
-            read-fn (resolve 'clojure.data.json/read)
-            ;; Multiple JSON values separated by whitespace; slurp
-            ;; puts them in one array. Pushback buffer needs ~64
-            ;; bytes — data.json reads ahead more than 1.
-            parsed (if (str/blank? input-text)
-                     []
-                     (try
-                       (let [pbr (java.io.PushbackReader.
-                                  (java.io.StringReader. input-text)
-                                  64)]
-                         (loop [acc []]
-                           (let [v (read-fn pbr :eof-error? false :eof-value ::eof)]
-                             (if (= ::eof v) acc (recur (conj acc v))))))
-                       (catch #?(:clj Throwable :cljs :default) t
-                         (throw (ex-info (str "jq: parse error: " (.getMessage t)) {})))))
+            parsed (try (jq-parse input-text)
+                        (catch #?(:clj Throwable :cljs :default) t
+                          (throw (ex-info (str "jq: parse error: "
+                                               #?(:clj (.getMessage t)
+                                                  :cljs (.-message t))) {}))))
             parsed (if (:slurp opts) [parsed] parsed)
             fmt-opts {:compact (:compact-output opts)
                       :raw     (:raw-output opts)}
             outs (mapcat #(jq-run-pipeline % expr) parsed)
             sb (cc/sbuf)]
         (doseq [o outs]
-          (.append sb ^String (jq-format o fmt-opts))
-          (.append sb "\n"))
-        (ok (.toString sb))))))
+          (cc/sappend! sb (jq-format o fmt-opts))
+          (cc/sappend! sb "\n"))
+        (ok (cc/sbstr sb))))))
 
 ;; ============================================================================
 ;; Network: curl
@@ -3227,26 +3293,27 @@
     data                       "POST"
     :else                      "GET"))
 
-(defn- curl-build-request
-  ^java.net.http.HttpRequest
-  [^String url {:keys [request data headers user] :as opts}]
-  (let [b (.. (java.net.http.HttpRequest/newBuilder)
-              (uri (java.net.URI/create url)))
-        method (curl-method opts)
-        body-publisher (if data
-                         (java.net.http.HttpRequest$BodyPublishers/ofString
-                          ^String data)
-                         (java.net.http.HttpRequest$BodyPublishers/noBody))]
-    (.method b ^String method body-publisher)
-    (doseq [h (or headers [])]
-      (let [idx (.indexOf ^String h ":")]
-        (when (pos? idx)
-          (.header b (str/trim (subs h 0 idx)) (str/trim (subs h (inc idx)))))))
-    (when user
-      (let [enc (.encodeToString (java.util.Base64/getEncoder)
-                                 (.getBytes ^String user "UTF-8"))]
-        (.header b "Authorization" (str "Basic " enc))))
-    (.build b)))
+#?(:clj
+   (defn- curl-build-request
+     ^java.net.http.HttpRequest
+     [^String url {:keys [request data headers user] :as opts}]
+     (let [b (.. (java.net.http.HttpRequest/newBuilder)
+                 (uri (java.net.URI/create url)))
+           method (curl-method opts)
+           body-publisher (if data
+                            (java.net.http.HttpRequest$BodyPublishers/ofString
+                             ^String data)
+                            (java.net.http.HttpRequest$BodyPublishers/noBody))]
+       (.method b ^String method body-publisher)
+       (doseq [h (or headers [])]
+         (let [idx (.indexOf ^String h ":")]
+           (when (pos? idx)
+             (.header b (str/trim (subs h 0 idx)) (str/trim (subs h (inc idx)))))))
+       (when user
+         (let [enc (.encodeToString (java.util.Base64/getEncoder)
+                                    (.getBytes ^String user "UTF-8"))]
+           (.header b "Authorization" (str "Basic " enc))))
+       (.build b))))
 
 (defn curl
   "POSIX-ish curl. Subset:
@@ -3262,77 +3329,77 @@
      -u USER:PASS             basic auth
 
    The URL is the last positional argument. Output goes to stdout
-   unless -o / -O is given. Network access is the agent's
-   responsibility — curl reaches the public internet."
+   unless -o / -O is given.
+
+   Currently JVM-only. CLJS port to come (Node fetch / browser fetch);
+   bb port via `babashka.http-client`."
   [argv fs _env]
-  (let [{:keys [opts pos err]}
-        (cli-parse argv [["-X" "--request METHOD"]
-                         ["-d" "--data DATA"]
-                         ["-H" "--header H"
-                          :assoc-fn (fn [m k v] (update m k (fnil conj []) v))
-                          :default []]
-                         ["-o" "--output FILE"]
-                         ["-O" "--remote-name"]
-                         ["-L" "--location"]
-                         ["-s" "--silent"]
-                         ["-i" "--include"]
-                         ["-f" "--fail"]
-                         ["-u" "--user USER:PASS"]])]
-    (cond
-      err (usage-err "curl" err)
-      (empty? pos) (usage-err "curl" "no URL specified")
-      :else
-      (let [url     (last pos)
-            client  (.. (java.net.http.HttpClient/newBuilder)
-                        (followRedirects java.net.http.HttpClient$Redirect/NORMAL)
-                        build)
-            req     (curl-build-request url opts)
-            resp    (try
-                      (.send client req
-                             (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
-                      (catch #?(:clj Throwable :cljs :default) t
-                        (vary-meta {} assoc ::err (.getMessage t))))]
-        (if-let [errmsg (::err (meta resp))]
-          (err (str "curl: (6) " errmsg) 6)
-          (let [status (.statusCode ^java.net.http.HttpResponse resp)
-                body   ^bytes (.body ^java.net.http.HttpResponse resp)
-                hdr-out (when (:include opts)
-                          (let [hs (.headers ^java.net.http.HttpResponse resp)
-                                version (.version ^java.net.http.HttpResponse resp)
-                                v-str (case (.name ^java.net.http.HttpClient$Version version)
-                                        "HTTP_1_1" "HTTP/1.1"
-                                        "HTTP_2"   "HTTP/2"
-                                        "HTTP/1.1")]
-                            (str v-str " " status "\r\n"
-                                 (str/join
-                                  ""
-                                  (for [[k vs] (.map hs)
-                                        v vs]
-                                    (str k ": " v "\r\n")))
-                                 "\r\n")))
-                target (or (:output opts)
-                           (when (:remote-name opts)
-                             (last (str/split url #"/"))))
-                fail?  (and (:fail opts) (>= status 400))]
-            (cond
-              fail?
-              (err (str "curl: (22) The requested URL returned error: " status) 22)
+  #?(:clj
+     (let [{:keys [opts pos err]}
+           (cli-parse argv [["-X" "--request METHOD"]
+                            ["-d" "--data DATA"]
+                            ["-H" "--header H"
+                             :assoc-fn (fn [m k v] (update m k (fnil conj []) v))
+                             :default []]
+                            ["-o" "--output FILE"]
+                            ["-O" "--remote-name"]
+                            ["-L" "--location"]
+                            ["-s" "--silent"]
+                            ["-i" "--include"]
+                            ["-f" "--fail"]
+                            ["-u" "--user USER:PASS"]])]
+       (cond
+         err (usage-err "curl" err)
+         (empty? pos) (usage-err "curl" "no URL specified")
+         :else
+         (let [url     (last pos)
+               client  (.. (java.net.http.HttpClient/newBuilder)
+                           (followRedirects java.net.http.HttpClient$Redirect/NORMAL)
+                           build)
+               req     (curl-build-request url opts)
+               resp    (try
+                         (.send client req
+                                (java.net.http.HttpResponse$BodyHandlers/ofByteArray))
+                         (catch Throwable t
+                           (vary-meta {} assoc ::err (.getMessage t))))]
+           (if-let [errmsg (::err (meta resp))]
+             (err (str "curl: (6) " errmsg) 6)
+             (let [status (.statusCode ^java.net.http.HttpResponse resp)
+                   body   ^bytes (.body ^java.net.http.HttpResponse resp)
+                   hdr-out (when (:include opts)
+                             (let [hs (.headers ^java.net.http.HttpResponse resp)
+                                   version (.version ^java.net.http.HttpResponse resp)
+                                   v-str (case (.name ^java.net.http.HttpClient$Version version)
+                                           "HTTP_1_1" "HTTP/1.1"
+                                           "HTTP_2"   "HTTP/2"
+                                           "HTTP/1.1")]
+                               (str v-str " " status "\r\n"
+                                    (str/join
+                                     ""
+                                     (for [[k vs] (.map hs)
+                                           v vs]
+                                       (str k ": " v "\r\n")))
+                                    "\r\n")))
+                   target (or (:output opts)
+                              (when (:remote-name opts)
+                                (last (str/split url #"/"))))
+                   fail?  (and (:fail opts) (>= status 400))]
+               (cond
+                 fail?
+                 (err (str "curl: (22) The requested URL returned error: " status) 22)
 
-              target
-              (let [out (fs/open-sink fs target false)]
-                (if (nil? out)
-                  (err (str "curl: cannot write to '" target "'") 23)
-                  (with-open [^java.io.OutputStream o out]
-                    (.write o body)
-                    {:stdout (or hdr-out "")
-                     :stderr ""
-                     :exit 0})))
+                 target
+                 (if (fs/write-string! fs target (String. body "UTF-8") false)
+                   {:stdout (or hdr-out "") :stderr "" :exit 0}
+                   (err (str "curl: cannot write to '" target "'") 23))
 
-              :else
-              {:stdout (str (or hdr-out "")
-                            (String. body "UTF-8"))
-               :stderr ""
-               :exit 0})))))))
+                 :else
+                 {:stdout (str (or hdr-out "")
+                               (String. body "UTF-8"))
+                  :stderr ""
+                  :exit 0}))))))
+     :cljs
+     (err "curl: HTTP client not yet ported to CLJS" 1)))
 
 ;; ============================================================================
 ;; sleep
@@ -3367,8 +3434,16 @@
       (let [parsed (mapv parse-duration args)]
         (if (some nil? parsed)
           (usage-err "sleep" (str "invalid time interval: " (nth args (.indexOf parsed nil))))
-          (do (Thread/sleep (long (reduce + 0 parsed)))
-              {:stdout "" :stderr "" :exit 0}))))))
+          (let [ms (long (reduce + 0 parsed))]
+            #?(:clj (Thread/sleep ms)
+               :cljs
+               ;; CLJS lacks synchronous sleep. We busy-wait — only
+               ;; acceptable for the tiny budgets agent scripts use
+               ;; (typically `sleep 0.1` between polls). Callers
+               ;; needing real async should not use this builtin.
+               (let [deadline (+ (.now js/Date) ms)]
+                 (while (< (.now js/Date) deadline) nil)))
+            {:stdout "" :stderr "" :exit 0}))))))
 
 ;; ============================================================================
 ;; Registry — the canonical builtin map
