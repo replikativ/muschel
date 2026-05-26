@@ -2897,14 +2897,13 @@
                       :else        nil)
             files   (if (:file opts) pos (rest pos))
             stdin   (or (:stdin env) "")
-            input   (cond
+            ;; Pass raw text — awk-impl/run splits it internally by
+            ;; the current RS (which may have been changed in BEGIN).
+            raw     (cond
                       (seq files)
-                      (vec (mapcat (fn [f]
-                                     (when-let [c (fs/read-file fs f)]
-                                       (str/split-lines c)))
-                                   files))
-                      (str/blank? stdin) []
-                      :else (str/split-lines stdin))
+                      (str/join "\n"
+                                (keep (fn [f] (fs/read-file fs f)) files))
+                      :else stdin)
             kv-vars (into {}
                           (for [kv (:var opts)
                                 :let [idx (.indexOf ^String kv "=")]
@@ -2914,10 +2913,10 @@
           (nil? program) (usage-err "awk" "missing program")
           :else
           (try
-            (let [result (awk-impl/run {:program program
-                                        :input   input
-                                        :fs      (:field-separator opts)
-                                        :vars    kv-vars})]
+            (let [result (awk-impl/run {:program   program
+                                        :raw-input raw
+                                        :fs        (:field-separator opts)
+                                        :vars      kv-vars})]
               {:stdout (:stdout result)
                :stderr ""
                :exit   (:exit result)})

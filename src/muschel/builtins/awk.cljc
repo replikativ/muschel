@@ -126,12 +126,16 @@
                         (and (not saw-dot?) (not saw-e?) (= c \.))
                         (recur (inc i) true saw-e?)
                         (and (not saw-e?) (or (= c \e) (= c \E)))
+                        ;; Only consume the `e`/`E` if it's followed by
+                        ;; an optional +/- AND at least one digit.
                         (let [j (inc i)
-                              j (if (and (< j n)
-                                         (or (= (.charAt src j) \+)
-                                             (= (.charAt src j) \-)))
-                                  (inc j) j)]
-                          (recur j saw-dot? true))
+                              j' (if (and (< j n)
+                                          (or (= (.charAt src j) \+)
+                                              (= (.charAt src j) \-)))
+                                   (inc j) j)]
+                          (if (and (< j' n) (digit? (.charAt src j')))
+                            (recur j' saw-dot? true)
+                            i))
                         :else i))))]
         [(Double/parseDouble (subs src pos end)) end]))))
 
@@ -143,10 +147,42 @@
                 (recur (inc i)) i))]
     [(subs src pos end) end]))
 
+;; Tokens that, when they're the most recent, can be FOLLOWED by a
+;; regex literal (i.e. `/` opens a regex). Anything else means `/` is
+;; division. The list comes from awk grammar: `/` is a regex iff it
+;; appears in expression position with no left-hand operand.
+(def ^:private regex-context-after
+  #{:newline :semicolon :lparen :lbrace :lbracket :rbrace :comma
+    :assign :add-assign :sub-assign :mul-assign :div-assign
+    :mod-assign :pow-assign
+    :eq :ne :lt :le :gt :ge :and :or :not :match :not-match
+    :question :colon
+    :add :sub :mul :div :mod :pow
+    :print :printf :return :if :while :do :for :in
+    :BEGIN :END
+    :dollar})
+
+(defn- forward-scan-regex
+  "Read a regex literal starting at `pos` (which points at the `/`).
+   Returns [pattern next-pos]."
+  [^String src pos]
+  (let [n (count src)
+        sb (StringBuilder.)]
+    (loop [i (inc pos)]
+      (cond
+        (>= i n) (throw (ex-info "unterminated regex" {:pos pos}))
+        (= (.charAt src i) \/) [(.toString sb) (inc i)]
+        (= (.charAt src i) \\)
+        (if (< (inc i) n)
+          (do (.append sb \\) (.append sb (.charAt src (inc i)))
+              (recur (+ i 2)))
+          (throw (ex-info "trailing backslash in regex" {:pos i})))
+        :else (do (.append sb (.charAt src i)) (recur (inc i)))))))
+
 (defn- tokenize
   "Lex `src` into a vec of {:type kw :value any :line :col} maps.
-   The parser will call `scan-regex` (below) for the contexts where
-   `/` introduces a regex rather than division."
+   Emits :regex tokens directly when context indicates `/` opens a
+   regex; otherwise emits :div / :div-assign."
   [^String src]
   (let [n (count src)
         out (transient [])
@@ -155,10 +191,20 @@
         bump (fn [c]
                (if (nl? c)
                  (do (vswap! line inc) (vreset! col 1))
-                 (vswap! col inc)))]
+                 (vswap! col inc)))
+        ;; What was the last NON-newline token? Newlines don't reset
+        ;; context — `/foo/\n` followed by `/bar/` should still let
+        ;; the second `/` start a regex.
+        last-tok (volatile! nil)
+        emit! (fn [tok]
+                (when (not= :newline (:type tok)) (vreset! last-tok (:type tok)))
+                (conj! out tok))
+        regex-here? (fn []
+                      (let [lt @last-tok]
+                        (or (nil? lt) (regex-context-after lt))))]
     (loop [i 0]
       (if (>= i n)
-        (do (conj! out {:type :eof :line @line :col @col})
+        (do (emit! {:type :eof :line @line :col @col})
             (persistent! out))
         (let [c (.charAt src i)
               ln @line cl @col]
@@ -170,7 +216,7 @@
 
             ;; Newline → token (statement terminator)
             (nl? c)
-            (do (conj! out {:type :newline :line ln :col cl})
+            (do (emit! {:type :newline :line ln :col cl})
                 (bump c) (recur (inc i)))
 
             ;; Other whitespace
@@ -180,10 +226,17 @@
             (and (= c \\) (< (inc i) n) (nl? (.charAt src (inc i))))
             (do (bump (.charAt src (inc i))) (recur (+ i 2)))
 
+            ;; Regex literal — `/` (or `/=`) in regex-allowed context
+            (and (= c \/) (regex-here?))
+            (let [[pat end] (forward-scan-regex src i)]
+              (emit! {:type :regex :value pat :line ln :col cl})
+              (vswap! col + (- end i))
+              (recur end))
+
             ;; String literals
             (or (= c \") (= c \'))
             (let [[v end] (scan-string src i c)]
-              (conj! out {:type :string :value v :line ln :col cl})
+              (emit! {:type :string :value v :line ln :col cl})
               (vswap! col + (- end i))
               (recur end))
 
@@ -191,7 +244,7 @@
             (or (digit? c)
                 (and (= c \.) (< (inc i) n) (digit? (.charAt src (inc i)))))
             (let [[v end] (scan-number src i)]
-              (conj! out {:type :number :value v :line ln :col cl})
+              (emit! {:type :number :value v :line ln :col cl})
               (vswap! col + (- end i))
               (recur end))
 
@@ -200,11 +253,11 @@
             (let [[nm end] (scan-name src i)]
               (cond
                 (keywords nm)
-                (conj! out {:type (keywords nm) :value nm :line ln :col cl})
+                (emit! {:type (keywords nm) :value nm :line ln :col cl})
                 (builtin-fns nm)
-                (conj! out {:type :builtin :value nm :line ln :col cl})
+                (emit! {:type :builtin :value nm :line ln :col cl})
                 :else
-                (conj! out {:type :name :value nm :line ln :col cl}))
+                (emit! {:type :name :value nm :line ln :col cl}))
               (vswap! col + (- end i))
               (recur end))
 
@@ -250,7 +303,7 @@
                         \$ [:dollar 1]   \| [:pipe 1]
                         [nil 1]))]
               (if tok
-                (do (conj! out {:type tok :line ln :col cl})
+                (do (emit! {:type tok :line ln :col cl})
                     (vswap! col + len)
                     (recur (+ i len)))
                 (throw (ex-info (str "unexpected char: " (pr-str c))
@@ -282,7 +335,7 @@
 ;; mutate the cursor and return AST nodes.
 ;; ============================================================================
 
-(declare parse-expr parse-stmt parse-stmts parse-pattern)
+(declare parse-expr parse-stmt parse-stmts parse-pattern parse-postfix)
 
 (defn- peek-tok [state]   (nth (:tokens state) @(:pos state) {:type :eof}))
 (defn- peek-tok-at [state offset]
@@ -354,9 +407,9 @@
       :string (do (advance! state) {:type :str :value (:value t)})
       :dollar (do (advance! state)
                   {:type :field :index (parse-primary state)})
-      :not    (do (advance! state) {:type :unary :op :not :value (parse-primary state)})
-      :sub    (do (advance! state) {:type :unary :op :neg :value (parse-primary state)})
-      :add    (do (advance! state) {:type :unary :op :pos :value (parse-primary state)})
+      :not    (do (advance! state) {:type :unary :op :not :value (parse-postfix state)})
+      :sub    (do (advance! state) {:type :unary :op :neg :value (parse-postfix state)})
+      :add    (do (advance! state) {:type :unary :op :pos :value (parse-postfix state)})
       :incr   (do (advance! state)
                   (let [tgt (parse-primary state)]
                     {:type :incr :op :incr :pre? true :expr tgt}))
@@ -366,7 +419,9 @@
       :lparen (do (advance! state)
                   (let [e (parse-expr state)]
                     (expect! state :rparen)
-                    e))
+                    ;; Wrap so `(a)++` doesn't treat (a) as an l-value
+                    ;; for post-incr — POSIX awk forbids that.
+                    {:type :paren :inner e}))
       :name   (let [nm (:value (advance! state))]
                 (if (at? state :lbracket)
                   (do (advance! state)
@@ -392,25 +447,7 @@
                                  acc'))))]
                 (expect! state :rparen)
                 {:type :call :func (keyword fname) :args args}))))
-      :div
-      ;; Bare regex in primary position.
-      (let [{:keys [src tokens-vol pos]} state
-            tok t
-            line (:line tok) col (:col tok)
-            ;; Compute source offset of this `/`.
-            offset (loop [i 0 ln 1 cl 1]
-                     (cond
-                       (and (= ln line) (= cl col)) i
-                       (>= i (count src)) i
-                       (= \newline (.charAt src i)) (recur (inc i) (inc ln) 1)
-                       :else (recur (inc i) ln (inc cl))))
-            [pat end] (scan-regex src offset)
-            tail-toks (tokenize (subs src end))
-            kept (subvec @tokens-vol 0 @pos)
-            new-toks (vec (concat kept tail-toks))]
-        (vreset! tokens-vol new-toks)
-        (vreset! pos (count kept))
-        {:type :regex :pattern pat})
+      :regex (do (advance! state) {:type :regex :pattern (:value t)})
       (throw (ex-info (str "unexpected token in primary: " (:type t)
                            " at line " (:line t) ":" (:col t))
                       {:token t})))))
@@ -457,7 +494,7 @@
 ;; Concatenation by juxtaposition — detect by peeking at the next
 ;; token; if it starts a primary, treat as :concat.
 (def ^:private concat-starts
-  #{:dollar :not :name :number :string :lparen :incr :decr :builtin})
+  #{:dollar :not :name :number :string :lparen :incr :decr :builtin :regex})
 
 (defn- parse-concat [state]
   (loop [l (parse-add state)]
@@ -536,19 +573,56 @@
 
 ;; ---------- Statements ----------
 
-(defn- parse-print-args [state]
-  ;; Comma-separated expressions until we hit a redirect, terminator,
-  ;; or rbrace.
-  (loop [acc []]
-    (let [t (peek-tok state)]
+(defn- lookahead-paren-has-comma?
+  "Given that the current token is `(`, scan ahead and report whether
+   a comma appears at paren-depth 0 inside this paren. Used to decide
+   whether `print (a, b)` is a paren-tuple of print args or a single
+   parenthesised expression."
+  [state]
+  (let [toks @(:tokens-vol state)
+        start (inc @(:pos state))
+        n (count toks)]
+    (loop [i start depth 1]
       (cond
-        (#{:newline :semicolon :rbrace :eof :gt :pipe} (:type t)) acc
+        (>= i n) false
+        (zero? depth) false
         :else
-        (let [e (parse-expr state)
-              acc' (conj acc e)]
-          (if (at? state :comma)
-            (do (advance! state) (recur acc'))
-            acc'))))))
+        (let [ty (:type (nth toks i))]
+          (cond
+            (= ty :lparen) (recur (inc i) (inc depth))
+            (= ty :rparen) (if (= depth 1) false (recur (inc i) (dec depth)))
+            (and (= ty :comma) (= depth 1)) true
+            :else (recur (inc i) depth)))))))
+
+(defn- parse-print-args [state]
+  ;; Special case: `print (e1, e2, …)` — paren-tuple form. Triggered
+  ;; only when the paren actually contains a top-level comma; bare
+  ;; `print (1+2)` falls through to the normal path.
+  (cond
+    (and (at? state :lparen) (lookahead-paren-has-comma? state))
+    (do (advance! state) ; lparen
+        (let [args (loop [acc []]
+                     (let [e (parse-expr state)
+                           acc' (conj acc e)]
+                       (if (at? state :comma)
+                         (do (advance! state) (recur acc'))
+                         acc')))]
+          (expect! state :rparen)
+          args))
+
+    :else
+    ;; Comma-separated expressions until we hit a redirect, terminator,
+    ;; or rbrace.
+    (loop [acc []]
+      (let [t (peek-tok state)]
+        (cond
+          (#{:newline :semicolon :rbrace :eof :gt :pipe} (:type t)) acc
+          :else
+          (let [e (parse-expr state)
+                acc' (conj acc e)]
+            (if (at? state :comma)
+              (do (advance! state) (recur acc'))
+              acc')))))))
 
 (defn- parse-simple-stmt [state]
   (let [t (peek-tok state)]
@@ -640,8 +714,13 @@
                             post (when-not (at? state :rparen)
                                    (parse-simple-stmt state))
                             _ (expect! state :rparen)
-                            _ (skip-terminators! state)
-                            body (parse-stmt state)]
+                            ;; Empty body? `for(...) ;` or `for(...) \n ;`
+                            body (cond
+                                   (at? state :semicolon)
+                                   (do (advance! state) {:type :block :body []})
+                                   :else
+                                   (do (skip-terminators! state)
+                                       (parse-stmt state)))]
                         {:type :for :pre pre :cond cond-e :post post :body body}))))
       :break    (do (advance! state) {:type :break})
       :continue (do (advance! state) {:type :continue})
@@ -688,6 +767,25 @@
         (skip-terminators! state)
         (while (not= :eof (:type (peek-tok state)))
           (cond
+            (at? state :function)
+            ;; Skip `function name(args) { body }` — we don't support
+            ;; calling user-defined functions, but we tolerate their
+            ;; presence in scripts (often boilerplate that's unused).
+            ;; If something tries to CALL the function, it'll surface
+            ;; later as "unknown function" at eval time.
+            (do (advance! state)             ; function
+                (advance! state)             ; name
+                (when (at? state :lparen)    ; (args)
+                  (loop [depth 1]
+                    (advance! state)
+                    (cond
+                      (= :lparen (:type (peek-tok state))) (recur (inc depth))
+                      (= :rparen (:type (peek-tok state)))
+                      (if (= depth 1) (advance! state) (recur (dec depth)))
+                      :else (recur depth))))
+                (skip-terminators! state)
+                (when (at? state :lbrace) (parse-stmt-block state)))
+
             (at? state :BEGIN)
             (do (advance! state) (skip-terminators! state)
                 (let [b (parse-stmt-block state)]
@@ -742,17 +840,23 @@
 
 (defn- fmt-num
   "awk's CONVFMT/OFMT formatting. Integers print as integers; doubles
-   use %.6g (matching default CONVFMT)."
+   use %.6g, then trim trailing zeros (so 2.86 not 2.86000) — that's
+   how POSIX/gawk render."
   [n]
   (cond
     (Double/isNaN n) "nan"
     (Double/isInfinite n) (if (pos? n) "inf" "-inf")
     (== n (Math/floor n)) (str (long n))
-    :else (let [s (format "%.6g" n)
-                ;; Strip trailing zeros in fractional part — but keep
-                ;; at least one digit after the dot.
-                ]
-            s)))
+    :else
+    (let [s (format "%.6g" n)
+          i (.indexOf ^String s "e")
+          [mant exp] (if (>= i 0) [(subs s 0 i) (subs s i)] [s ""])
+          mant' (if (.contains ^String mant ".")
+                  (-> mant
+                      (str/replace #"0+$" "")
+                      (str/replace #"\.$" ""))
+                  mant)]
+      (str mant' exp))))
 
 (defn- v->str [v]
   (case (:tag v)
@@ -795,35 +899,53 @@
   [{:keys [fs ofs ors rs vars] :or {ofs " " ors "\n" rs "\n"}}]
   {:globals (atom (or vars {}))
    :arrays  (atom {})
-   :fields  (atom [])     ; $1..$N
-   :line    (atom "")     ; $0
-   :specials (atom {"NR" (v-num 0) "NF" (v-num 0)
+   :fields  (atom [])     ; $1..$N (each a tagged value)
+   :line    (atom (v-numstr ""))   ; $0 (tagged value)
+   :specials (atom {"NR" (v-num 0) "NF" (v-num 0) "FNR" (v-num 0)
                     "FS" (v-str (or fs " "))
                     "OFS" (v-str ofs)
                     "ORS" (v-str ors)
                     "RS" (v-str rs)
                     "FILENAME" (v-str "")
                     "RSTART" (v-num 0)
-                    "RLENGTH" (v-num -1)
+                    "RLENGTH" (v-num 0)
                     "SUBSEP" (v-str (str (char 28)))
                     "CONVFMT" (v-str "%.6g")
-                    "OFMT" (v-str "%.6g")})
+                    "OFMT" (v-str "%.6g")
+                    "ARGC" (v-num 1)})
    :out     (StringBuilder.)
    :exit?   (atom false)
    :exit-code (atom 0)
    :range-state (atom {})})
 
 (def ^:private special-names
-  #{"NR" "NF" "FS" "OFS" "ORS" "RS" "FILENAME" "RSTART" "RLENGTH"
-    "SUBSEP" "CONVFMT" "OFMT"})
+  #{"NR" "NF" "FNR" "FS" "OFS" "ORS" "RS" "FILENAME" "RSTART" "RLENGTH"
+    "SUBSEP" "CONVFMT" "OFMT" "ARGC"})
 
 (defn- special-var? [nm] (boolean (special-names nm)))
 
 (defn- get-special [state nm]
   (or (get @(:specials state) nm) (v-null)))
 
+(declare rebuild-line!)
+
 (defn- set-special! [state nm v]
-  (swap! (:specials state) assoc nm v))
+  (swap! (:specials state) assoc nm v)
+  ;; Some special vars have side effects.
+  (case nm
+    "NF"
+    (let [n (long (max 0 (v->num v)))
+          cur @(:fields state)
+          cur-len (count cur)]
+      (cond
+        (< n cur-len) (reset! (:fields state) (vec (take n cur)))
+        (> n cur-len) (reset! (:fields state) (vec (concat cur (repeat (- n cur-len) (v-str ""))))))
+      (rebuild-line! state)
+      ;; rebuild-line! overwrites NF with the new field count. Restore
+      ;; the user's original assigned value (which may be a string like
+      ;; "x" that numerically coerces to 0).
+      (swap! (:specials state) assoc "NF" v))
+    nil))
 
 (defn- get-global [state nm]
   (or (get @(:globals state) nm) (v-null)))
@@ -847,50 +969,65 @@
   "Split `line` by FS. FS rules:
      \" \"  — whitespace-trim, split on runs of whitespace
      single char — split on that literal
-     multi-char — treat as regex"
+     multi-char — treat as regex
+   Preserves trailing empties (split with -1 limit) so that awk's
+   split(\"a,b,\", arr, \",\") yields 3 elements (a, b, \"\")."
   [^String line ^String fs]
   (cond
     (= line "") []
-    (= fs " ") (vec (str/split (str/trim line) #"\s+"))
-    (= 1 (count fs)) (vec (str/split line (re-pattern (java.util.regex.Pattern/quote fs))))
-    :else (vec (str/split line (re-pattern fs)))))
+    (= fs " ")  (vec (str/split (str/trim line) #"\s+"))
+    (= 1 (count fs))
+    (vec (.split line (java.util.regex.Pattern/quote fs) -1))
+    :else
+    (vec (.split line ^String fs -1))))
 
-(defn- set-line! [state ^String line]
-  (reset! (:line state) line)
+(defn- split-and-populate! [state ^String line-str]
   (let [fs (v->str (get-special state "FS"))
-        fields (split-fields line fs)]
+        parts (split-fields line-str fs)
+        fields (mapv v-numstr parts)]
     (reset! (:fields state) fields)
-    (set-special! state "NF" (v-num (count fields)))))
+    (swap! (:specials state) assoc "NF" (v-num (count fields)))))
+
+(defn- set-line!
+  "Used per-record: $0 = input as :numstr."
+  [state ^String line-str]
+  (reset! (:line state) (v-numstr line-str))
+  (split-and-populate! state line-str))
 
 (defn- get-field [state n]
   (cond
-    (zero? n) (v-numstr @(:line state))
+    (zero? n) @(:line state)
     (neg? n) (v-str "")
     :else
     (let [fs @(:fields state)]
       (if (> n (count fs))
         (v-str "")
-        (v-numstr (nth fs (dec n)))))))
+        (nth fs (dec n))))))
 
 (defn- rebuild-line!
+  "Re-join fields by OFS into $0 (as :str — rebuilt strings are always
+   true strings); sync NF directly (bypasses set-special! to avoid the
+   resize-recursion loop)."
   [state]
-  (let [ofs (v->str (get-special state "OFS"))]
-    (reset! (:line state) (str/join ofs @(:fields state)))
-    (set-special! state "NF" (v-num (count @(:fields state))))))
+  (let [ofs (v->str (get-special state "OFS"))
+        fs @(:fields state)]
+    (reset! (:line state) (v-str (str/join ofs (mapv v->str fs))))
+    (swap! (:specials state) assoc "NF" (v-num (count fs)))))
 
 (defn- set-field! [state n v]
   (cond
     (zero? n)
-    (set-line! state (v->str v))
+    ;; $0 = expr — store the tagged value and re-split as :numstr fields.
+    (do (reset! (:line state) v)
+        (split-and-populate! state (v->str v)))
 
     (pos? n)
     (let [fs @(:fields state)
           cur-len (count fs)
-          ;; pad with empties up to n
           padded (if (>= cur-len n)
                    fs
-                   (vec (concat fs (repeat (- n cur-len) ""))))
-          new-fields (assoc padded (dec n) (v->str v))]
+                   (vec (concat fs (repeat (- n cur-len) (v-str "")))))
+          new-fields (assoc padded (dec n) v)]
       (reset! (:fields state) new-fields)
       (rebuild-line! state))))
 
@@ -901,7 +1038,8 @@
 (def ^:private regex-cache (atom {}))
 (defn- compile-re [^String pat]
   (or (get @regex-cache pat)
-      (let [p (java.util.regex.Pattern/compile pat)]
+      ;; awk's `.` matches any char incl. newline (DOTALL semantics).
+      (let [p (java.util.regex.Pattern/compile pat java.util.regex.Pattern/DOTALL)]
         (swap! regex-cache assoc pat p) p)))
 
 ;; ---- built-in functions --------------------------------------------------
@@ -940,13 +1078,22 @@
                    (when (not= :var (:type a))
                      (throw (ex-info "split: 2nd arg must be array name" {})))
                    (:name a))
-        fs (if (>= (count ast-args) 3)
-             (let [third (nth ast-args 2)]
-               (if (= :regex (:type third))
-                 (:pattern third)
-                 (v->str (eval-expr state third))))
-             (v->str (get-special state "FS")))
-        parts (split-fields s fs)]
+        third (when (>= (count ast-args) 3) (nth ast-args 2))
+        [pat regex?] (cond
+                       (nil? third)
+                       [(v->str (get-special state "FS")) false]
+                       (= :regex (:type third))
+                       [(:pattern third) true]
+                       :else
+                       [(v->str (eval-expr state third)) false])
+        ;; When the separator is a *regex literal*, never apply the
+        ;; FS=" " whitespace-split rule — `/ /` means literal space.
+        parts (cond
+                regex?
+                (cond
+                  (= "" s) []
+                  :else (vec (.split ^String s ^String pat -1)))
+                :else (split-fields s pat))]
     ;; Clear and refill the array.
     (swap! (:arrays state) assoc arr-name
            (into {} (map-indexed (fn [i p] [(str (inc i)) (v-numstr p)])
@@ -1110,10 +1257,12 @@
     (let [m (.matcher (compile-re (:pattern expr)) ^String (v->str (get-field state 0)))]
       (v-num (if (.find m) 1 0)))
 
+    :paren
+    (eval-expr state (:inner expr))
+
     :var
     (let [nm (:name expr)]
-      (case nm
-        ("NR" "NF" "FS" "OFS" "ORS" "RS" "FILENAME" "RSTART" "RLENGTH" "SUBSEP" "CONVFMT" "OFMT")
+      (if (special-var? nm)
         (get-special state nm)
         (get-global state nm)))
 
@@ -1122,9 +1271,15 @@
       (get-field state n))
 
     :index
-    (let [arr (get-array state (:array expr))
+    ;; awk quirk: reading a[k] inserts an empty entry if absent (so
+    ;; later `(k in a)` is true). Match that.
+    (let [nm (:array expr)
+          arr (get-array state nm)
           k (v->str (eval-expr state (first (:index expr))))]
-      (or (get arr k) (v-null)))
+      (if (contains? arr k)
+        (get arr k)
+        (do (set-array-elt! state nm k (v-null))
+            (v-null))))
 
     :unary
     (let [v (eval-expr state (:value expr))]
@@ -1177,33 +1332,56 @@
       (v-num (if (contains? (get-array state (:array expr)) k) 1 0)))
 
     :assign
-    (let [v (eval-expr state (:right expr))
-          l (:left expr)]
+    (let [l (:left expr)
+          ;; Pre-compute any side-effecting subexpression of the target
+          ;; (e.g. arr[k++]) BEFORE evaluating the RHS, to match awk's
+          ;; left-to-right semantics.
+          field-idx (when (= :field (:type l)) (long (v->num (eval-expr state (:index l)))))
+          arr-key (when (= :index (:type l)) (v->str (eval-expr state (first (:index l)))))
+          v (eval-expr state (:right expr))]
       (case (:type l)
         :var   (if (special-var? (:name l))
                  (set-special! state (:name l) v)
                  (set-global! state (:name l) v))
-        :field (set-field! state (long (v->num (eval-expr state (:index l)))) v)
-        :index (let [k (v->str (eval-expr state (first (:index l))))]
-                 (set-array-elt! state (:array l) k v)))
+        :field (set-field! state field-idx v)
+        :index (set-array-elt! state (:array l) arr-key v))
       v)
 
     :aug-assign
-    (let [cur (eval-expr state (:left expr))
+    (let [l (:left expr)
+          ;; Awk's evaluation order: lvalue index/key first (its subexpr
+          ;; can be side-effecting), then RHS (side-effects propagate),
+          ;; THEN read the current value.
+          field-idx (when (= :field (:type l)) (long (v->num (eval-expr state (:index l)))))
+          arr-key (when (= :index (:type l)) (v->str (eval-expr state (first (:index l)))))
           rhs (eval-expr state (:right expr))
+          cur (case (:type l)
+                :var   (if (special-var? (:name l))
+                         (get-special state (:name l))
+                         (get-global state (:name l)))
+                :field (get-field state field-idx)
+                :index (let [arr (get-array state (:array l))]
+                         (or (get arr arr-key) (v-null))))
           new (arith (:op expr) cur rhs)]
-      (case (:type (:left expr))
-        :var   (if (special-var? (:name (:left expr)))
-                 (set-special! state (:name (:left expr)) new)
-                 (set-global! state (:name (:left expr)) new))
-        :field (set-field! state (long (v->num (eval-expr state (:index (:left expr))))) new)
-        :index (let [k (v->str (eval-expr state (first (:index (:left expr)))))]
-                 (set-array-elt! state (:array (:left expr)) k new)))
+      (case (:type l)
+        :var   (if (special-var? (:name l))
+                 (set-special! state (:name l) new)
+                 (set-global! state (:name l) new))
+        :field (set-field! state field-idx new)
+        :index (set-array-elt! state (:array l) arr-key new))
       new)
 
     :incr
     (let [target (:expr expr)
-          cur (eval-expr state target)
+          field-idx (when (= :field (:type target)) (long (v->num (eval-expr state (:index target)))))
+          arr-key (when (= :index (:type target)) (v->str (eval-expr state (first (:index target)))))
+          cur (case (:type target)
+                :var   (if (special-var? (:name target))
+                         (get-special state (:name target))
+                         (get-global state (:name target)))
+                :field (get-field state field-idx)
+                :index (let [arr (get-array state (:array target))]
+                         (or (get arr arr-key) (v-null))))
           n (v->num cur)
           new (v-num (case (:op expr)
                        :incr (inc n)
@@ -1212,9 +1390,8 @@
         :var   (if (special-var? (:name target))
                  (set-special! state (:name target) new)
                  (set-global! state (:name target) new))
-        :field (set-field! state (long (v->num (eval-expr state (:index target)))) new)
-        :index (let [k (v->str (eval-expr state (first (:index target))))]
-                 (set-array-elt! state (:array target) k new)))
+        :field (set-field! state field-idx new)
+        :index (set-array-elt! state (:array target) arr-key new))
       (if (:pre? expr) new (v-num n)))
 
     :call
@@ -1361,6 +1538,7 @@
 (defn- run-record! [state program record]
   (set-line! state record)
   (set-special! state "NR" (v-num (inc (long (v->num (get-special state "NR"))))))
+  (set-special! state "FNR" (v-num (inc (long (v->num (get-special state "FNR"))))))
   (try
     (doseq [[idx {:keys [pattern stmts]}] (map-indexed vector (:actions program))]
       (when (pattern-match? state idx pattern)
@@ -1385,31 +1563,56 @@
     (catch clojure.lang.ExceptionInfo e
       (when-not (= :awk/exit (:awk/control (ex-data e))) (throw e)))))
 
+(defn- split-input-by-rs
+  "Split a raw input string into records using current RS. Standard
+   awk semantics: a single-char RS is a literal separator; multi-char
+   RS is treated as a regex; default \"\\n\" is paragraph-mode-free
+   line split. Trailing empty record after a final terminator is
+   dropped (so `a\\nb\\n` yields 2 records, not 3)."
+  [^String raw ^String rs]
+  (if (= "" raw) []
+    (let [parts (cond
+                  (= rs "\n") (vec (.split raw "\n" -1))
+                  (= 1 (count rs))
+                  (vec (.split raw (java.util.regex.Pattern/quote rs) -1))
+                  :else
+                  (vec (.split raw ^String rs -1)))
+          parts (if (and (seq parts) (= "" (last parts)))
+                  (vec (butlast parts))
+                  parts)]
+      parts)))
+
 (defn run
   "Top-level awk run.
 
    Options:
      :program  the awk source (string) — required
-     :input    seq of input record strings (typically lines from stdin
-               or files), nil for no-input
+     :input    seq of input record strings (already split by RS), OR
+     :raw-input  a single string to split internally by RS after BEGIN
      :fs       initial FS (default \" \")
      :vars     {name → value-string} from `-v VAR=val` (initialised as
                :numstr before BEGIN runs)
 
    Returns {:stdout str :exit int}."
-  [{:keys [program input fs vars]}]
+  [{:keys [program input raw-input fs vars]}]
   (let [state (init-state {:fs fs
                            :vars (into {} (for [[k v] vars] [k (v-numstr v)]))})
         ast (parse program)]
-    ;; BEGIN
+    ;; BEGIN — may change RS, so don't split raw-input yet
     (run-blocks state (:begin ast))
     ;; Per-record actions
     (when (and (seq (:actions ast)) (not @(:exit? state)))
-      (try
-        (doseq [record (or input []) :while (not @(:exit? state))]
-          (run-record! state ast record))
-        (catch clojure.lang.ExceptionInfo e
-          (when-not (= :awk/exit (:awk/control (ex-data e))) (throw e)))))
+      (let [records (cond
+                      (some? input) input
+                      (some? raw-input)
+                      (split-input-by-rs raw-input
+                                         (v->str (get-special state "RS")))
+                      :else [])]
+        (try
+          (doseq [record records :while (not @(:exit? state))]
+            (run-record! state ast record))
+          (catch clojure.lang.ExceptionInfo e
+            (when-not (= :awk/exit (:awk/control (ex-data e))) (throw e))))))
     ;; END
     (run-blocks state (:end ast))
     {:stdout (.toString ^StringBuilder (:out state))

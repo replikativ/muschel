@@ -21,11 +21,14 @@
 ;; Direct unit tests against the awk ns
 ;; ============================================================================
 
-(defn- run1 [src in]
+(defn- run1
+  "Pass `in` as :raw-input so the awk runtime sees the unsplit text
+   and can honor a runtime-modified RS."
+  [src in]
   (:stdout
    (awk/run
-    {:program src
-     :input   (if (= "" in) [] (str/split-lines in))})))
+    {:program   src
+     :raw-input in})))
 
 (deftest patterns
   (is (= "foo\n"        (run1 "/foo/" "foo\nbar")))
