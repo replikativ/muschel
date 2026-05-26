@@ -57,6 +57,16 @@
     (testing src
       (is (= :deny (:decision (check src)))))))
 
+(deftest run-and-capture-propagates-denied-reason
+  ;; `exec/run` returns `{:exit 126 :permit … :denied-reason "…"}` on
+  ;; a parse-time deny. `run-and-capture` must surface BOTH fields —
+  ;; the reason is what callers want for a user-visible error message.
+  (let [r (run-perm "rm -rf /tmp/x" {})]
+    (is (= 126 (:exit r)))
+    (is (string? (:denied-reason r))
+        "run-and-capture should propagate :denied-reason from run")
+    (is (= :deny (:decision (:permit r))))))
+
 (deftest defaults-ask-for-unknown
   (let [r (check "make install" {:prompter (fn [_] {:result :allow-once})})]
     (is (= :allow (:decision r)))
