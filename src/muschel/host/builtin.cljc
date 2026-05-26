@@ -81,23 +81,27 @@
 
 (defn- build-env
   "Minimal env value for builtin fns. Carries :cwd from :dir, any
-   :extra-env vars under :vars, and the resolved :stdin string for
-   builtins that read from it (grep/cat with no file args, tr, cut,
-   xargs, …). We resolve :in eagerly via the fallback host's
-   -read-all-string — fine for the bounded inputs builtins handle.
+   :extra-env vars under :vars, and a deferred `:stdin` for builtins
+   that read from it (grep/cat with no file args, tr, cut, xargs, …).
+
+   `:stdin` is a `delay` that slurps `:in` on first deref. Builtins
+   that never read stdin (e.g. `grep pattern file.txt`, `ls`) never
+   force it — so an unbounded source like `System/in` won't block
+   them. Builtins should go through `posix/read-stdin` /
+   `posix/stdin-available?` rather than touching `:stdin` directly.
 
    Also forwards `:interrupt-fn` (resource budget) and `:trace` (the
    introspection state) so builtins / awk can record their own
    events when needed."
   [{:keys [dir extra-env in interrupt-fn trace]} fallback-host fallback-fs]
-  (let [stdin (when in
-                (try (host/-read-all-string fallback-host in)
-                     (catch #?(:clj Throwable :cljs :default) _ nil)))]
-    (cond-> {:cwd  (or dir (fs/cwd fallback-fs))
-             :vars (or extra-env {})}
-      stdin        (assoc :stdin stdin)
-      interrupt-fn (assoc :interrupt-fn interrupt-fn)
-      trace        (assoc :trace trace))))
+  (cond-> {:cwd  (or dir (fs/cwd fallback-fs))
+           :vars (or extra-env {})}
+    in           (assoc :stdin
+                        (delay
+                          (try (host/-read-all-string fallback-host in)
+                               (catch #?(:clj Throwable :cljs :default) _ ""))))
+    interrupt-fn (assoc :interrupt-fn interrupt-fn)
+    trace        (assoc :trace trace)))
 
 (defn- invoke-builtin!
   "Run a builtin fn synchronously, write its stdout/stderr to the

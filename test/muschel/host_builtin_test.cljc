@@ -388,3 +388,76 @@
   (let [r (run (mk-host) "echo -n \"\" | xargs -r echo hello")]
     (is (= 0 (:exit r)))
     (is (= "" (:stdout r)))))
+
+;; ============================================================================
+;; Stdin laziness — `:in` must not be drained for builtins that don't use it
+;; ============================================================================
+;;
+;; Regression for the System/in hang: `build-env` used to eagerly slurp the
+;; stdin source for every builtin invocation, so `(run-and-capture …)` from
+;; a REPL — where `System/in` lacks EOF — blocked forever inside the slurp,
+;; even for programs like `grep PAT FILE` that never read stdin.
+;;
+;; Now: `run` doesn't default `:in` to `System/in`, and `build-env` wraps the
+;; slurp in a `delay` that builtins only force via `read-stdin`.
+;;
+;; These tests are JVM-only because they rely on `java.io.InputStream` /
+;; `System/setIn`. The contract they verify is platform-independent.
+
+#?(:clj
+   (defn- counting-stdin
+     "An InputStream that records every read() call in `counter` and
+      reports EOF (-1). Used to detect whether a builtin touched stdin."
+     [counter]
+     (proxy [java.io.InputStream] []
+       (read
+         ([]      (swap! counter inc) -1)
+         ([_]     (swap! counter inc) -1)
+         ([_ _ _] (swap! counter inc) -1))
+       (available [] 0))))
+
+#?(:clj
+   (deftest builtin-stdin-not-drained-when-unused
+     (let [reads (atom 0)
+           src   (counting-stdin reads)
+           host  (mk-host)
+           r     (m/run-and-capture (m/new-env) "grep beta a.txt"
+                                    {:host host :in src})]
+       (is (= 0 (:exit r)))
+       (is (= "beta\n" (:stdout r)))
+       (is (zero? @reads)
+           "grep with file args must not touch the stdin source"))))
+
+#?(:clj
+   (deftest builtin-stdin-still-drained-when-needed
+     ;; The flip side: with no files, grep DOES read stdin. The lazy
+     ;; delay should be forced on first access from read-stdin.
+     (let [src  (java.io.ByteArrayInputStream.
+                 (.getBytes "alpha\nbeta\ngamma\n" "UTF-8"))
+           host (mk-host)
+           r    (m/run-and-capture (m/new-env) "grep beta"
+                                   {:host host :in src})]
+       (is (= 0 (:exit r)))
+       (is (= "beta\n" (:stdout r))))))
+
+#?(:clj
+   (deftest run-and-capture-doesnt-block-on-open-stdin
+     ;; The original bug report: from a REPL where System/in has no
+     ;; writer-EOF, `(m/run-and-capture env "grep beta a.txt" {:host host})`
+     ;; used to hang. Simulate that with a PipedInputStream whose writer
+     ;; end is held open and never closed — slurp on it would block.
+     (let [piped-in (java.io.PipedInputStream.)
+           _writer  (java.io.PipedOutputStream. piped-in)  ; never closed
+           prev-in  System/in]
+       (try
+         (System/setIn piped-in)
+         (let [fut (future
+                     (m/run-and-capture (m/new-env) "grep beta a.txt"
+                                        {:host (mk-host)}))
+               r   (deref fut 5000 :TIMEOUT)]
+           (when (= :TIMEOUT r) (future-cancel fut))
+           (is (not= :TIMEOUT r)
+               "run-and-capture must return without slurping System/in")
+           (is (= 0 (:exit r)))
+           (is (= "beta\n" (:stdout r))))
+         (finally (System/setIn prev-in))))))

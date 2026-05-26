@@ -16,7 +16,8 @@
          → {:env env' :exit int :stdout str :stderr str}
 
    `opts` may include:
-     :in   — InputStream  (default: System/in)
+     :in   — InputStream  (default: nil — no stdin; pass `System/in`
+                          explicitly for interactive inheritance)
      :out  — OutputStream (default: System/out)
      :err  — OutputStream (default: System/err)
 
@@ -2528,11 +2529,16 @@
                           :prev-cwd (mfs/cwd effective-fs))
                    ifn                                         (assoc :interrupt-fn ifn)
                    trace-state                                 (assoc :trace trace-state))
-             opts' (cond-> {:in  (or in #?(:clj System/in :cljs nil))
-                            :out (or out #?(:clj System/out :cljs (host/string-sink h)))
+             ;; `:in` deliberately has NO default: defaulting to
+             ;; `System/in` on JVM blocks any builtin invocation when
+             ;; stdin lacks EOF (REPLs, nrepl sessions, agents driving
+             ;; muschel programmatically). Callers wanting interactive
+             ;; stdin inheritance pass `:in System/in` explicitly.
+             opts' (cond-> {:out (or out #?(:clj System/out :cljs (host/string-sink h)))
                             :err (or err #?(:clj System/err :cljs (host/string-sink h)))
                             :session sess
                             :host h}
+                     in     (assoc :in in)
                      permit (assoc :permit permit))
              opts'' (merge opts' (expand-opts opts'))
              env' (exec-stmts env (:stmts ast) opts'')]
