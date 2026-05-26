@@ -535,13 +535,16 @@
 (defn- parse-and [state]
   (loop [l (parse-in state)]
     (if (at? state :and)
-      (do (advance! state) (recur {:type :binary :op :and :left l :right (parse-in state)}))
+      ;; The RHS of `&&` may itself be an assignment in awk —
+      ;; `if (1 && x = 2)` parses as `if (1 && (x = 2))`. Recurse
+      ;; through parse-expr to allow that.
+      (do (advance! state) (recur {:type :binary :op :and :left l :right (parse-expr state)}))
       l)))
 
 (defn- parse-or [state]
   (loop [l (parse-and state)]
     (if (at? state :or)
-      (do (advance! state) (recur {:type :binary :op :or :left l :right (parse-and state)}))
+      (do (advance! state) (recur {:type :binary :op :or :left l :right (parse-expr state)}))
       l)))
 
 (defn- parse-cond [state]
@@ -821,16 +824,37 @@
 (defn- parse-num-prefix
   "Match leading numeric prefix of `s`. Returns [num parsed?] —
    `parsed?` indicates whether the *whole* string was consumed
-   (numeric throughout)."
+   (numeric throughout). Recognises:
+     1, 1.5, .5, 1e10, 1E+10
+     0x22, -0xa, 0XABCDEF      (hex int)
+     nan, NAN, +nan, -nan      (NaN, sign ignored)
+     inf, INF, infinity, +inf  (positive infinity)
+     -inf                       (negative infinity)"
   [^String s]
   (let [s (str/triml s)]
     (cond
       (str/blank? s) [0.0 false]
       :else
-      (let [m (re-find #"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?" s)]
-        (if m
-          [(Double/parseDouble m) (= (count m) (count s))]
-          [0.0 false])))))
+      (let [;; nan / inf
+            m-nan (re-find #"^[+-]?(?i:nan)" s)
+            m-inf (re-find #"^([+-]?)(?i:infinity|inf)" s)
+            m-hex (re-find #"^([+-]?)0[xX]([0-9a-fA-F]+)" s)
+            m-dec (re-find #"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?" s)]
+        (cond
+          m-nan [Double/NaN (= (count m-nan) (count s))]
+          m-inf (let [sign (nth m-inf 1)
+                      v (if (= "-" sign)
+                          Double/NEGATIVE_INFINITY
+                          Double/POSITIVE_INFINITY)]
+                  [v (= (count (first m-inf)) (count s))])
+          m-hex (let [whole (first m-hex)
+                      sign (nth m-hex 1)
+                      digits (nth m-hex 2)
+                      n (Long/parseLong digits 16)
+                      v (double (if (= "-" sign) (- n) n))]
+                  [v (= (count whole) (count s))])
+          m-dec [(Double/parseDouble m-dec) (= (count m-dec) (count s))]
+          :else [0.0 false])))))
 
 (defn- v->num [v]
   (case (:tag v)
@@ -838,25 +862,28 @@
     :num  (:n v)
     (:str :numstr) (first (parse-num-prefix (:s v)))))
 
+(def ^:dynamic *convfmt* "%.6g")
+
 (defn- fmt-num
   "awk's CONVFMT/OFMT formatting. Integers print as integers; doubles
-   use %.6g, then trim trailing zeros (so 2.86 not 2.86000) — that's
-   how POSIX/gawk render."
-  [n]
-  (cond
-    (Double/isNaN n) "nan"
-    (Double/isInfinite n) (if (pos? n) "inf" "-inf")
-    (== n (Math/floor n)) (str (long n))
-    :else
-    (let [s (format "%.6g" n)
-          i (.indexOf ^String s "e")
-          [mant exp] (if (>= i 0) [(subs s 0 i) (subs s i)] [s ""])
-          mant' (if (.contains ^String mant ".")
-                  (-> mant
-                      (str/replace #"0+$" "")
-                      (str/replace #"\.$" ""))
-                  mant)]
-      (str mant' exp))))
+   use the current CONVFMT (read from the dynamic *convfmt*), then
+   trim trailing zeros (so 2.86 not 2.86000)."
+  ([n] (fmt-num n *convfmt*))
+  ([n fmt]
+   (cond
+     (Double/isNaN n) "nan"
+     (Double/isInfinite n) (if (pos? n) "inf" "-inf")
+     (== n (Math/floor n)) (str (long n))
+     :else
+     (let [s (format fmt n)
+           i (.indexOf ^String s "e")
+           [mant exp] (if (>= i 0) [(subs s 0 i) (subs s i)] [s ""])
+           mant' (if (.contains ^String mant ".")
+                   (-> mant
+                       (str/replace #"0+$" "")
+                       (str/replace #"\.$" ""))
+                   mant)]
+       (str mant' exp)))))
 
 (defn- v->str [v]
   (case (:tag v)
@@ -941,10 +968,12 @@
         (< n cur-len) (reset! (:fields state) (vec (take n cur)))
         (> n cur-len) (reset! (:fields state) (vec (concat cur (repeat (- n cur-len) (v-str ""))))))
       (rebuild-line! state)
-      ;; rebuild-line! overwrites NF with the new field count. Restore
-      ;; the user's original assigned value (which may be a string like
-      ;; "x" that numerically coerces to 0).
       (swap! (:specials state) assoc "NF" v))
+    "CONVFMT"
+    ;; CONVFMT controls number→string conversion in expression context.
+    ;; fmt-num reads the dynamic *convfmt*; update it now so any later
+    ;; v->str picks it up.
+    (alter-var-root #'*convfmt* (constantly (v->str v)))
     nil))
 
 (defn- get-global [state nm]
@@ -1044,9 +1073,21 @@
 
 ;; ---- built-in functions --------------------------------------------------
 
-(defn- bi-length [args state]
-  (let [s (if (empty? args) (v->str (get-field state 0)) (v->str (first args)))]
-    (v-num (count s))))
+(defn- bi-length
+  "length() — defaults to length of $0; length(s) → char count;
+   length(array) → entry count (gawk extension, often relied on)."
+  [args state ast-args]
+  (cond
+    (empty? args)
+    (v-num (count (v->str (get-field state 0))))
+    ;; Array form: the arg AST is a bare :var whose name refers to an
+    ;; array we've seen. Distinguish from a string by checking the
+    ;; array registry.
+    (and (= 1 (count ast-args))
+         (= :var (:type (first ast-args)))
+         (contains? @(:arrays state) (:name (first ast-args))))
+    (v-num (count (get @(:arrays state) (:name (first ast-args)))))
+    :else (v-num (count (v->str (first args))))))
 
 (defn- bi-substr [args]
   (let [s (v->str (first args))
@@ -1067,7 +1108,10 @@
 (defn- bi-index [args]
   (let [s (v->str (first args))
         t (v->str (second args))]
-    (v-num (inc (.indexOf ^String s ^String t)))))
+    (cond
+      ;; POSIX: index(s, "") returns 0 (no match), not 1.
+      (= "" t) (v-num 0)
+      :else (v-num (inc (.indexOf ^String s ^String t))))))
 
 (defn- bi-split [ast-args state]
   ;; `ast-args` are the *unevaluated* parser nodes, because we need to
@@ -1086,9 +1130,12 @@
                        [(:pattern third) true]
                        :else
                        [(v->str (eval-expr state third)) false])
-        ;; When the separator is a *regex literal*, never apply the
-        ;; FS=" " whitespace-split rule — `/ /` means literal space.
+        ;; Empty separator → split into individual characters (gawk
+        ;; extension that many scripts rely on).
         parts (cond
+                (and (not regex?) (= "" pat))
+                (cond (= "" s) []
+                      :else (mapv str (seq s)))
                 regex?
                 (cond
                   (= "" s) []
@@ -1214,9 +1261,31 @@
                                        (conj! coercers (fn [v] (long (v->num v)))))
                 (= kind \s) (do (.append sb \%) (.append sb spec-body) (.append sb \s)
                                 (conj! coercers (fn [v] (v->str v))))
-                (#{\e \E \f \g \G} kind)
+                (#{\e \E \f} kind)
                 (do (.append sb \%) (.append sb spec-body) (.append sb kind)
-                    (conj! coercers (fn [v] (double (v->num v))))))
+                    (conj! coercers (fn [v] (double (v->num v)))))
+                (#{\g \G} kind)
+                ;; Java's %g pads to full precision (1234.50); awk
+                ;; trims (1234.5). Format with Java then strip trailing
+                ;; zeros, splice into the output via %s.
+                (do (.append sb "%s")
+                    (conj! coercers
+                           (let [jfmt (str "%" spec-body kind)]
+                             (fn [v]
+                               (let [s (format jfmt (double (v->num v)))
+                                     ;; Strip trailing zeros from the
+                                     ;; fractional part; keep exponent
+                                     ;; if present.
+                                     i (.indexOf ^String s (int (if (= kind \G) \E \e)))
+                                     [mant exp] (if (>= i 0)
+                                                  [(subs s 0 i) (subs s i)]
+                                                  [s ""])
+                                     mant' (if (.contains ^String mant ".")
+                                             (-> mant
+                                                 (str/replace #"0+$" "")
+                                                 (str/replace #"\.$" ""))
+                                             mant)]
+                                 (str mant' exp)))))))
               (recur end))
             :else
             (do (.append sb c) (recur (inc i)))))))
@@ -1397,7 +1466,7 @@
     :call
     (let [args (mapv #(eval-expr state %) (:args expr))]
       (case (:func expr)
-        :length (bi-length args state)
+        :length (bi-length args state (:args expr))
         :substr (bi-substr args)
         :index  (bi-index args)
         :split  (bi-split (:args expr) state)
@@ -1436,9 +1505,16 @@
     (let [args (:args stmt)
           ofs (v->str (get-special state "OFS"))
           ors (v->str (get-special state "ORS"))
+          ofmt (v->str (get-special state "OFMT"))
+          ;; OFMT formats numeric values (only :num — :numstr stays
+          ;; as the original string).
+          v->print-str (fn [v]
+                         (case (:tag v)
+                           :num (fmt-num (:n v) ofmt)
+                           (v->str v)))
           parts (if (empty? args)
                   [(v->str (get-field state 0))]
-                  (mapv #(v->str (eval-expr state %)) args))]
+                  (mapv #(v->print-str (eval-expr state %)) args))]
       (emit state (str (str/join ofs parts) ors)))
 
     :printf
@@ -1595,13 +1671,19 @@
 
    Returns {:stdout str :exit int}."
   [{:keys [program input raw-input fs vars]}]
+  ;; Reset the CONVFMT-tracking dyn-var so a prior run's CONVFMT
+  ;; doesn't leak in.
+  (alter-var-root #'*convfmt* (constantly "%.6g"))
   (let [state (init-state {:fs fs
                            :vars (into {} (for [[k v] vars] [k (v-numstr v)]))})
         ast (parse program)]
     ;; BEGIN — may change RS, so don't split raw-input yet
     (run-blocks state (:begin ast))
-    ;; Per-record actions
-    (when (and (seq (:actions ast)) (not @(:exit? state)))
+    ;; Per-record actions. We also iterate records when ONLY an END
+    ;; block is present, so its body can rely on NR / NF / $0 from
+    ;; the last record (matches gawk + goawk).
+    (when (and (or (seq (:actions ast)) (seq (:end ast)))
+               (not @(:exit? state)))
       (let [records (cond
                       (some? input) input
                       (some? raw-input)
