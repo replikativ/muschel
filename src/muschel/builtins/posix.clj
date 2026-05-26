@@ -1849,7 +1849,9 @@
                          ["-v" "--verbose"]])]
     (cond
       err (usage-err "rm" err)
-      (empty? pos) (if (:force opts) (ok "") (usage-err "rm" "missing operand"))
+      ;; Native: `rm` always requires at least one operand. -f silences
+      ;; per-file 'no such file' errors, not the missing-operand error.
+      (empty? pos) (usage-err "rm" "missing operand")
       :else
       (let [recursive? (or (:recursive opts) (:recursive-cap opts))
             stdout    (volatile! "")
@@ -1899,22 +1901,30 @@
 
 (defn- cp-target
   "If `dst` is an existing dir, append SRC's basename; otherwise use
-   DST as the final filename."
+   DST as the final filename. SRC's trailing slashes are stripped so
+   `cp d/ d2` resolves to `d2` (the dir's contents), matching native
+   cp behaviour."
   [fs src dst]
   (let [s (fs/stat fs dst)]
     (if (and s (= :dir (:type s)))
-      (let [base (last (str/split src #"/"))]
+      (let [src-trimmed (str/replace src #"/+$" "")
+            base (last (str/split src-trimmed #"/"))]
         (str (str/replace dst #"/+$" "") "/" base))
       dst)))
 
 (defn cp
-  "POSIX cp. -r/-R for recursive."
+  "POSIX cp. -r/-R for recursive. -p (preserve attributes) is a no-op
+   here since the VFS already preserves mtime through stat round-trip.
+   -n (no-clobber) refuses to overwrite an existing destination."
   [argv fs _env]
   (let [{:keys [opts pos err]}
         (cli-parse argv [["-r" "--recursive"]
                          ["-R" "--recursive-cap"]
                          ["-f" "--force"]
-                         ["-v" "--verbose"]])]
+                         ["-v" "--verbose"]
+                         ["-p" "--preserve"]
+                         ["-n" "--no-clobber"]
+                         ["-i" "--interactive"]])]
     (cond
       err (usage-err "cp" err)
       (< (count pos) 2) (usage-err "cp" "missing destination file operand")
@@ -1935,16 +1945,25 @@
                   (vreset! any-err? true))
               :else
               (let [final (cp-target fs src dst)]
-                (when-not (copy-tree! fs src final)
-                  (vswap! stderr str "cp: failed to copy '" src "' to '" final "'\n")
-                  (vreset! any-err? true))))))
+                (cond
+                  (and (:no-clobber opts) (fs/exists? fs final))
+                  nil  ; silently skip per GNU `cp -n`
+                  :else
+                  (when-not (copy-tree! fs src final)
+                    (vswap! stderr str "cp: failed to copy '" src "' to '" final "'\n")
+                    (vreset! any-err? true)))))))
         {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
 
 (defn mv
-  "POSIX mv. Same final-arg semantics as cp."
+  "POSIX mv. Same final-arg semantics as cp. -n refuses to overwrite
+   an existing destination; -f silences errors; -i (interactive) is
+   accepted but always behaves like -f (we have no TTY for prompting)."
   [argv fs _env]
-  (let [{:keys [pos err]} (cli-parse argv [["-f" "--force"]
-                                           ["-v" "--verbose"]])]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-f" "--force"]
+                         ["-v" "--verbose"]
+                         ["-n" "--no-clobber"]
+                         ["-i" "--interactive"]])]
     (cond
       err (usage-err "mv" err)
       (< (count pos) 2) (usage-err "mv" "missing destination file operand")
@@ -1955,9 +1974,13 @@
             any-err?  (volatile! false)]
         (doseq [src srcs]
           (let [final (cp-target fs src dst)]
-            (when-not (fs/rename fs src final)
-              (vswap! stderr str "mv: cannot move '" src "' to '" final "'\n")
-              (vreset! any-err? true))))
+            (cond
+              (and (:no-clobber opts) (fs/exists? fs final))
+              nil  ; skip
+              :else
+              (when-not (fs/rename fs src final)
+                (vswap! stderr str "mv: cannot move '" src "' to '" final "'\n")
+                (vreset! any-err? true)))))
         {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
 
 (defn- parse-mode-octal
@@ -2151,49 +2174,65 @@
 ;; Path tools: basename, dirname, realpath
 ;; ============================================================================
 
+(defn- basename-one [path suffix]
+  (let [base
+        (cond
+          (re-matches #"/+" path) "/"  ; POSIX: basename / → /
+          :else
+          (let [trimmed (str/replace path #"/+$" "")
+                last-seg (last (str/split trimmed #"/"))]
+            (or last-seg trimmed)))]
+    (if (and suffix
+             (not= base suffix)
+             (str/ends-with? base suffix))
+      (subs base 0 (- (count base) (count suffix)))
+      base)))
+
 (defn basename
-  "POSIX basename PATH [SUFFIX]."
+  "POSIX basename PATH [SUFFIX]. -a treats every arg as a path (no
+   SUFFIX consumed); -s SUFFIX strips a common suffix from each;
+   -z separates with NUL instead of newline."
   [argv _fs _env]
-  (let [args (rest argv)]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-a" "--multiple"]
+                         ["-s" "--suffix SUFFIX"]
+                         ["-z" "--zero"]])]
     (cond
-      (empty? args) (usage-err "basename" "missing operand")
+      err (usage-err "basename" err)
+      (empty? pos) (usage-err "basename" "missing operand")
       :else
-      (let [[path suffix] args
-            base
-            (cond
-              ;; POSIX: basename of `/` is `/`.
-              (re-matches #"/+" path) "/"
-              :else
-              (let [trimmed (str/replace path #"/+$" "")
-                    last-seg (last (str/split trimmed #"/"))]
-                (or last-seg trimmed)))
-            base' (if (and suffix
-                           (not= base suffix)
-                           (str/ends-with? base suffix))
-                    (subs base 0 (- (count base) (count suffix)))
-                    base)]
-        (ok (str base' "\n"))))))
+      (let [sep (if (:zero opts) "\0" "\n")
+            paths (if (or (:multiple opts) (:suffix opts))
+                    pos
+                    [(first pos)])
+            suffix (or (:suffix opts)
+                       (when (and (not (:multiple opts))
+                                  (= 2 (count pos)))
+                         (second pos)))
+            outs (mapv #(basename-one % suffix) paths)]
+        (ok (str (str/join sep outs) sep))))))
 
 (defn dirname
-  "POSIX dirname PATH... (one or more)."
+  "POSIX dirname PATH...  -z separates outputs with NUL."
   [argv _fs _env]
-  (let [paths (rest argv)]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-z" "--zero"]])]
     (cond
-      (empty? paths) (usage-err "dirname" "missing operand")
+      err (usage-err "dirname" err)
+      (empty? pos) (usage-err "dirname" "missing operand")
       :else
-      (let [out (str/join "\n"
-                          (for [p paths]
-                            (cond
-                              ;; POSIX: dirname of `/` is `/`. Of `//` is `//`.
-                              (re-matches #"/+" p) "/"
-                              :else
-                              (let [trimmed (str/replace p #"/+$" "")
-                                    idx     (.lastIndexOf ^String trimmed "/")]
-                                (cond
-                                  (neg? idx)  "."
-                                  (zero? idx) "/"
-                                  :else       (subs trimmed 0 idx))))))]
-        (ok (str out "\n"))))))
+      (let [sep (if (:zero opts) "\0" "\n")
+            outs (for [p pos]
+                   (cond
+                     (re-matches #"/+" p) "/"  ; POSIX: dirname / → /
+                     :else
+                     (let [trimmed (str/replace p #"/+$" "")
+                           idx     (.lastIndexOf ^String trimmed "/")]
+                       (cond
+                         (neg? idx)  "."
+                         (zero? idx) "/"
+                         :else       (subs trimmed 0 idx)))))]
+        (ok (str (str/join sep outs) sep))))))
 
 (defn realpath
   "Canonicalise a path through the FS. -m (canonicalize-missing) lets
@@ -2618,13 +2657,29 @@
   (let [flags (or flags "")
         case-insensitive? (str/includes? flags "i")
         global?           (str/includes? flags "g")
+        ;; `s/PAT/REPL/N` (N a digit) replaces only the Nth match.
+        ;; Recognise the first digit run as the target index.
+        nth-target (when-let [m (re-find #"\d+" flags)]
+                     (Long/parseLong m))
         pat-flags (cond-> 0
                     case-insensitive? (bit-or java.util.regex.Pattern/CASE_INSENSITIVE))
         re (java.util.regex.Pattern/compile pat pat-flags)
         m  (.matcher re ^String line)]
-    (if global?
-      (.replaceAll m repl)
-      (.replaceFirst m repl))))
+    (cond
+      nth-target
+      (let [sb  (StringBuffer.)
+            cnt (volatile! 0)]
+        (loop []
+          (when (.find m)
+            (vswap! cnt inc)
+            ;; `$0` re-emits the matched text unchanged.
+            (.appendReplacement m sb (if (= @cnt nth-target) repl "$0"))
+            (recur)))
+        (.appendTail m sb)
+        (.toString sb))
+
+      global?  (.replaceAll m repl)
+      :else    (.replaceFirst m repl))))
 
 (defn sed
   "POSIX sed, subset:
@@ -2802,38 +2857,23 @@
     :else false))
 
 (defn awk
-  "Minimal awk:
-     awk '/PAT/'         print matching lines (implicit `{print}`)
-     awk '/PAT/ {…}'     run action on matches
-     awk '{print $N}'    field-printing
-     awk 'NR==N'         N-th line
-   -F SEP sets the field separator (default whitespace)."
-  [argv fs env]
-  (let [{:keys [opts pos err]}
-        (cli-parse argv [["-F" "--field-separator SEP" :default " "]])]
-    (cond
-      err (usage-err "awk" err)
-      (empty? pos) (usage-err "awk" "missing program")
-      :else
-      (let [prog (first pos)
-            ;; File args after the program; stdin if none. Reads go
-            ;; through the FS handle so awk respects containment.
-            files (rest pos)
-            rules (awk-parse-program prog)
-            stdin (or (:stdin env) "")
-            content (if (seq files)
-                      (str/join "\n" (map (fn [f] (or (fs/read-file fs f) "")) files))
-                      stdin)
-            lines (str/split-lines content)
-            out (StringBuilder.)]
-        (doseq [[idx ^String line] (map-indexed vector lines)]
-          (let [nr (inc idx)
-                fields (awk-split-line line (:field-separator opts))
-                nf (count fields)]
-            (doseq [{:keys [pattern action]} rules
-                    :when (awk-pattern-match? pattern line nr)]
-              (awk-eval-action action {:fields fields :nr nr :nf nf :out out}))))
-        (ok (.toString out))))))
+  "Not implemented. A faithful awk needs the full pattern-action
+   language (BEGIN/END, -v VAR=val, arithmetic, string ops, regex
+   predicates, printf inside actions, associative arrays). A shallow
+   subset is worse than none — agents write idiomatic awk and
+   silently get empty output.
+
+   For now: use the available text builtins (cut / grep / sed / tr /
+   sort / uniq) and pipe them. For richer tabular work, the host
+   embedding muschel typically exposes a Clojure surface (SCI, REPL,
+   or library calls) better suited to the task."
+  [_argv _fs _env]
+  (err (str "awk: not implemented.\n"
+            "  field projection:  cut -d ' ' -f N\n"
+            "  line filtering:    grep PATTERN\n"
+            "  substitution:      sed 's/.../.../'\n"
+            "  numeric pipelines: prefer the host's Clojure surface")
+       1))
 
 ;; ============================================================================
 ;; jq — JSON projection & filtering
@@ -2903,10 +2943,14 @@
     (let [n (Long/parseLong (subs step 1 (dec (count step))))]
       (when (sequential? v) (nth v n nil)))
 
-    (re-matches #"\[\d+:\d+\]" step)
-    (let [[_ a b] (re-find #"\[(\d+):(\d+)\]" step)
-          aa (Long/parseLong a) bb (Long/parseLong b)]
-      (when (sequential? v) (subvec (vec v) (min aa (count v)) (min bb (count v)))))
+    ;; Full slice `.[a:b]` plus open-ended `.[a:]` / `.[:b]`.
+    (re-matches #"\[\d*:\d*\]" step)
+    (let [[_ a b] (re-find #"\[(\d*):(\d*)\]" step)
+          n  (when (sequential? v) (count v))
+          aa (if (str/blank? a) 0 (Long/parseLong a))
+          bb (if (str/blank? b) (or n 0) (Long/parseLong b))]
+      (when n
+        (subvec (vec v) (min aa n) (min bb n))))
 
     ;; .field — strip the leading dot if present
     :else
@@ -3146,14 +3190,19 @@
           (let [status (.statusCode ^java.net.http.HttpResponse resp)
                 body   ^bytes (.body ^java.net.http.HttpResponse resp)
                 hdr-out (when (:include opts)
-                          (let [hs (.headers ^java.net.http.HttpResponse resp)]
-                            (str "HTTP/" status "\n"
+                          (let [hs (.headers ^java.net.http.HttpResponse resp)
+                                version (.version ^java.net.http.HttpResponse resp)
+                                v-str (case (.name ^java.net.http.HttpClient$Version version)
+                                        "HTTP_1_1" "HTTP/1.1"
+                                        "HTTP_2"   "HTTP/2"
+                                        "HTTP/1.1")]
+                            (str v-str " " status "\r\n"
                                  (str/join
                                   ""
                                   (for [[k vs] (.map hs)
                                         v vs]
-                                    (str k ": " v "\n")))
-                                 "\n")))
+                                    (str k ": " v "\r\n")))
+                                 "\r\n")))
                 target (or (:output opts)
                            (when (:remote-name opts)
                              (last (str/split url #"/"))))

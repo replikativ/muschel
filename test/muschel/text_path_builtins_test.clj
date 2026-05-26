@@ -191,34 +191,19 @@
 
 ;; ============================================================================
 ;; awk
+;;
+;; A faithful awk needs the full pattern-action language. A shallow
+;; subset is worse than none — agents write `'NR>1 && $3>10 {print}'`
+;; and silently get nothing back. So awk refuses with a clear message
+;; that steers them to cut+grep or clojure_eval.
 ;; ============================================================================
 
-(deftest awk-print-default
+(deftest awk-refuses-with-guidance
   (let [r (run (mk-host) "echo hi | awk '{print}'")]
-    (is (= 0 (:exit r)))
-    (is (= "hi\n" (:stdout r)))))
-
-(deftest awk-print-field
-  (let [r (run (mk-host) "echo 'a b c' | awk '{print $2}'")]
-    (is (= 0 (:exit r)))
-    (is (= "b\n" (:stdout r)))))
-
-(deftest awk-csv-field-separator
-  (let [r (run (mk-host) "awk -F , '{print $1}' csv")]
-    (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "name"))
-    (is (.contains ^String (:stdout r) "alice"))
-    (is (.contains ^String (:stdout r) "bob"))))
-
-(deftest awk-pattern-match
-  (let [r (run (mk-host) "awk '/beta/' a.txt")]
-    (is (= 0 (:exit r)))
-    (is (= "beta\n" (:stdout r)))))
-
-(deftest awk-nr-eq
-  (let [r (run (mk-host) "awk 'NR==2 {print}' a.txt")]
-    (is (= 0 (:exit r)))
-    (is (= "beta\n" (:stdout r)))))
+    (is (= 1 (:exit r)))
+    (is (re-find #"not implemented" (:stderr r)))
+    (is (re-find #"cut|sed|grep" (:stderr r))
+        "stderr should suggest the available builtins")))
 
 ;; ============================================================================
 ;; sed — range addresses
