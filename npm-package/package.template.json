@@ -12,7 +12,8 @@
     "muschel.js.map",
     "index.d.ts",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "dist/playground"
   ],
   "keywords": [
     "shell",
@@ -35,5 +36,5 @@
   },
   "homepage": "https://github.com/replikativ/muschel",
   "author": "Christian Weilbach",
-  "license": "EPL-1.0"
+  "license": "Apache-2.0"
 }

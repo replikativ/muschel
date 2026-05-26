@@ -130,7 +130,10 @@
 (defn build-playground
   "Build the shadow-cljs :playground target into dist/playground/.
    Clears any prior dev-build artifacts (cljs-runtime/, manifest.edn)
-   so what ships to npm is just the minified bundle."
+   so what ships to npm is just the minified bundle, then mirrors the
+   bundle into `npm-package/dist/playground/` so it's included in the
+   npm tarball — unpkg loads `dist/playground/playground.js` from the
+   published package."
   [_]
   (println "Building :playground via shadow-cljs...")
   (b/delete {:path "dist/playground"})
@@ -138,12 +141,17 @@
     (when (not= 0 (:exit ret))
       (throw (ex-info "shadow-cljs playground build failed" {:exit (:exit ret)}))))
   (b/delete {:path "dist/playground/cljs-runtime"})
-  (b/delete {:path "dist/playground/manifest.edn"}))
+  (b/delete {:path "dist/playground/manifest.edn"})
+  (b/delete {:path "npm-package/dist/playground"})
+  (b/copy-dir {:src-dirs ["dist/playground"]
+               :target-dir "npm-package/dist/playground"}))
 
-(defn npm-publish
-  "Bump version, build the npm bundle, then `npm publish` from
-   `npm-package/`. Requires npx + npm on PATH and an authenticated
-   npm session (with --otp if 2FA is enabled).
+(defn npm-pack
+  "Build everything that ships in the npm tarball — the library bundle
+   (`muschel.js`), the playground bundle (`dist/playground/playground.js`,
+   served from unpkg by the README playground link), and the stamped
+   `package.json`. Doesn't publish — leaves `npm-package/` ready for
+   either `npm pack --dry-run` (inspection) or `npm publish` (release).
 
    Layout (datahike pattern):
 
@@ -152,10 +160,21 @@
        package.json           ← generated each publish from template
        muschel.js             ← shadow-cljs :npm output
        index.d.ts             ← hand-authored TS types
+       dist/playground/       ← shadow-cljs :playground release
        README.md, LICENSE     ← shipped as `files`"
   [_]
-  (build-npm nil)               ; produce muschel.js first
-  (npm-version nil)             ; then stamp package.json
+  (build-npm nil)
+  (build-playground nil)
+  (npm-version nil))
+
+(defn npm-publish
+  "Build everything (via `npm-pack`), then `npm publish` from
+   `npm-package/`. Requires npx + npm on PATH and an authenticated
+   npm session (`--otp 123456` from your authenticator app if TOTP
+   2FA is enabled, or an automation token from npmjs.com → Access
+   Tokens for non-interactive runs)."
+  [_]
+  (npm-pack nil)
   (println "Publishing to npm from npm-package/...")
   (let [ret (b/process {:command-args ["npm" "publish" "--access" "public"]
                         :dir "npm-package"})]
