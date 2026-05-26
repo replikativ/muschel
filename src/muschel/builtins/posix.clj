@@ -1681,12 +1681,323 @@
              :exit (if @any-err? 1 0)}))))))
 
 ;; ============================================================================
+;; Write builtins — touch, mkdir, rmdir, rm, cp, mv, chmod, ln, tee
+;;
+;; Each goes through the muschel.fs protocol so containment is enforced.
+;; None touches the fallback host's file methods directly.
+;; ============================================================================
+
+(defn touch
+  "POSIX touch. Create empty file if missing, update mtime if existing.
+   -c skips creation. -a / -m selective time-axes treated as no-ops."
+  [argv fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-a" "--access-only"]
+                         ["-c" "--no-create"]
+                         ["-m" "--mtime-only"]])]
+    (cond
+      err (usage-err "touch" err)
+      (empty? pos) (usage-err "touch" "missing file operand")
+      :else
+      (let [stderr (volatile! "")
+            any-err? (volatile! false)]
+        (doseq [f pos]
+          (let [existing (fs/exists? fs f)]
+            (cond
+              (and (:no-create opts) (not existing)) nil
+              :else
+              (when-not (fs/touch fs f)
+                (vswap! stderr str "touch: " f ": cannot touch (outside root?)\n")
+                (vreset! any-err? true)))))
+        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+(defn- mkdir-p
+  "Create every missing ancestor of `path` (including path itself).
+   Returns truthy only when the final path is a directory."
+  [fs ^String path]
+  (let [absolute? (str/starts-with? path "/")
+        segs      (->> (str/split path #"/") (filter seq) vec)
+        start     (if absolute? "/" (fs/cwd fs))
+        steps     (rest (reductions (fn [acc s]
+                                      (str (str/replace acc #"/+$" "") "/" s))
+                                    start
+                                    segs))]
+    (every?
+     (fn [p]
+       (if (fs/exists? fs p)
+         (= :dir (:type (fs/stat fs p)))
+         (fs/mkdir fs p)))
+     steps)))
+
+(defn mkdir
+  "POSIX mkdir. -p creates parents (and is idempotent on existing dirs)."
+  [argv fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-p" "--parents"]
+                         ["-m" "--mode MODE"]])]
+    (cond
+      err (usage-err "mkdir" err)
+      (empty? pos) (usage-err "mkdir" "missing operand")
+      :else
+      (let [stderr (volatile! "")
+            any-err? (volatile! false)]
+        (doseq [d pos]
+          (cond
+            (:parents opts)
+            (when-not (mkdir-p fs d)
+              (vswap! stderr str "mkdir: cannot create directory '" d "'\n")
+              (vreset! any-err? true))
+            (fs/exists? fs d)
+            (do (vswap! stderr str "mkdir: cannot create directory '" d "': File exists\n")
+                (vreset! any-err? true))
+            :else
+            (when-not (fs/mkdir fs d)
+              (vswap! stderr str "mkdir: cannot create directory '" d "'\n")
+              (vreset! any-err? true))))
+        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+(defn rmdir
+  "POSIX rmdir — empty directories only."
+  [argv fs _env]
+  (let [{:keys [pos err]} (cli-parse argv [["-p" "--parents"]])]
+    (cond
+      err (usage-err "rmdir" err)
+      (empty? pos) (usage-err "rmdir" "missing operand")
+      :else
+      (let [stderr (volatile! "")
+            any-err? (volatile! false)]
+        (doseq [d pos]
+          (let [s (fs/stat fs d)]
+            (cond
+              (nil? s)
+              (do (vswap! stderr str "rmdir: failed to remove '" d "': No such file or directory\n")
+                  (vreset! any-err? true))
+              (not= :dir (:type s))
+              (do (vswap! stderr str "rmdir: failed to remove '" d "': Not a directory\n")
+                  (vreset! any-err? true))
+              (seq (fs/list-dir fs d))
+              (do (vswap! stderr str "rmdir: failed to remove '" d "': Directory not empty\n")
+                  (vreset! any-err? true))
+              :else
+              (when-not (fs/delete fs d)
+                (vswap! stderr str "rmdir: failed to remove '" d "'\n")
+                (vreset! any-err? true)))))
+        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+(defn- delete-recursive!
+  "Depth-first walk: delete every leaf first, then the dir."
+  [fs path]
+  (let [s (fs/stat fs path)]
+    (cond
+      (nil? s) false
+      (= :dir (:type s))
+      (let [children (fs/list-dir fs path)]
+        (doseq [{:keys [name]} children]
+          (delete-recursive! fs (str (str/replace path #"/+$" "") "/" name)))
+        (boolean (fs/delete fs path)))
+      :else
+      (boolean (fs/delete fs path)))))
+
+(defn rm
+  "POSIX rm. -r/-R recursive; -f silences missing-file errors. -i not
+   implemented — refusing dangerous patterns is the permit layer's job."
+  [argv fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-r" "--recursive"]
+                         ["-R" "--recursive-cap"]
+                         ["-f" "--force"]
+                         ["-v" "--verbose"]])]
+    (cond
+      err (usage-err "rm" err)
+      (empty? pos) (if (:force opts) (ok "") (usage-err "rm" "missing operand"))
+      :else
+      (let [recursive? (or (:recursive opts) (:recursive-cap opts))
+            stdout    (volatile! "")
+            stderr    (volatile! "")
+            any-err?  (volatile! false)]
+        (doseq [f pos]
+          (let [s (fs/stat fs f)]
+            (cond
+              (nil? s)
+              (when-not (:force opts)
+                (vswap! stderr str "rm: cannot remove '" f "': No such file or directory\n")
+                (vreset! any-err? true))
+              (and (= :dir (:type s)) (not recursive?))
+              (do (vswap! stderr str "rm: cannot remove '" f "': Is a directory\n")
+                  (vreset! any-err? true))
+              :else
+              (if (delete-recursive! fs f)
+                (when (:verbose opts) (vswap! stdout str "removed '" f "'\n"))
+                (do (vswap! stderr str "rm: cannot remove '" f "'\n")
+                    (vreset! any-err? true))))))
+        {:stdout @stdout :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+(defn- copy-file! [fs src dst]
+  (let [bytes (fs/read-bytes fs src)
+        out   (fs/open-sink fs dst false)]
+    (if (and bytes out)
+      (with-open [^java.io.OutputStream o out]
+        (cond
+          (bytes? bytes)  (.write o ^bytes bytes)
+          (string? bytes) (.write o (.getBytes ^String bytes "UTF-8")))
+        true)
+      false)))
+
+(defn- copy-tree! [fs src dst]
+  (let [s (fs/stat fs src)]
+    (cond
+      (nil? s) false
+      (= :dir (:type s))
+      (do (or (fs/exists? fs dst) (fs/mkdir fs dst))
+          (doseq [{:keys [name]} (fs/list-dir fs src)]
+            (copy-tree! fs
+                        (str (str/replace src #"/+$" "") "/" name)
+                        (str (str/replace dst #"/+$" "") "/" name)))
+          true)
+      :else
+      (copy-file! fs src dst))))
+
+(defn- cp-target
+  "If `dst` is an existing dir, append SRC's basename; otherwise use
+   DST as the final filename."
+  [fs src dst]
+  (let [s (fs/stat fs dst)]
+    (if (and s (= :dir (:type s)))
+      (let [base (last (str/split src #"/"))]
+        (str (str/replace dst #"/+$" "") "/" base))
+      dst)))
+
+(defn cp
+  "POSIX cp. -r/-R for recursive."
+  [argv fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-r" "--recursive"]
+                         ["-R" "--recursive-cap"]
+                         ["-f" "--force"]
+                         ["-v" "--verbose"]])]
+    (cond
+      err (usage-err "cp" err)
+      (< (count pos) 2) (usage-err "cp" "missing destination file operand")
+      :else
+      (let [recursive? (or (:recursive opts) (:recursive-cap opts))
+            dst       (last pos)
+            srcs      (butlast pos)
+            stderr    (volatile! "")
+            any-err?  (volatile! false)]
+        (doseq [src srcs]
+          (let [s (fs/stat fs src)]
+            (cond
+              (nil? s)
+              (do (vswap! stderr str "cp: cannot stat '" src "': No such file or directory\n")
+                  (vreset! any-err? true))
+              (and (= :dir (:type s)) (not recursive?))
+              (do (vswap! stderr str "cp: -r not specified; omitting directory '" src "'\n")
+                  (vreset! any-err? true))
+              :else
+              (let [final (cp-target fs src dst)]
+                (when-not (copy-tree! fs src final)
+                  (vswap! stderr str "cp: failed to copy '" src "' to '" final "'\n")
+                  (vreset! any-err? true))))))
+        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+(defn mv
+  "POSIX mv. Same final-arg semantics as cp."
+  [argv fs _env]
+  (let [{:keys [pos err]} (cli-parse argv [["-f" "--force"]
+                                           ["-v" "--verbose"]])]
+    (cond
+      err (usage-err "mv" err)
+      (< (count pos) 2) (usage-err "mv" "missing destination file operand")
+      :else
+      (let [dst       (last pos)
+            srcs      (butlast pos)
+            stderr    (volatile! "")
+            any-err?  (volatile! false)]
+        (doseq [src srcs]
+          (let [final (cp-target fs src dst)]
+            (when-not (fs/rename fs src final)
+              (vswap! stderr str "mv: cannot move '" src "' to '" final "'\n")
+              (vreset! any-err? true))))
+        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+(defn- parse-mode
+  "Parse an octal mode string (`755`, `0755`) into an int. Returns
+   nil on malformed input. Symbolic modes (`u+x`) are not supported."
+  [^String s]
+  (try (Long/parseLong s 8) (catch Throwable _ nil)))
+
+(defn chmod
+  "POSIX chmod, octal modes only."
+  [argv fs _env]
+  (let [args (vec (rest argv))]
+    (cond
+      (< (count args) 2) (usage-err "chmod" "missing operand")
+      :else
+      (let [mode-s (first args)
+            files  (rest args)
+            mode   (parse-mode mode-s)]
+        (if (nil? mode)
+          (usage-err "chmod" (str "invalid mode: " mode-s))
+          (let [stderr   (volatile! "")
+                any-err? (volatile! false)]
+            (doseq [f files]
+              (when-not (fs/chmod fs f mode)
+                (vswap! stderr str "chmod: cannot chmod '" f "'\n")
+                (vreset! any-err? true)))
+            {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))))
+
+(defn ln
+  "Symbolic link via `-s` only. Hard links aren't meaningful inside
+   the sandbox; refusing them keeps the surface tight."
+  [argv fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-s" "--symbolic"]
+                         ["-f" "--force"]])]
+    (cond
+      err                       (usage-err "ln" err)
+      (not (:symbolic opts))    (usage-err "ln" "only -s (symbolic) is supported")
+      (not= 2 (count pos))      (usage-err "ln" "exactly TARGET LINK_NAME required")
+      :else
+      (let [[target link-path] pos]
+        (when (and (:force opts) (fs/exists? fs link-path))
+          (fs/delete fs link-path))
+        (if (fs/symlink fs target link-path)
+          {:stdout "" :stderr "" :exit 0}
+          (err (str "ln: failed to create symbolic link '" link-path "'") 1))))))
+
+(defn tee
+  "Read stdin, write to stdout AND each FILE. -a appends."
+  [argv fs env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-a" "--append"]
+                         ["-i" "--ignore-interrupts"]])]
+    (cond
+      err (usage-err "tee" err)
+      :else
+      (let [stdin    (or (:stdin env) "")
+            stderr   (volatile! "")
+            any-err? (volatile! false)]
+        (doseq [f pos]
+          (try
+            (let [out (fs/open-sink fs f (boolean (:append opts)))]
+              (if out
+                (with-open [^java.io.OutputStream o out]
+                  (.write o (.getBytes ^String stdin "UTF-8")))
+                (do (vswap! stderr str "tee: " f ": cannot open for writing\n")
+                    (vreset! any-err? true))))
+            (catch Throwable t
+              (vswap! stderr str "tee: " f ": " (.getMessage t) "\n")
+              (vreset! any-err? true))))
+        {:stdout stdin :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+;; ============================================================================
 ;; Registry — the canonical builtin map
 ;; ============================================================================
 
 (def standard-read-only
-  "All read-only builtins shipping in v1. Suitable as :builtins for
-   muschel.host.builtin/make."
+  "Strict read-only builtin set. No filesystem mutations possible
+   through this map. Use as :builtins on a BuiltinHost that should
+   never be able to alter its FS."
   {"pwd"   pwd
    "echo"  echo
    "ls"    ls
@@ -1707,3 +2018,19 @@
    "sh"    sh
    "bash"  sh
    "dash"  sh})
+
+(def standard
+  "Full standard set: read builtins plus write builtins (touch, mkdir,
+   rmdir, rm, cp, mv, chmod, ln, tee). All routed through the FS for
+   containment. Use as :builtins on a BuiltinHost when the agent
+   should be able to author files in the sandbox."
+  (merge standard-read-only
+         {"touch" touch
+          "mkdir" mkdir
+          "rmdir" rmdir
+          "rm"    rm
+          "cp"    cp
+          "mv"    mv
+          "chmod" chmod
+          "ln"    ln
+          "tee"   tee}))

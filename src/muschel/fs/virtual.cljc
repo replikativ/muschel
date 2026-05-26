@@ -63,11 +63,15 @@
       (when-let [entry (get @entries-atom resolved)]
         {:type     (:type entry)
          :size     (cond
-                     (= :dir (:type entry)) 0
-                     (string? (:bytes entry)) (count (:bytes entry))
-                     :else (alength ^bytes (:bytes entry)))
-         :mtime-ms (or (:mtime-ms entry) 0)
-         :perms    nil})))
+                     (= :dir (:type entry))     0
+                     (= :symlink (:type entry)) (count (or (:target entry) ""))
+                     (string? (:bytes entry))   (count (:bytes entry))
+                     (nil? (:bytes entry))      0
+                     :else                      (alength ^bytes (:bytes entry)))
+         :mtime-ms   (or (:mtime-ms entry) 0)
+         :perms      nil
+         :perms-mode (:perms-mode entry)
+         :target     (:target entry)})))
 
   (-list-dir [this path]
     (when-let [resolved (fs/-resolve this path)]
@@ -139,7 +143,86 @@
                                       :mtime-ms (mtime)}))))]
            (when seed (.write ^java.io.ByteArrayOutputStream baos ^bytes seed 0 (alength ^bytes seed)))
            baos))
-       :cljs nil)))
+       :cljs nil))
+
+  (-mkdir [this path]
+    (when-let [resolved (fs/-resolve this path)]
+      ;; Refuse if a non-dir entry already exists, or if the parent
+      ;; doesn't exist (so the user does mkdir -p deliberately).
+      (let [existing (get @entries-atom resolved)
+            parent   (let [segs (vec (fs/split-path resolved))]
+                       (if (<= (count segs) 2)
+                         "/"
+                         (fs/join-path "" (filter seq (butlast segs)))))
+            parent-e (get @entries-atom parent)]
+        (cond
+          existing                                            nil
+          (or (= "/" resolved)
+              (and parent-e (= :dir (:type parent-e))))
+          (do (swap! entries-atom assoc resolved
+                     {:type :dir :mtime-ms (mtime)})
+              true)
+          :else nil))))
+
+  (-delete [this path]
+    (when-let [resolved (fs/-resolve this path)]
+      (when-let [entry (get @entries-atom resolved)]
+        ;; For dirs, refuse if any children exist (POSIX rmdir).
+        (let [prefix (str (str/replace resolved #"/+$" "") "/")
+              child? (some (fn [[p _]]
+                             (and (str/starts-with? p prefix)
+                                  (not= p resolved)))
+                           @entries-atom)]
+          (when-not (and (= :dir (:type entry)) child?)
+            (swap! entries-atom dissoc resolved)
+            true)))))
+
+  (-rename [this from to]
+    (when-let [from-r (fs/-resolve this from)]
+      (when-let [to-r (fs/-resolve this to)]
+        (when-let [entry (get @entries-atom from-r)]
+          ;; Atomic in the atom: remove from, write to, plus walk any
+          ;; descendants and re-key under the new prefix.
+          (swap! entries-atom
+                 (fn [m]
+                   (let [prefix (str (str/replace from-r #"/+$" "") "/")
+                         to-prefix (str (str/replace to-r #"/+$" "") "/")
+                         descendants
+                         (->> m
+                              (filter (fn [[p _]] (str/starts-with? p prefix)))
+                              (mapv (fn [[p e]]
+                                      [p (str to-prefix (subs p (count prefix))) e])))
+                         m' (apply dissoc m (mapv first descendants))
+                         m' (assoc m' to-r (assoc entry :mtime-ms (mtime)))
+                         m' (reduce (fn [acc [_ to-p e]]
+                                      (assoc acc to-p e))
+                                    m'
+                                    descendants)]
+                     (dissoc m' from-r))))
+          true))))
+
+  (-touch [this path]
+    (when-let [resolved (fs/-resolve this path)]
+      (let [now (mtime)]
+        (swap! entries-atom
+               (fn [m]
+                 (if-let [e (get m resolved)]
+                   (assoc m resolved (assoc e :mtime-ms now))
+                   (assoc m resolved {:type :file :bytes "" :mtime-ms now}))))
+        true)))
+
+  (-chmod [this path mode]
+    (when-let [resolved (fs/-resolve this path)]
+      (when (get @entries-atom resolved)
+        (swap! entries-atom update resolved assoc :perms-mode mode)
+        true)))
+
+  (-symlink [this target link-path]
+    (when-let [resolved (fs/-resolve this link-path)]
+      (when-not (get @entries-atom resolved)
+        (swap! entries-atom assoc resolved
+               {:type :symlink :target target :mtime-ms (mtime)})
+        true))))
 
 (defn make
   "Construct a virtual FS pre-populated with `entries`, a map of

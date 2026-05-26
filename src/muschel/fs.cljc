@@ -84,7 +84,41 @@
      BuiltinHost to route shell-redirect `> file` / `>> file` writes.
 
      For impls that don't otherwise persist (virtual FS), closing the
-     returned stream commits the bytes into the FS's storage."))
+     returned stream commits the bytes into the FS's storage.")
+
+  ;; ---- write-side protocol -----------------------------------------------
+
+  (-mkdir [this path]
+    "Create the directory at `path`. Returns truthy on success, nil
+     if outside root, if the parent doesn't exist, or if a non-dir
+     entry already lives there. Use for both plain `mkdir` and the
+     leaf step of `mkdir -p`.")
+
+  (-delete [this path]
+    "Delete the file or empty directory at `path`. Returns truthy
+     on success, nil if outside root, missing, or a non-empty dir.
+     Callers wanting `rm -rf` walk the tree themselves and call
+     -delete on each leaf before its parent.")
+
+  (-rename [this from to]
+    "Move/rename `from` to `to`. Both must resolve inside the root.
+     Returns truthy on success.")
+
+  (-touch [this path]
+    "Create `path` as an empty file if missing; otherwise update its
+     mtime. Returns truthy on success.")
+
+  (-chmod [this path mode]
+    "Set the mode (octal int, e.g. 0o755) on `path`. Returns truthy
+     on success. Virtual impls may store the bits opaquely for
+     stat-roundtripping without enforcing permission semantics.")
+
+  (-symlink [this target link-path]
+    "Create a symbolic link at `link-path` pointing at `target`.
+     `link-path` must resolve inside the root; `target` is stored as
+     given (may be relative or absolute — symlink-resolution at
+     read-time still goes through the FS, which catches outside-root
+     targets at follow time)."))
 
 ;; ============================================================================
 ;; Public wrappers
@@ -100,6 +134,12 @@
 (defn read-bytes [fs path] (-read-bytes fs path))
 (defn open-source [fs path] (-open-source fs path))
 (defn open-sink   [fs path append?] (-open-sink fs path append?))
+(defn mkdir       [fs path] (-mkdir fs path))
+(defn delete      [fs path] (-delete fs path))
+(defn rename      [fs from to] (-rename fs from to))
+(defn touch       [fs path] (-touch fs path))
+(defn chmod       [fs path mode] (-chmod fs path mode))
+(defn symlink     [fs target link-path] (-symlink fs target link-path))
 
 ;; ============================================================================
 ;; Path utilities (impl-agnostic)

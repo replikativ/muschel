@@ -169,7 +169,71 @@
         ;; Defense in depth: re-check containment of the parent
         ;; directory. If the resolved path's parent escaped root via
         ;; a symlink, resolve* would have returned nil already.
-        (Files/newOutputStream p (into-array java.nio.file.OpenOption base-opts))))))
+        (Files/newOutputStream p (into-array java.nio.file.OpenOption base-opts)))))
+
+  (-mkdir [_ path]
+    (when-let [resolved (resolve* root @cwd-atom path)]
+      (let [p (str->path resolved)]
+        (when-not (Files/exists p follow)
+          (try (Files/createDirectory p (make-array java.nio.file.attribute.FileAttribute 0))
+               true
+               (catch Throwable _ nil))))))
+
+  (-delete [_ path]
+    (when-let [resolved (resolve* root @cwd-atom path)]
+      (let [p (str->path resolved)]
+        (try (Files/delete p) true
+             (catch Throwable _ nil)))))
+
+  (-rename [_ from to]
+    (when-let [from-resolved (resolve* root @cwd-atom from)]
+      ;; Resolve `to` relative to the same root + cwd. For `to`, the
+      ;; resolved path is allowed to NOT exist yet — resolve* falls
+      ;; back to abs+normalize and still inside?-checks.
+      (when-let [to-resolved (resolve* root @cwd-atom to)]
+        (try (Files/move (str->path from-resolved)
+                         (str->path to-resolved)
+                         (into-array java.nio.file.CopyOption
+                                     [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+             true
+             (catch Throwable _ nil)))))
+
+  (-touch [_ path]
+    (when-let [resolved (resolve* root @cwd-atom path)]
+      (let [p (str->path resolved)]
+        (try
+          (if (Files/exists p follow)
+            (do (Files/setLastModifiedTime
+                 p (java.nio.file.attribute.FileTime/fromMillis (System/currentTimeMillis)))
+                true)
+            (do (Files/createFile p (make-array java.nio.file.attribute.FileAttribute 0))
+                true))
+          (catch Throwable _ nil)))))
+
+  (-chmod [_ path mode]
+    (when-let [resolved (resolve* root @cwd-atom path)]
+      (let [p (str->path resolved)]
+        (try
+          (let [perms (java.nio.file.attribute.PosixFilePermissions/fromString
+                       (let [m (long mode)
+                             rwx (fn [bits]
+                                   (str (if (pos? (bit-and bits 4)) "r" "-")
+                                        (if (pos? (bit-and bits 2)) "w" "-")
+                                        (if (pos? (bit-and bits 1)) "x" "-")))]
+                         (str (rwx (bit-and (bit-shift-right m 6) 7))
+                              (rwx (bit-and (bit-shift-right m 3) 7))
+                              (rwx (bit-and m 7)))))]
+            (Files/setPosixFilePermissions p perms)
+            true)
+          (catch Throwable _ nil)))))
+
+  (-symlink [_ target link-path]
+    (when-let [resolved (resolve* root @cwd-atom link-path)]
+      (try (Files/createSymbolicLink (str->path resolved)
+                                     (str->path target)
+                                     (make-array java.nio.file.attribute.FileAttribute 0))
+           true
+           (catch Throwable _ nil)))))
 
 (defn make
   "Construct a disk FS pinned to `root`. All paths resolve under root;
