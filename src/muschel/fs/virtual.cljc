@@ -147,49 +147,28 @@
        (when-let [s (fs/-read-file this path)] s)))
 
   (-open-sink [this path append?]
-    #?(:clj
-       (when-let [resolved (fs/-resolve this path)]
-         ;; Build an in-memory buffer; on close commit the bytes
-         ;; (UTF-8 decoded) into the entries map as a Clojure string.
-         ;; For append mode, seed with the existing content first.
-         (let [existing (when append?
-                          (when-let [e (get @entries-atom resolved)]
-                            (when (= :file (:type e)) (:content e))))
-               baos     (proxy [java.io.ByteArrayOutputStream] []
-                          (close []
-                            (proxy-super close)
-                            (let [s (.toString ^java.io.ByteArrayOutputStream this "UTF-8")]
-                              (swap! entries-atom assoc resolved
-                                     {:type :file
-                                      :content s
-                                      :mtime-ms (mtime)}))))]
-           (when existing
-             (let [bs (.getBytes ^String existing "UTF-8")]
-               (.write ^java.io.ByteArrayOutputStream baos ^bytes bs
-                       0 (alength bs))))
-           baos))
-       :cljs
-       ;; CLJS sink: same shape host/browser uses for its own VFS sinks
-       ;; (`{::buf :sink :acc <atom>}`). Eagerly mirrors writes into
-       ;; entries-atom on every swap! so a subsequent reader (`cat
-       ;; new.txt`) sees the latest bytes without an explicit close.
-       (when-let [resolved (fs/-resolve this path)]
-         (let [existing (when append?
-                          (when-let [e (get @entries-atom resolved)]
-                            (when (= :file (:type e)) (:content e))))
-               initial  (or existing "")
-               acc      (atom initial)]
-           ;; Eagerly mirror writes back into entries-atom so a follow-up
-           ;; read sees them without needing an explicit close.
-           (swap! entries-atom assoc resolved
-                  {:type :file :content initial :mtime-ms (mtime)})
-           (add-watch acc ::vfs-flush
-                      (fn [_ _ _ new]
-                        (swap! entries-atom assoc resolved
-                               {:type :file
-                                :content new
-                                :mtime-ms (mtime)})))
-           {::buf :sink :acc acc ::path resolved ::vfs-sink? true}))))
+    ;; Cross-platform sink shape: a Clojure map carrying an `:acc`
+    ;; atom. `muschel.host.builtin` recognises this shape directly so
+    ;; the same code path runs on JVM, babashka, and CLJS — none of
+    ;; which can fully support a `proxy [java.io.ByteArrayOutputStream]`
+    ;; with the close-hook commit semantics we used to rely on. An
+    ;; `add-watch` mirrors every swap! into entries-atom so a follow-up
+    ;; read sees the bytes without needing an explicit close.
+    (when-let [resolved (fs/-resolve this path)]
+      (let [existing (when append?
+                       (when-let [e (get @entries-atom resolved)]
+                         (when (= :file (:type e)) (:content e))))
+            initial  (or existing "")
+            acc      (atom initial)]
+        (swap! entries-atom assoc resolved
+               {:type :file :content initial :mtime-ms (mtime)})
+        (add-watch acc ::vfs-flush
+                   (fn [_ _ _ new]
+                     (swap! entries-atom assoc resolved
+                            {:type :file
+                             :content new
+                             :mtime-ms (mtime)})))
+        {::buf :sink :acc acc ::path resolved ::vfs-sink? true})))
 
   (-mkdir [this path]
     (when-let [resolved (fs/-resolve this path)]

@@ -24,7 +24,11 @@
             [muschel.session :as session]
             [muschel.host.builtin :as host.builtin]
             #?(:clj  [muschel.host.jvm :as host.jvm])
-            #?(:clj  [muschel.fs.disk :as fs.disk])))
+            ;; `muschel.fs.disk` uses java.nio.file.* (Files,
+            ;; PosixFileAttributeView, …) which babashka doesn't ship.
+            ;; Stub it out on bb — bb users get the VFS path; real-disk
+            ;; access is a JVM-only feature anyway.
+            #?@(:bb [] :clj [[muschel.fs.disk :as fs.disk]])))
 
 ;; ============================================================================
 ;; Parsing
@@ -127,12 +131,14 @@
    (default \"/\"). Pure in-memory; structurally contained."
   fs.virtual/make)
 
-#?(:clj
-   (def disk-fs
-     "Construct a DiskFS pinned to `root`. Real disk, contained via
-      `inside?`-check + parent-real-path resolution.
-      Options: `:cwd`, `:max-bytes`. JVM only."
-     fs.disk/make))
+;; bb has no PosixFileAttributeView etc., so muschel.fs.disk doesn't
+;; load there — only define `disk-fs` on real JVM.
+#?(:bb nil
+   :clj (def disk-fs
+          "Construct a DiskFS pinned to `root`. Real disk, contained via
+           `inside?`-check + parent-real-path resolution.
+           Options: `:cwd`, `:max-bytes`. JVM only."
+          fs.disk/make))
 
 ;; FS protocol wrappers — symmetric with JS `m.fs.*`.
 (def fs-read-file          fs/read-file)

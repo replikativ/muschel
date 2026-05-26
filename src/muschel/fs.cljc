@@ -163,32 +163,41 @@
    writes `content` (UTF-8), and closes. Returns truthy on success,
    nil if the path resolves outside root or the open fails.
 
-   Cross-platform: JVM uses with-open + OutputStream; CLJS resolves
-   the sink to an atom-backed string buffer and mutates it (the
-   sink shape is impl-specific, but the patterns are stable)."
+   Sink shape varies by FS impl. We handle two canonical shapes
+   uniformly on every host:
+
+   - Map with an `:acc` atom — used by `muschel.fs.virtual` and
+     `muschel.host.browser`. Both JVM and CLJS reach this branch;
+     writes mutate the atom and the FS's add-watch mirrors them
+     back into entries-atom.
+   - Bare CLJS atom — fallback for older shape compatibility.
+
+   On JVM `OutputStream`-backed sinks (real-disk DiskFS) fall through
+   to a `with-open + .write` write."
   [fs path ^String content append?]
   (when-let [sink (-open-sink fs path append?)]
-    #?(:clj
-       (with-open [^java.io.OutputStream o sink]
-         (.write o ^bytes (.getBytes content "UTF-8"))
-         true)
-       :cljs
-       (cond
-         ;; Canonical shape: a Clojure map with an :acc atom (matches
-         ;; muschel.fs.virtual and muschel.host.browser sinks).
-         (and (map? sink) (instance? cljs.core/Atom (:acc sink)))
-         (do (if append?
-               (swap! (:acc sink) str content)
-               (reset! (:acc sink) content))
-             true)
+    (cond
+      (and (map? sink)
+           #?(:clj  (instance? clojure.lang.Atom (:acc sink))
+              :cljs (instance? cljs.core/Atom    (:acc sink))))
+      (do (if append?
+            (swap!  (:acc sink) str content)
+            (reset! (:acc sink) content))
+          true)
 
-         (instance? cljs.core/Atom sink)
-         (do (if append?
-               (swap! sink str content)
-               (reset! sink content))
-             true)
+      #?(:cljs (instance? cljs.core/Atom sink) :clj false)
+      #?(:cljs (do (if append?
+                     (swap! sink str content)
+                     (reset! sink content))
+                   true)
+         :clj nil)
 
-         :else true))))
+      :else
+      #?(:clj
+         (with-open [^java.io.OutputStream o sink]
+           (.write o ^bytes (.getBytes content "UTF-8"))
+           true)
+         :cljs true))))
 
 ;; ============================================================================
 ;; Path utilities (impl-agnostic)

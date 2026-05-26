@@ -2431,20 +2431,21 @@
 
 (defn- date-parts-now
   "Return a `{:y :mo :d :h :mi :s :j :epoch-ms}` snapshot of the
-   current local time. Cross-platform: JVM uses Calendar/Date,
+   current local time. Cross-platform: JVM + babashka use
+   `java.time.LocalDateTime` (bb refuses `java.util.Calendar`);
    CLJS uses js/Date."
   []
   #?(:clj
-     (let [now (java.util.Date.)
-           cal (doto (java.util.Calendar/getInstance) (.setTime now))]
-       {:y  (.get cal java.util.Calendar/YEAR)
-        :mo (inc (.get cal java.util.Calendar/MONTH))
-        :d  (.get cal java.util.Calendar/DAY_OF_MONTH)
-        :h  (.get cal java.util.Calendar/HOUR_OF_DAY)
-        :mi (.get cal java.util.Calendar/MINUTE)
-        :s  (.get cal java.util.Calendar/SECOND)
-        :j  (.get cal java.util.Calendar/DAY_OF_YEAR)
-        :epoch-ms (.getTime now)})
+     (let [now (java.time.LocalDateTime/now)
+           inst (.. now (atZone (java.time.ZoneId/systemDefault)) toInstant)]
+       {:y  (.getYear now)
+        :mo (.getMonthValue now)
+        :d  (.getDayOfMonth now)
+        :h  (.getHour now)
+        :mi (.getMinute now)
+        :s  (.getSecond now)
+        :j  (.getDayOfYear now)
+        :epoch-ms (.toEpochMilli inst)})
      :cljs
      (let [now (js/Date.)
            jan-1 (js/Date. (.getFullYear now) 0 1)
@@ -3204,9 +3205,20 @@
 
 (defn- jq-format
   "Render a value as JSON output. Honours -c (compact) and -r (raw —
-   strip surrounding quotes on string outputs)."
+   strip surrounding quotes on string outputs).
+
+   JVM uses `clojure.data.json` (resolved at call-time to avoid a
+   compile-time require cycle); babashka uses its built-in
+   `cheshire.core`; CLJS uses `JSON.stringify`."
   [v {:keys [compact raw]}]
-  #?(:clj
+  #?(:bb
+     (do (require 'cheshire.core)
+         (let [gen (resolve 'cheshire.core/generate-string)]
+           (cond
+             (and raw (string? v)) v
+             compact (gen v)
+             :else (gen v {:pretty true}))))
+     :clj
      (do (require 'clojure.data.json)
          (let [json-write (resolve 'clojure.data.json/write-str)]
            (cond
@@ -3222,12 +3234,16 @@
 (defn- jq-parse
   "Parse the input text into a vector of JSON values. JVM uses
    `clojure.data.json` (handles multi-value whitespace-separated
-   streams). CLJS uses `js/JSON.parse` (single value only — jq
-   `--slurp` covers most multi-value workflows the agent needs)."
+   streams); babashka uses `cheshire.core/parse-string` (single
+   value); CLJS uses `js/JSON.parse` (single value)."
   [^String input-text]
   (if (str/blank? input-text)
     []
-    #?(:clj
+    #?(:bb
+       (do (require 'cheshire.core)
+           (let [parse (resolve 'cheshire.core/parse-string)]
+             [(parse input-text)]))
+       :clj
        (do (require 'clojure.data.json)
            (let [read-fn (resolve 'clojure.data.json/read)
                  pbr (java.io.PushbackReader.

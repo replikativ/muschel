@@ -184,14 +184,35 @@
 ;; Host wrapping
 ;; ============================================================================
 
+(defn- atom-sink?
+  "A portable sink shape used by `muschel.fs.virtual` and
+   `muschel.host.browser`: any map carrying an atom under `:acc`. We
+   recognise it here so VFS redirects work the same way on every host
+   (JVM and bb both refuse `proxy` over `java.io.ByteArrayOutputStream`
+   with rich-enough behaviour to embed close-hooks)."
+  [x]
+  (and (map? x) #?(:clj  (instance? clojure.lang.Atom (:acc x))
+                   :cljs (instance? cljs.core/Atom (:acc x)))))
+
 (defrecord BuiltinHost [fallback-host builtins fs fallback-allowlist]
   host/Host
   ;; ---- buffers ----
-  (-write-string!    [_ sink s] (host/-write-string!    fallback-host sink s))
+  ;; VFS-owned sinks (`{::buf :sink :acc <atom>}`) are written through
+  ;; here before reaching the fallback host, so the fallback (JVM /
+  ;; Node / Browser) never sees a shape it can't handle. Anything else
+  ;; — `OutputStream` on JVM, BrowserHost's own `:acc`-tagged sinks —
+  ;; falls through to the fallback.
+  (-write-string! [_ sink s]
+    (cond
+      (atom-sink? sink) (swap! (:acc sink) str s)
+      :else             (host/-write-string! fallback-host sink s)))
   (-read-all-string  [_ source] (host/-read-all-string  fallback-host source))
   (-close!           [_ io]     (host/-close!           fallback-host io))
   (-string-sink      [_]        (host/-string-sink      fallback-host))
-  (-sink->string     [_ sink]   (host/-sink->string     fallback-host sink))
+  (-sink->string [_ sink]
+    (cond
+      (atom-sink? sink) @(:acc sink)
+      :else             (host/-sink->string fallback-host sink)))
   (-string-source    [_ s]      (host/-string-source    fallback-host s))
 
   ;; ---- files ---- routed through FS for containment.
