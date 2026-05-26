@@ -1,6 +1,6 @@
 (ns muschel.text-path-builtins-test
   "Tests for the text + path tools: sed, awk, printf, env, date, seq,
-   basename, dirname, realpath, test/[."
+   basename, dirname, realpath, test/[. Cross-platform."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [muschel.builtins.posix :as posix]
@@ -8,7 +8,7 @@
             [muschel.fs :as fs]
             [muschel.fs.virtual :as vfs]
             [muschel.host.builtin :as hb]
-            [muschel.host.jvm :as jvm]))
+            [muschel.test-helpers :as th]))
 
 (defn- mk-host
   ([] (mk-host {}))
@@ -17,8 +17,11 @@
                         "/work/csv"   "name,age\nalice,30\nbob,25\n"}
                        {:cwd "/work"})}}]
    (hb/make {:fs fs
-             :fallback-host (jvm/make)
+             :fallback-host (th/fallback-host)
              :builtins posix/standard})))
+
+(defn- now-ms []
+  #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)))
 
 (defn- run [host cmd]
   (m/run-and-capture (m/new-env) cmd {:host host}))
@@ -50,7 +53,7 @@
 (deftest realpath-resolves-inside-root
   (let [r (run (mk-host) "realpath a.txt")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "a.txt"))))
+    (is (str/includes? (:stdout r) "a.txt"))))
 
 ;; ============================================================================
 ;; printf
@@ -80,7 +83,7 @@
 (deftest env-prints-vars
   (let [r (run (mk-host) "env")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "="))))
+    (is (str/includes? (:stdout r) "="))))
 
 (deftest date-default
   (let [r (run (mk-host) "date")]
@@ -151,7 +154,7 @@
 (deftest bracket-in-if
   (let [r (run (mk-host) "if [ -e a.txt ]; then echo yes; fi")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "yes"))))
+    (is (str/includes? (:stdout r) "yes"))))
 
 ;; ============================================================================
 ;; sed
@@ -186,8 +189,8 @@
   (let [host (mk-host)]
     (run host "sed -i 's/alpha/AAA/' a.txt")
     (let [r (run host "cat a.txt")]
-      (is (.contains ^String (:stdout r) "AAA"))
-      (is (not (.contains ^String (:stdout r) "alpha"))))))
+      (is (str/includes? (:stdout r) "AAA"))
+      (is (not (str/includes? (:stdout r) "alpha"))))))
 
 ;; ============================================================================
 ;; awk
@@ -243,7 +246,7 @@
 (deftest jq-identity
   (let [r (run (mk-host {:fs (jq-fs)}) "jq -c . obj.json")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "alice"))))
+    (is (str/includes? (:stdout r) "alice"))))
 
 (deftest jq-field
   (let [r (run (mk-host {:fs (jq-fs)}) "jq -r .name obj.json")]
@@ -305,9 +308,9 @@
     (is (re-find #"does-not-exist" (:stdout r)))))
 
 (deftest sleep-multi-arg-sums
-  (let [start (System/currentTimeMillis)
+  (let [start (now-ms)
         r (run (mk-host) "sleep 0.02 0.03")
-        elapsed (- (System/currentTimeMillis) start)]
+        elapsed (- (now-ms) start)]
     (is (= 0 (:exit r)))
     (is (>= elapsed 40))))
 
@@ -343,9 +346,9 @@
 ;; ============================================================================
 
 (deftest sleep-blocks
-  (let [start (System/currentTimeMillis)
+  (let [start (now-ms)
         r (run (mk-host) "sleep 0.05")
-        elapsed (- (System/currentTimeMillis) start)]
+        elapsed (- (now-ms) start)]
     (is (= 0 (:exit r)))
     (is (>= elapsed 40))))
 
@@ -363,22 +366,24 @@
 ;; through the FS for -o.
 ;; ============================================================================
 
-(deftest curl-handles-bad-host
-  (let [r (run (mk-host) "curl -s http://localhost:1/never")]
-    ;; Connection refused → non-zero exit with a clean curl: error
-    (is (pos? (:exit r)))
-    (is (re-find #"curl:" (:stderr r)))))
+;; curl uses java.net.http on JVM and a refusal stub on CLJS (no
+;; Node http binding wired yet), so these tests only run on JVM.
+#?(:clj
+   (deftest curl-handles-bad-host
+     (let [r (run (mk-host) "curl -s http://localhost:1/never")]
+       ;; Connection refused → non-zero exit with a clean curl: error
+       (is (pos? (:exit r)))
+       (is (re-find #"curl:" (:stderr r))))))
 
-(deftest curl-output-routes-through-fs
-  ;; -o on a path outside the sandbox refuses; we can't easily prove
-  ;; the network path without external connectivity, so we check the
-  ;; refusal path. Real-network behaviour is covered by curl-uuid
-  ;; (skipped unless connectivity is available).
-  (let [fs (vfs/make {"/work" :dir} {:cwd "/work"})
-        host (hb/make {:fs fs :fallback-host (jvm/make)
-                       :builtins posix/standard})
-        ;; pick a host that's guaranteed unreachable to short-circuit
-        r (run host "curl -s -o /etc/dvergr-test http://localhost:1/")]
-    ;; Either we refused before the call (no network try) or the
-    ;; call failed first. In neither case does /etc/dvergr-test exist.
-    (is (not (.exists (java.io.File. "/etc/dvergr-test"))))))
+#?(:clj
+   (deftest curl-output-routes-through-fs
+     ;; -o on a path outside the sandbox refuses; we can't easily prove
+     ;; the network path without external connectivity, so we check the
+     ;; refusal path. Real-network behaviour is covered by curl-uuid
+     ;; (skipped unless connectivity is available).
+     (let [host (th/mk-host {:files {"/work" :dir} :cwd "/work"})
+           ;; pick a host that's guaranteed unreachable to short-circuit
+           r (run host "curl -s -o /etc/dvergr-test http://localhost:1/")]
+       ;; Either we refused before the call (no network try) or the
+       ;; call failed first. In neither case does /etc/dvergr-test exist.
+       (is (not (.exists (java.io.File. "/etc/dvergr-test")))))))

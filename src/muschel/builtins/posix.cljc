@@ -3071,14 +3071,14 @@
       (when (< i n)
         (let [c (.charAt s i)]
           (cond
-            (or (= c \[) (= c \()) (do (.append out c) (vswap! depth inc))
-            (or (= c \]) (= c \))) (do (.append out c) (vswap! depth dec))
+            (or (= c \[) (= c \()) (do (cc/sappend! out c) (vswap! depth inc))
+            (or (= c \]) (= c \))) (do (cc/sappend! out c) (vswap! depth dec))
             (and (= c \|) (zero? @depth))
-            (do (conj! result (str/trim (.toString out)))
-                (.setLength out 0))
-            :else (.append out c)))
+            (do (conj! result (str/trim (cc/sbstr out)))
+                (cc/sbclear! out))
+            :else (cc/sappend! out c)))
         (recur (inc i))))
-    (conj! result (str/trim (.toString out)))
+    (conj! result (str/trim (cc/sbstr out)))
     (vec (persistent! result))))
 
 (defn- jq-step
@@ -3122,27 +3122,27 @@
   (loop [i 0 acc (transient []) buf (cc/sbuf)]
     (cond
       (>= i (count s))
-      (let [tail (.toString buf)]
+      (let [tail (cc/sbstr buf)]
         (cond-> (persistent! acc)
           (seq tail) (conj tail)))
 
       (= \. (.charAt s i))
-      (let [tail (.toString buf)
+      (let [tail (cc/sbstr buf)
             acc' (cond-> acc (seq tail) (conj! tail))]
-        (.setLength buf 0)
-        (.append buf \.)
+        (cc/sbclear! buf)
+        (cc/sappend! buf \.)
         (recur (inc i) acc' buf))
 
       (= \[ (.charAt s i))
-      (let [tail (.toString buf)
+      (let [tail (cc/sbstr buf)
             acc' (cond-> acc (seq tail) (conj! tail))
             close (.indexOf s "]" i)
             chunk (subs s i (inc close))]
-        (.setLength buf 0)
+        (cc/sbclear! buf)
         (recur (inc close) (conj! acc' chunk) buf))
 
       :else
-      (do (.append buf (.charAt s i))
+      (do (cc/sappend! buf (.charAt s i))
           (recur (inc i) acc buf)))))
 
 (defn- jq-builtin-fn [^String fname]

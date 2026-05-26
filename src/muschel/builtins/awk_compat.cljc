@@ -44,6 +44,15 @@
   #?(:clj (.toString ^StringBuilder sb)
      :cljs (.toString sb)))
 
+(defn sbclear!
+  "Reset the buffer to empty in-place. Portable replacement for
+   `(.setLength sb 0)` (JVM StringBuilder only — goog.string.StringBuffer
+   exposes `.clear`)."
+  [sb]
+  #?(:clj  (.setLength ^StringBuilder sb 0)
+     :cljs (.clear sb))
+  sb)
+
 ;; ============================================================================
 ;; Number parsing + special values
 ;; ============================================================================
@@ -113,10 +122,19 @@
 (defn re-compile
   "Compile `pat` (a pattern string) with DOTALL semantics — `.` matches
    newline (awk requires this). Returns a platform regex value
-   suitable for `re-find-pos`."
+   suitable for `re-find-pos`.
+
+   Honors a leading `(?i)` inline flag by stripping it and applying
+   the platform's case-insensitive flag — JS RegExp doesn't support
+   `(?i)` inline, only construction-time flags. JVM's Pattern.compile
+   accepts `(?i)` natively, so the inline form is preserved there."
   [^String pat]
   #?(:clj (java.util.regex.Pattern/compile pat java.util.regex.Pattern/DOTALL)
-     :cljs (js/RegExp. pat "gs")))   ;; g = global (lastIndex tracking), s = dotall
+     :cljs (let [icase? (.startsWith pat "(?i)")
+                 pat'   (if icase? (subs pat 4) pat)
+                 flags  (if icase? "gsi" "gs")]
+             ;; g = global (lastIndex tracking), s = dotall, i = icase.
+             (js/RegExp. pat' flags))))
 
 (defn re-quote
   "Return a pattern string that matches `s` as a literal."

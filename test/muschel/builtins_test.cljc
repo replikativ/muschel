@@ -1,5 +1,7 @@
 (ns muschel.builtins-test
-  (:require [clojure.test :refer [deftest is testing]]
+  "Direct unit tests for builtin fns. Cross-platform."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [muschel.fs.virtual :as vfs]
             [muschel.builtins.posix :as posix]))
 
@@ -40,14 +42,14 @@
 (deftest ls-default-hides-dotfiles
   (let [r (posix/ls ["ls"] (make-fs) {})]
     (is (= 0 (:exit r)))
-    (is (not (.contains ^String (:stdout r) ".dot"))
+    (is (not (str/includes? (:stdout r) ".dot"))
         "default ls hides .dot")
-    (is (.contains ^String (:stdout r) "a.txt"))
-    (is (.contains ^String (:stdout r) "sub"))))
+    (is (str/includes? (:stdout r) "a.txt"))
+    (is (str/includes? (:stdout r) "sub"))))
 
 (deftest ls-a-shows-dotfiles
   (let [r (posix/ls ["ls" "-a"] (make-fs) {})]
-    (is (.contains ^String (:stdout r) ".dot"))))
+    (is (str/includes? (:stdout r) ".dot"))))
 
 (deftest ls-l-long-format
   (let [r (posix/ls ["ls" "-l"] (make-fs) {})]
@@ -57,7 +59,7 @@
 (deftest ls-missing-target
   (let [r (posix/ls ["ls" "no-such"] (make-fs) {})]
     (is (= 2 (:exit r)))
-    (is (.contains ^String (:stderr r) "No such file"))))
+    (is (str/includes? (:stderr r) "No such file"))))
 
 ;; ============================================================================
 ;; cat
@@ -74,13 +76,13 @@
 
 (deftest cat-n-numbers-lines
   (let [r (posix/cat ["cat" "-n" "a.txt"] (make-fs) {})]
-    (is (.contains ^String (:stdout r) "     1\talpha"))
-    (is (.contains ^String (:stdout r) "     2\tbeta"))))
+    (is (str/includes? (:stdout r) "     1\talpha"))
+    (is (str/includes? (:stdout r) "     2\tbeta"))))
 
 (deftest cat-missing-file
   (let [r (posix/cat ["cat" "no-such"] (make-fs) {})]
     (is (= 1 (:exit r)))
-    (is (.contains ^String (:stderr r) "No such file or directory"))))
+    (is (str/includes? (:stderr r) "No such file or directory"))))
 
 (deftest cat-cannot-escape
   (let [r (posix/cat ["cat" "/etc/passwd"] (make-fs) {})]
@@ -90,7 +92,7 @@
 (deftest cat-rejects-traversal
   (let [r (posix/cat ["cat" "../../../../etc/passwd"] (make-fs) {})]
     (is (= 1 (:exit r)))
-    (is (.contains ^String (:stderr r) "No such file"))))
+    (is (str/includes? (:stderr r) "No such file"))))
 
 ;; ============================================================================
 ;; head / tail
@@ -134,7 +136,7 @@
 
 (deftest wc-multiple-files-total
   (let [r (posix/wc ["wc" "-l" "a.txt" "sub/b.txt"] (make-fs) {})]
-    (is (.contains ^String (:stdout r) "total"))))
+    (is (str/includes? (:stdout r) "total"))))
 
 ;; ============================================================================
 ;; stat

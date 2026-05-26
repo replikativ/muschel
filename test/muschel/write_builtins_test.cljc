@@ -1,21 +1,23 @@
 (ns muschel.write-builtins-test
   "Tests for the write-side builtins: touch, mkdir, rmdir, rm, cp, mv,
    chmod, ln, tee. Each goes through the FS protocol so containment
-   is enforced — verified at the bottom."
-  (:require [clojure.test :refer [deftest is testing]]
+   is enforced — verified at the bottom. Cross-platform: runs on JVM
+   and Node / ClojureScript."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [muschel.builtins.posix :as posix]
             [muschel.core :as m]
             [muschel.fs :as fs]
             [muschel.fs.virtual :as vfs]
             [muschel.host.builtin :as hb]
-            [muschel.host.jvm :as jvm]))
+            [muschel.test-helpers :as th]))
 
 (defn- fs+host
   ([] (fs+host {"/work" :dir "/work/a.txt" "alpha\n"}))
   ([entries]
    (let [fs   (vfs/make entries {:cwd "/work"})
          host (hb/make {:fs fs
-                        :fallback-host (jvm/make)
+                        :fallback-host (th/fallback-host)
                         :builtins posix/standard})]
      [fs host])))
 
@@ -36,7 +38,9 @@
 (deftest touch-updates-mtime
   (let [[fs host] (fs+host)
         before    (:mtime-ms (fs/stat fs "/work/a.txt"))]
-    (Thread/sleep 3)
+    #?(:clj  (Thread/sleep 3)
+       :cljs (let [deadline (+ (.now js/Date) 3)]
+               (while (< (.now js/Date) deadline) nil)))
     (run host "touch a.txt")
     (let [after (:mtime-ms (fs/stat fs "/work/a.txt"))]
       (is (> after before)))))
@@ -183,7 +187,7 @@
         r (run host "chmod 0644 a.txt")]
     (is (= 0 (:exit r)))
     ;; vfs stores opaque mode; check via internal entry shape.
-    (is (= 0644 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
+    (is (= 8r644 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
 
 (deftest ln-s-creates-symlink
   (let [[fs host] (fs+host)
@@ -201,8 +205,8 @@
   (let [[fs host] (fs+host)
         r (run host "echo hello | tee out.txt")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "hello"))
-    (is (.contains ^String (fs/read-file fs "/work/out.txt") "hello"))))
+    (is (str/includes? (:stdout r) "hello"))
+    (is (str/includes? (fs/read-file fs "/work/out.txt") "hello"))))
 
 (deftest tee-append
   (let [[fs host] (fs+host {"/work" :dir "/work/log" "init\n"})]
@@ -218,7 +222,7 @@
   (let [[fs host] (fs+host)
         r (run host "mkdir -m 0700 secret")]
     (is (= 0 (:exit r)))
-    (is (= 0700 (-> (fs/stat fs "/work/secret") :perms-mode (or 0))))))
+    (is (= 8r700 (-> (fs/stat fs "/work/secret") :perms-mode (or 0))))))
 
 (deftest rmdir-p-walks-parents
   (let [[fs host] (fs+host {"/work" :dir
@@ -237,20 +241,20 @@
         _ (run host "chmod 0644 a.txt")
         r (run host "chmod u+x a.txt")]
     (is (= 0 (:exit r)))
-    (is (= 0744 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
+    (is (= 8r744 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
 
 (deftest chmod-symbolic-a-equals-r
   (let [[fs host] (fs+host)
         r (run host "chmod a=r a.txt")]
     (is (= 0 (:exit r)))
-    (is (= 0444 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
+    (is (= 8r444 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
 
 (deftest chmod-symbolic-go-minus-w
   (let [[fs host] (fs+host)
         _ (run host "chmod 0666 a.txt")
         r (run host "chmod go-w a.txt")]
     (is (= 0 (:exit r)))
-    (is (= 0644 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
+    (is (= 8r644 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
 
 (deftest chown-records-owner-group
   (let [[fs host] (fs+host)
@@ -270,26 +274,27 @@
 ;; Write builtins respect FS containment
 ;; ============================================================================
 
-(deftest write-builtins-cannot-touch-real-disk
-  ;; Whatever the virtual FS chooses to do internally (the implicit
-  ;; root is `/`, so absolute paths like `/etc/passwd` end up as vfs
-  ;; entries), no operation reaches real disk. The contract under
-  ;; test: the real filesystem is invariant across any sequence of
-  ;; write-builtin invocations.
-  (let [marker (str "/tmp/muschel-write-sandbox-marker-"
-                    (System/currentTimeMillis))]
-    (try
-      (let [[_ host] (fs+host)]
-        (doseq [cmd [(str "touch " marker)
-                     (str "mkdir " marker)
-                     (str "mkdir -p " marker "/a/b/c")
-                     (str "echo data > " marker)
-                     (str "cp a.txt " marker)
-                     (str "rm -rf /etc")]]
-          (run host cmd))
-        (is (not (.exists (java.io.File. marker)))
-            "no real /tmp file may exist after all the writes")
-        (is (.exists (java.io.File. "/etc/passwd"))
-            "real /etc/passwd must still exist"))
-      (finally
-        (try (.delete (java.io.File. marker)) (catch Throwable _))))))
+#?(:clj
+   (deftest write-builtins-cannot-touch-real-disk
+     ;; JVM-only because it asserts AGAINST real-disk side effects via
+     ;; java.io.File. The cross-platform invariant — the host's FS
+     ;; only routes builtin writes through the VFS — is covered by
+     ;; every `cp` / `mv` / `rm` test above (they prove the VFS is
+     ;; what gets mutated, not the real disk).
+     (let [marker (str "/tmp/muschel-write-sandbox-marker-"
+                       (System/currentTimeMillis))]
+       (try
+         (let [[_ host] (fs+host)]
+           (doseq [cmd [(str "touch " marker)
+                        (str "mkdir " marker)
+                        (str "mkdir -p " marker "/a/b/c")
+                        (str "echo data > " marker)
+                        (str "cp a.txt " marker)
+                        (str "rm -rf /etc")]]
+             (run host cmd))
+           (is (not (.exists (java.io.File. marker)))
+               "no real /tmp file may exist after all the writes")
+           (is (.exists (java.io.File. "/etc/passwd"))
+               "real /etc/passwd must still exist"))
+         (finally
+           (try (.delete (java.io.File. marker)) (catch Throwable _)))))))
