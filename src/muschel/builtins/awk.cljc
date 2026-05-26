@@ -1598,13 +1598,13 @@
    dropped (so `a\\nb\\n` yields 2 records, not 3)."
   [^String raw ^String rs]
   (if (= "" raw) []
-    (let [pat (if (= 1 (count rs)) (cc/re-quote rs) rs)
-          re  (compile-re pat)
-          parts (cc/split-by-regex re raw)
-          parts (if (and (seq parts) (= "" (last parts)))
-                  (vec (butlast parts))
-                  parts)]
-      parts)))
+      (let [pat (if (= 1 (count rs)) (cc/re-quote rs) rs)
+            re  (compile-re pat)
+            parts (cc/split-by-regex re raw)
+            parts (if (and (seq parts) (= "" (last parts)))
+                    (vec (butlast parts))
+                    parts)]
+        parts)))
 
 (defn run
   "Top-level awk run.

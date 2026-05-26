@@ -1196,7 +1196,7 @@
                ;; Defer to end: accumulate paths under this action's
                ;; argv signature (we only support one batched -exec).
                (do (vswap! batch-paths update :argv (fn [a]
-                                                     (or a (:argv tree))))
+                                                      (or a (:argv tree))))
                    (vswap! batch-paths update :paths (fnil conj []) (:path entry))
                    true)
                (let [exit (spawn-exec-action! tree (:path entry)
