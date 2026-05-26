@@ -1,0 +1,40 @@
+{
+  "name": "muschel",
+  "version": "{{VERSION}}",
+  "description": "Sandboxed bash shell for LLM agents — pure JS, virtual or contained filesystem, structural containment with introspection and resource budgets",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "main": "muschel.js",
+  "types": "index.d.ts",
+  "files": [
+    "muschel.js",
+    "muschel.js.map",
+    "index.d.ts",
+    "README.md",
+    "LICENSE",
+    "dist/playground"
+  ],
+  "keywords": [
+    "shell",
+    "bash",
+    "sandbox",
+    "llm",
+    "agent",
+    "ai",
+    "tool-use",
+    "filesystem",
+    "containment",
+    "clojurescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/replikativ/muschel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/replikativ/muschel/issues"
+  },
+  "homepage": "https://github.com/replikativ/muschel",
+  "author": "Christian Weilbach",
+  "license": "Apache-2.0"
+}

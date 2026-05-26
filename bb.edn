@@ -7,7 +7,7 @@
 ;;   {:deps {org.replikativ/muschel {:mvn/version "0.1.x"}}}
 ;;
 ;; This file is only for repo-local development.
-{:paths ["src" "resources"]
+{:paths ["src" "resources" "test"]
 
  :tasks
  {:requires
@@ -79,4 +79,33 @@
              (println (str "muschel.emit: " (.getMessage e)))
              (when-let [n (:node (ex-data e))]
                (println "  AST node:" (pr-str (select-keys n [:type :op :reason])))))
-           (System/exit 1)))))}}}
+           (System/exit 1)))))}
+
+  test
+  {:doc "Run the cross-platform test suite under babashka. Exits 0 on
+         pass, 1 on any failure or error. Use this in CI alongside
+         `clj -M:test` (JVM) and `node out/ci-tests.js` (CLJS-on-Node)
+         to verify all three runtimes."
+   :requires ([clojure.test :as t])
+   :task
+   (let [test-nses '[muschel.arith-test
+                     muschel.awk-host-test
+                     muschel.awk-test
+                     muschel.budget-test
+                     muschel.builtins-test
+                     muschel.env-test
+                     muschel.errors-test
+                     muschel.exec-test
+                     muschel.fs-test
+                     muschel.host-builtin-test
+                     muschel.lex-test
+                     muschel.parse-test
+                     muschel.permit-test
+                     muschel.sandbox-containment-test
+                     muschel.session-test
+                     muschel.text-path-builtins-test
+                     muschel.trace-test
+                     muschel.write-builtins-test]]
+     (doseq [n test-nses] (require n))
+     (let [{:keys [fail error] :as summary} (apply t/run-tests test-nses)]
+       (System/exit (if (or (pos? fail) (pos? error)) 1 0))))}}}

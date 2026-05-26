@@ -30,14 +30,19 @@
             #?(:cljs [goog.string.format])
             [muschel.arith :as arith]
             [muschel.ast :as ast]
+            [muschel.budget :as budget]
             [muschel.env :as env]
             [muschel.errors :as err]
             [muschel.expand :as expand]
+            [muschel.fs :as mfs]
+            [muschel.fs.traced :as fs.traced]
             [muschel.host :as host]
             #?(:clj [muschel.host.jvm :as host.jvm])
             [muschel.parse :as parse]
             [muschel.permit :as permit]
-            [muschel.session :as session]))
+            [muschel.runtime :as rt]
+            [muschel.session :as session]
+            [muschel.trace :as trace]))
 
 (defn- fmt
   "Portable format: cljs uses goog.string/format."
@@ -161,10 +166,28 @@
   (host/resolve-path (:cwd env) path))
 
 (defn- open-output [h env path append?]
-  (host/open-file-sink h (resolve-path env path) append?))
+  (let [resolved (resolve-path env path)
+        sink     (try (host/open-file-sink h resolved append?)
+                      (catch #?(:clj Throwable :cljs :default) t
+                        (trace/record-fs! (:trace env)
+                                          {:type :fs :op :open-sink
+                                           :path resolved :ok? false})
+                        (throw t)))]
+    (trace/record-fs! (:trace env)
+                      {:type :fs :op :open-sink :path resolved :ok? (some? sink)})
+    sink))
 
 (defn- open-input [h env path]
-  (host/open-file-source h (resolve-path env path)))
+  (let [resolved (resolve-path env path)
+        source   (try (host/open-file-source h resolved)
+                      (catch #?(:clj Throwable :cljs :default) t
+                        (trace/record-fs! (:trace env)
+                                          {:type :fs :op :open-source
+                                           :path resolved :ok? false})
+                        (throw t)))]
+    (trace/record-fs! (:trace env)
+                      {:type :fs :op :open-source :path resolved :ok? (some? source)})
+    source))
 
 (defn- apply-redir
   "Returns [env' new-opts closer-fn]. The closer-fn closes whatever we
@@ -246,16 +269,34 @@
 
 (defn- apply-redirs
   "Apply a sequence of redirections, returning [env' opts' close!-fn]
-   where close!-fn closes everything in reverse order."
+   where close!-fn closes everything in reverse order.
+
+   Any redirect that fails (target outside FS root, unreadable file, …)
+   writes a bash-style \"line N: cmd: file: msg\" line to :err on
+   `opts`, marks env as `:redir-failed?` so the caller can short-circuit
+   the inner command and exit 1, and returns the original env / opts."
   [env redirs opts]
   (let [closers (volatile! [])
+        failure (volatile! nil)
         [env' opts']
         (reduce (fn [[env opts] r]
-                  (let [[env' opts' c] (apply-redir env r opts)]
-                    (vswap! closers conj c)
-                    [env' opts']))
+                  (if @failure
+                    [env opts]
+                    (try
+                      (let [[env' opts' c] (apply-redir env r opts)]
+                        (vswap! closers conj c)
+                        [env' opts'])
+                      (catch #?(:clj Throwable :cljs :default) e
+                        (vreset! failure e)
+                        (host/write-string! (:host opts) (:err opts)
+                                            (str "muschel: redirect: "
+                                                 #?(:clj (.getMessage ^Throwable e)
+                                                    :cljs (.-message e))
+                                                 "\n"))
+                        [env opts]))))
                 [env opts]
-                redirs)]
+                redirs)
+        env' (cond-> env' @failure (assoc :redir-failed? true))]
     [env' opts' (fn [] (doseq [c (reverse @closers)]
                          (try (c) (catch #?(:clj Throwable :cljs :default) _ nil))))]))
 
@@ -314,15 +355,21 @@
 
 (defn- builtin-pwd
   "POSIX `pwd [-L|-P]`. We don't distinguish logical vs physical paths
-   (no symlink resolution), but we still reject unknown flags."
+   (no symlink resolution), but we still reject unknown flags. The
+   printed cwd is sandbox-relative when the host carries a sandbox-
+   aware FS so the host mount prefix doesn't leak."
   [env args opts]
   (if-let [bad (some #(when (and (str/starts-with? % "-")
                                  (not (re-matches #"-[LP]+" %))) %)
                      args)]
     (do (write-line opts :err (str "invalid option: \"" bad "\"\n"))
         (env/record-exit env 2))
-    (do (write-line opts :out (str (:cwd env) "\n"))
-        (env/record-exit env 0))))
+    (let [raw (:cwd env)
+          shown (if-let [fs (:fs env)]
+                  (mfs/sandbox-relativize fs raw)
+                  raw)]
+      (write-line opts :out (str shown "\n"))
+      (env/record-exit env 0))))
 
 (defn- builtin-echo
   "bash `echo [-neE] [arg ...]`. Flags only count if they appear at
@@ -1676,6 +1723,12 @@
       (when (= :deny (:decision result))
         (let [denied (some (fn [pc] (when (= :deny (:decision pc)) pc))
                            (:per-call result))]
+          (trace/record-denied! (:trace env)
+                                {:type :denied
+                                 :tool name
+                                 :argv (vec (cons name args))
+                                 :reason (:reason denied "?")
+                                 :rule-id (:rule-id denied)})
           (write-line opts :err (str "muschel: runtime permit denied `" name
                                      "`: " (:reason denied "?") "\n"))
           (env/record-exit env 126))))))
@@ -1697,9 +1750,15 @@
                         :extra-env (merge (env/to-process-env env) extra-env)
                         :in   (:in opts)
                         :out  (:out opts)
-                        :err  (:err opts)}
+                        :err  (:err opts)
+                        :interrupt-fn (:interrupt-fn env)
+                        :trace (:trace env)}
             result (try (host/spawn h spawn-opts)
                         (catch #?(:clj Throwable :cljs :default) e
+                          ;; Budget-exceeded interrupts must propagate
+                          ;; up to run-and-capture's boundary, not be
+                          ;; logged-and-swallowed.
+                          (when (budget/budget-exceeded? e) (throw e))
                           (write-line opts :err
                                       (str name ": "
                                            #?(:clj (.getMessage ^Throwable e)
@@ -1800,7 +1859,17 @@
                 (dissoc :returning?)))
 
           (builtin? name)
-          ((get builtins name) env1 args opts)
+          (let [started-at #?(:clj (System/currentTimeMillis) :cljs 0)
+                env'       ((get builtins name) env1 args opts)
+                exit       (or (:last-exit env') 0)]
+            (trace/record-tool! (:trace env)
+                                {:type :tool
+                                 :name name
+                                 :argv (vec (cons name args))
+                                 :exit exit
+                                 :duration-ms (- #?(:clj (System/currentTimeMillis) :cljs 0)
+                                                 started-at)})
+            env')
 
           :else
           (run-external env1 name args extra-env opts))))))
@@ -1907,12 +1976,23 @@
                                 (when-not (= i last-idx)
                                   (host/close! h (nth sinks i)))
                                 env')
-                              (catch #?(:clj Throwable :cljs :default) _
+                              (catch #?(:clj Throwable :cljs :default) t
                                 (when-not (= i last-idx)
                                   (host/close! h (nth sinks i)))
-                                (env/record-exit env 1)))))))
+                                (if (budget/budget-exceeded? t)
+                                  (throw t)
+                                  (env/record-exit env 1))))))))
           stmts))
-        results (mapv #(host/await-async h %) tasks)
+        results (try (mapv #(host/await-async h %) tasks)
+                     (catch #?(:clj Throwable :cljs :default) t
+                       ;; Java futures wrap the worker's throw in
+                       ;; ExecutionException. Unwrap so budget-exceeded
+                       ;; comes through cleanly.
+                       (let [cause #?(:clj (or (.getCause ^Throwable t) t)
+                                      :cljs t)]
+                         (if (budget/budget-exceeded? cause)
+                           (throw cause)
+                           (throw t)))))
         ;; Per POSIX (and default bash), pipeline exit = last cmd's exit.
         ;; pipefail uses the RIGHTMOST non-zero (bash semantics).
         last-exit (or (:last-exit (last results)) 0)
@@ -2255,15 +2335,23 @@
         [env-r opts-r close!] (apply-redirs env all-redirs opts)
         cmd-without-redirs (dissoc cmd :redirs)]
     (try
-      (let [env' (try
-                   (exec-cmd env-r cmd-without-redirs opts-r)
-                   (catch #?(:clj clojure.lang.ExceptionInfo
-                             :cljs ExceptionInfo) e
-                     (if (= :muschel.expand/param-error
-                            (:type (ex-data e)))
-                       (do (write-line opts-r :err (str (:msg (ex-data e)) "\n"))
-                           (-> env-r (env/record-exit 1) (assoc :exiting? true)))
-                       (throw e))))]
+      (let [env' (cond
+                   ;; A redirect raised (file not found, FS escape, …).
+                   ;; apply-redirs already wrote the error to :err.
+                   ;; Skip the command and exit 1.
+                   (:redir-failed? env-r)
+                   (-> env-r (dissoc :redir-failed?) (env/record-exit 1))
+
+                   :else
+                   (try
+                     (exec-cmd env-r cmd-without-redirs opts-r)
+                     (catch #?(:clj clojure.lang.ExceptionInfo
+                               :cljs ExceptionInfo) e
+                       (if (= :muschel.expand/param-error
+                              (:type (ex-data e)))
+                         (do (write-line opts-r :err (str (:msg (ex-data e)) "\n"))
+                             (-> env-r (env/record-exit 1) (assoc :exiting? true)))
+                         (throw e)))))]
         (let [env' (if (:neg? stmt)
                      (env/record-exit env' (if (zero? (:last-exit env')) 1 0))
                      env')
@@ -2349,6 +2437,7 @@
    exec-stmt-body and read+cleared here."
   [env stmts opts]
   (reduce (fn [env st]
+            (budget/check-interrupt! env)
             (cond
               (stop-propagating? env) (reduced env)
               :else
@@ -2385,20 +2474,60 @@
    provided, `env` overrides the session's current value at start —
    pass `(session/-env sess)` to thread without override."
   ([env src-or-ast] (run env src-or-ast {}))
-  ([env src-or-ast {:keys [in out err session permit] :as opts}]
+  ([env src-or-ast {:keys [in out err session permit
+                           interrupt-fn timeout-ms trace] :as opts}]
    (let [ast (if (string? src-or-ast) (parse/parse src-or-ast) src-or-ast)
          sess (or session (session/atom-session env))
+         ;; Resource-budget interrupt (cooperative). The caller can
+         ;; pass `interrupt-fn` directly OR a `timeout-ms` (we
+         ;; synthesise a deadline-based interrupt for them); when both
+         ;; are present we combine.
+         ifn (budget/combine interrupt-fn
+                             (when timeout-ms (budget/deadline-interrupt timeout-ms)))
+         ;; Optional introspection state. When opted in, every tool
+         ;; call, FS op, and permit denial is recorded.
+         trace-state (trace/coerce-options trace)
          ;; Optional permit check before any exec.
          permit-result (when permit (permit/check (assoc permit :ast ast)))]
      (if (and permit-result (= :deny (:decision permit-result)))
        (let [denied (first (filter #(= :deny (:decision %))
                                    (:per-call permit-result)))]
-         {:env env
-          :exit 126                                       ; convention: permission denied
-          :session sess
-          :permit permit-result
-          :denied-reason (:reason denied)})
+         ;; Even though we never exec'd, surface the deny via trace so
+         ;; the caller sees WHY the run was refused.
+         (when trace-state
+           (doseq [pc (filter #(= :deny (:decision %)) (:per-call permit-result))]
+             (trace/record-denied! trace-state
+                                   {:type :denied
+                                    :tool (or (:tool pc) (some-> pc :call :args first :parts first :value))
+                                    :argv (mapv #(some-> % :parts first :value) (some-> pc :call :args))
+                                    :reason (:reason pc "?")
+                                    :rule-id (:rule-id pc)})))
+         (cond-> {:env env
+                  :exit 126                              ; convention: permission denied
+                  :session sess
+                  :permit permit-result
+                  :denied-reason (:reason denied)}
+           trace-state (assoc :trace (trace/snapshot trace-state))))
        (let [h (or (:host opts) (default-host))
+             ;; A sandbox-aware host carries `:fs` (muschel.fs handle).
+             ;; Thread it into env so expand's pathname expansion walks
+             ;; the FS tree instead of leaking to babashka.fs against
+             ;; real disk. Also align env's :cwd with the FS's notion
+             ;; of cwd so relative-path resolution stays consistent.
+             host-fs (when h (try (:fs h) (catch #?(:clj Throwable :cljs :default) _ nil)))
+             ;; If tracing is opted in, wrap the host's FS so every
+             ;; protocol op records an event. The inner FS stays
+             ;; unchanged — containment isn't affected.
+             traced-fs (when (and trace-state host-fs)
+                         (fs.traced/wrap host-fs trace-state))
+             effective-fs (or traced-fs host-fs)
+             env (cond-> env
+                   effective-fs                                (assoc :fs effective-fs)
+                   (and effective-fs (not= (:cwd env) (mfs/cwd effective-fs)))
+                   (assoc :cwd (mfs/cwd effective-fs)
+                          :prev-cwd (mfs/cwd effective-fs))
+                   ifn                                         (assoc :interrupt-fn ifn)
+                   trace-state                                 (assoc :trace trace-state))
              opts' (cond-> {:in  (or in #?(:clj System/in :cljs nil))
                             :out (or out #?(:clj System/out :cljs (host/string-sink h)))
                             :err (or err #?(:clj System/err :cljs (host/string-sink h)))
@@ -2412,7 +2541,8 @@
          (when session
            (session/-swap-env! session (constantly env')))
          (cond-> {:env env' :exit (:last-exit env') :session sess}
-           permit-result (assoc :permit permit-result)))))))
+           permit-result (assoc :permit permit-result)
+           trace-state   (assoc :trace (trace/snapshot trace-state))))))))
 
 (defn run-and-capture
   "Like `run` but captures stdout and stderr as strings via the host."
@@ -2421,11 +2551,21 @@
    (let [h (or (:host opts) (default-host))
          out-buf (host/string-sink h)
          err-buf (host/string-sink h)
-         {:keys [env exit session]}
+         {:keys [env exit session permit trace] :as result}
          (run env src-or-ast
               (merge opts {:host h :out out-buf :err err-buf}))]
-     {:env env
-      :exit exit
-      :session session
-      :stdout (host/sink->string h out-buf)
-      :stderr (host/sink->string h err-buf)})))
+     (cond-> {:env env
+              :exit exit
+              :session session
+              :stdout (host/sink->string h out-buf)
+              :stderr (host/sink->string h err-buf)}
+       permit (assoc :permit permit)
+       trace  (assoc :trace trace)))))
+
+;; Late-bound registration: lets the `sh` builtin call back into the
+;; executor without a static require of `muschel.exec` from
+;; `muschel.builtins.posix` (which would form a cycle), and without
+;; the JVM-only `(require …) + (resolve …)` trick (which CLJS forbids).
+(rt/register! {:parse   parse/parse
+               :run     run-and-capture
+               :new-env env/new-env})

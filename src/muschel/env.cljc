@@ -69,21 +69,31 @@
              "/")))
 
 (defn new-env
-  "Build a fresh env from the host process environment. Every env var
-   inherited from the host is marked `:exported? true`.
+  "Build a fresh env. **SECURITY**: by default we DO NOT inherit any
+   host process environment — a sandboxed script must not see
+   `$BRAVE_API_KEY`, `$AWS_SECRET_ACCESS_KEY`, or any other secret
+   that happened to be in the launching process's env. Pass
+   `:host-env? true` (explicit opt-in) when you actually want host
+   inheritance — e.g. for unsandboxed CLI use — or `:vars {name val …}`
+   to seed a curated allowlist.
 
    Options:
      :cwd         override starting cwd (default: host cwd)
      :pos-args    initial positional params (default: [])
-     :script      \\$0 value (default: \"muschel\")"
-  [& {:keys [cwd pos-args script]
-      :or {pos-args [] script "bash"}}]
-  (let [host (host-env-map)
-        cwd' (or cwd (get host "PWD") (host-cwd))
+     :script      \\$0 value (default: \"bash\")
+     :host-env?   inherit (System/getenv); default `false`. ONLY pass
+                  true outside a sandboxed context.
+     :vars        explicit seed map {name → string-value}; each becomes
+                  an exported var. Use this for the allowlist case."
+  [& {:keys [cwd pos-args script host-env? vars]
+      :or {pos-args [] script "bash" host-env? false}}]
+  (let [host (when host-env? (host-env-map))
+        seed (merge (or host {}) (or vars {}))
+        cwd' (or cwd (get seed "PWD") (host-cwd))
         ;; Sync PWD in the var table to the resolved cwd so `$PWD`
         ;; and `pwd` agree (bash invariant).
-        host (assoc host "PWD" cwd')
-        vars (into {} (for [[k v] host]
+        seed (assoc seed "PWD" cwd')
+        vars (into {} (for [[k v] seed]
                         [k {:value v :exported? true :readonly? false}]))]
     {:vars       vars
      :cwd        cwd'
@@ -251,24 +261,27 @@
 ;; Working directory
 ;; ============================================================================
 
-(defn- absolutize [^String cwd ^String path]
-  #?(:clj
-     (let [f (java.io.File. path)]
-       (.getCanonicalPath
-        (if (.isAbsolute f) f (java.io.File. cwd path))))
-     :cljs
-     ;; In node, use the `path` module's resolve (works like java's
-     ;; getCanonicalPath for path-string purposes, without filesystem
-     ;; existence requirement). In the browser, treat paths as opaque.
-     (if (and (exists? js/require))
-       (let [path-mod (js/require "path")]
-         (.resolve path-mod cwd path))
-       ;; Browser: pure-string concatenation, no `.` / `..` resolution.
-       ;; Good enough for in-memory shells that don't touch a real fs.
-       (cond
-         (clojure.string/starts-with? path "/") path
-         (= "" path) cwd
-         :else (str (clojure.string/replace cwd #"/$" "") "/" path)))))
+(defn- absolutize
+  "Pure-string absolute-and-normalize. NEVER touches the filesystem —
+   that would canonicalise symlinks against the host root and leak
+   the real mount path into the sandbox's view of the cwd. The FS
+   layer is the only place authorised to follow links."
+  [^String cwd ^String path]
+  (let [joined (cond
+                 (clojure.string/starts-with? path "/") path
+                 (= "" path) cwd
+                 :else (str (clojure.string/replace cwd #"/$" "") "/" path))
+        segs (clojure.string/split joined #"/")
+        normalized (loop [in segs out []]
+                     (if-let [s (first in)]
+                       (cond
+                         (or (= "" s) (= "." s)) (recur (rest in) out)
+                         (= ".." s)
+                         (recur (rest in)
+                                (if (seq out) (vec (butlast out)) out))
+                         :else (recur (rest in) (conj out s)))
+                       out))]
+    (str "/" (clojure.string/join "/" normalized))))
 
 (defn cd
   "Change to `path` (absolute or relative to current cwd). Returns new

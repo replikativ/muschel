@@ -22,8 +22,13 @@
         (.flush out))))
 
   (-read-all-string [_ source]
-    (with-open [^java.io.InputStream in source]
-      (slurp in)))
+    ;; Do NOT `with-open` close the source here. When `source` is the
+    ;; read-end of a muschel pipe, babashka.process has a background
+    ;; copy thread that also reads it; closing under their feet emits
+    ;; \"ERROR while copying :in option:  Stream closed\" stderr noise.
+    ;; The caller (typically a builtin) owns the lifetime — they will
+    ;; close once they're done extracting whatever bytes they need.
+    (slurp source))
 
   (-close! [_ io]
     (when (instance? java.io.Closeable io)

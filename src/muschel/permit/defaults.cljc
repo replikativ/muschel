@@ -84,4 +84,65 @@
     [{:tool :bash :pattern {:kind :argv-glob :glob "mkfs.*"}
       :action :deny :origin :default :reason "format filesystem"}
      {:tool :bash :pattern {:kind :argv-vec :vec ["chmod" #{"777" "+rwx"}]}
-      :action :deny :origin :default :reason "world-writable permissions"}])))
+      :action :deny :origin :default :reason "world-writable permissions"}
+
+      ;; --- argv-shape fine-grained gates ----------------------------------
+      ;;
+      ;; argv-shape matches exact-length argv (last `:**` makes the
+      ;; tail open). Use it to allow a broad command BUT deny a
+      ;; specific dangerous combination — last-match-wins layering.
+
+      ;; git push: allow, but force-flavours deny.
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["git" "push" :**]}
+      :action :allow :origin :default
+      :reason "publish commits"}
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["git" "push" #{"-f" "--force" "--force-with-lease"} :**]}
+      :action :deny :origin :default
+      :reason "force-push rewrites remote history"}
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["git" "push" :* #{"-f" "--force" "--force-with-lease"} :**]}
+      :action :deny :origin :default
+      :reason "force-push rewrites remote history"}
+
+      ;; git reset --hard / git clean -fd: history / working-tree wipes
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["git" "reset" "--hard" :**]}
+      :action :deny :origin :default
+      :reason "discards uncommitted work"}
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["git" "clean" #{"-fd" "-fdx" "-fx" "-df"} :**]}
+      :action :deny :origin :default
+      :reason "deletes untracked files"}
+
+      ;; chmod world-writable variants (octal 7 in `other` slot)
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["chmod"
+                                    #{"0777" "777" "0666" "666" "0755" "0700"}
+                                    :**]}
+      ;; `:allow` for the well-known safe defaults, `:deny` for 0777/0666
+      :action :allow :origin :default
+      :reason "explicit octal modes"}
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["chmod" #{"0777" "777" "0666" "666"} :**]}
+      :action :deny :origin :default
+      :reason "world-writable / world-readable octal"}
+
+      ;; rm -rf / on common dangerous paths.
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape ["rm" :** #{"/" "/*" "/home" "/usr" "/etc" "/var" "/bin" "/lib"}]}
+      :action :deny :origin :default
+      :reason "would delete a critical system path"}
+
+      ;; curl / wget piped to sh — the install.sh pattern. The pipe
+      ;; itself is fine; running anything fetched is what we gate.
+      ;; The leaf `sh` / `bash` call hits the next rule.
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape [#{"bash" "sh" "zsh" "dash"} "-c" :**]}
+      :action :allow :origin :default
+      :reason "muschel re-parses through the same gates"}
+     {:tool :bash :pattern {:kind :argv-shape
+                            :shape [#{"bash" "sh" "zsh" "dash"}]}
+      :action :ask :origin :default
+      :reason "bare shell prompt — confirm intent"}])))

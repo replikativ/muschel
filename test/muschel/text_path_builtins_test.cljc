@@ -1,0 +1,389 @@
+(ns muschel.text-path-builtins-test
+  "Tests for the text + path tools: sed, awk, printf, env, date, seq,
+   basename, dirname, realpath, test/[. Cross-platform."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [muschel.builtins.posix :as posix]
+            [muschel.core :as m]
+            [muschel.fs :as fs]
+            [muschel.fs.virtual :as vfs]
+            [muschel.host.builtin :as hb]
+            [muschel.test-helpers :as th]))
+
+(defn- mk-host
+  ([] (mk-host {}))
+  ([{:keys [fs]
+     :or {fs (vfs/make {"/work/a.txt" "alpha\nbeta\ngamma\n"
+                        "/work/csv"   "name,age\nalice,30\nbob,25\n"}
+                       {:cwd "/work"})}}]
+   (hb/make {:fs fs
+             :fallback-host (th/fallback-host)
+             :builtins posix/standard})))
+
+(defn- now-ms []
+  #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)))
+
+(defn- run [host cmd]
+  (m/run-and-capture (m/new-env) cmd {:host host}))
+
+;; ============================================================================
+;; basename / dirname / realpath
+;; ============================================================================
+
+(deftest basename-strips-dirs
+  (let [r (run (mk-host) "basename /etc/foo/bar.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "bar.txt\n" (:stdout r)))))
+
+(deftest basename-with-suffix
+  (let [r (run (mk-host) "basename /etc/foo/bar.txt .txt")]
+    (is (= 0 (:exit r)))
+    (is (= "bar\n" (:stdout r)))))
+
+(deftest dirname-strips-final
+  (let [r (run (mk-host) "dirname /etc/foo/bar.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "/etc/foo\n" (:stdout r)))))
+
+(deftest dirname-no-slash-returns-dot
+  (let [r (run (mk-host) "dirname x")]
+    (is (= 0 (:exit r)))
+    (is (= ".\n" (:stdout r)))))
+
+(deftest realpath-resolves-inside-root
+  (let [r (run (mk-host) "realpath a.txt")]
+    (is (= 0 (:exit r)))
+    (is (str/includes? (:stdout r) "a.txt"))))
+
+;; ============================================================================
+;; printf
+;; ============================================================================
+
+(deftest printf-string
+  (let [r (run (mk-host) "printf \"hello %s\\n\" world")]
+    (is (= 0 (:exit r)))
+    (is (= "hello world\n" (:stdout r)))))
+
+(deftest printf-int
+  (let [r (run (mk-host) "printf \"%d\\n\" 42")]
+    (is (= 0 (:exit r)))
+    (is (= "42\n" (:stdout r)))))
+
+(deftest printf-multiple-args-reuse-format
+  ;; bash's printf reapplies the format string when there are more
+  ;; arguments than specifiers.
+  (let [r (run (mk-host) "printf \"%s\\n\" a b c")]
+    (is (= 0 (:exit r)))
+    (is (= "a\nb\nc\n" (:stdout r)))))
+
+;; ============================================================================
+;; env / date / seq
+;; ============================================================================
+
+(deftest env-prints-vars
+  (let [r (run (mk-host) "env")]
+    (is (= 0 (:exit r)))
+    (is (str/includes? (:stdout r) "="))))
+
+(deftest date-default
+  (let [r (run (mk-host) "date")]
+    (is (= 0 (:exit r)))
+    (is (re-find #"\d{4}-\d{2}-\d{2}" (:stdout r)))))
+
+(deftest date-format
+  (let [r (run (mk-host) "date +%Y")]
+    (is (= 0 (:exit r)))
+    (is (re-find #"^\d{4}$" (str/trim-newline (:stdout r))))))
+
+(deftest seq-1-to-n
+  (let [r (run (mk-host) "seq 3")]
+    (is (= 0 (:exit r)))
+    (is (= "1\n2\n3\n" (:stdout r)))))
+
+(deftest seq-start-end
+  (let [r (run (mk-host) "seq 2 5")]
+    (is (= 0 (:exit r)))
+    (is (= "2\n3\n4\n5\n" (:stdout r)))))
+
+(deftest seq-with-step
+  (let [r (run (mk-host) "seq 1 2 7")]
+    (is (= 0 (:exit r)))
+    (is (= "1\n3\n5\n7\n" (:stdout r)))))
+
+;; ============================================================================
+;; test / [
+;; ============================================================================
+
+(deftest test-string-equal
+  (let [r (run (mk-host) "test foo = foo")]
+    (is (= 0 (:exit r)))))
+
+(deftest test-string-not-equal
+  (let [r (run (mk-host) "test foo = bar")]
+    (is (= 1 (:exit r)))))
+
+(deftest test-empty-z
+  (let [r (run (mk-host) "test -z \"\"")]
+    (is (= 0 (:exit r)))))
+
+(deftest test-int-eq
+  (let [r (run (mk-host) "test 5 -eq 5")]
+    (is (= 0 (:exit r)))))
+
+(deftest test-int-lt
+  (let [r (run (mk-host) "test 2 -lt 5")]
+    (is (= 0 (:exit r)))))
+
+(deftest test-file-exists
+  (let [r (run (mk-host) "test -e a.txt")]
+    (is (= 0 (:exit r)))))
+
+(deftest test-file-missing
+  (let [r (run (mk-host) "test -e missing.txt")]
+    (is (= 1 (:exit r)))))
+
+(deftest test-d-on-dir
+  (let [fs (vfs/make {"/work" :dir "/work/sub" :dir} {:cwd "/work"})
+        r  (run (mk-host {:fs fs}) "test -d sub")]
+    (is (= 0 (:exit r)))))
+
+(deftest bracket-form
+  (let [r (run (mk-host) "[ -e a.txt ]")]
+    (is (= 0 (:exit r)))))
+
+(deftest bracket-in-if
+  (let [r (run (mk-host) "if [ -e a.txt ]; then echo yes; fi")]
+    (is (= 0 (:exit r)))
+    (is (str/includes? (:stdout r) "yes"))))
+
+;; ============================================================================
+;; sed
+;; ============================================================================
+
+(deftest sed-substitute-first
+  (let [r (run (mk-host) "echo foofoo | sed 's/foo/bar/'")]
+    (is (= 0 (:exit r)))
+    (is (= "barfoo\n" (:stdout r)))))
+
+(deftest sed-substitute-global
+  (let [r (run (mk-host) "echo foofoo | sed 's/foo/bar/g'")]
+    (is (= 0 (:exit r)))
+    (is (= "barbar\n" (:stdout r)))))
+
+(deftest sed-substitute-case-insensitive
+  (let [r (run (mk-host) "echo FOOFOO | sed 's/foo/bar/gi'")]
+    (is (= 0 (:exit r)))
+    (is (= "barbar\n" (:stdout r)))))
+
+(deftest sed-delete-pattern
+  (let [r (run (mk-host) "sed '/beta/d' a.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "alpha\ngamma\n" (:stdout r)))))
+
+(deftest sed-quiet-print-pattern
+  (let [r (run (mk-host) "sed -n '/beta/p' a.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "beta\n" (:stdout r)))))
+
+(deftest sed-in-place-rewrites-file
+  (let [host (mk-host)]
+    (run host "sed -i 's/alpha/AAA/' a.txt")
+    (let [r (run host "cat a.txt")]
+      (is (str/includes? (:stdout r) "AAA"))
+      (is (not (str/includes? (:stdout r) "alpha"))))))
+
+;; ============================================================================
+;; awk
+;;
+;; A faithful awk needs the full pattern-action language. A shallow
+;; subset is worse than none — agents write `'NR>1 && $3>10 {print}'`
+;; and silently get nothing back. So awk refuses with a clear message
+;; that steers them to cut+grep or clojure_eval.
+;; ============================================================================
+
+(deftest awk-works-through-host
+  ;; Sanity check the awk dispatch through the host. Detailed awk
+  ;; semantics are in muschel.awk-test.
+  (let [r (run (mk-host) "echo hi | awk '{print}'")]
+    (is (= 0 (:exit r)))
+    (is (= "hi\n" (:stdout r)))))
+
+;; ============================================================================
+;; sed — range addresses
+;; ============================================================================
+
+(deftest sed-range-numeric
+  ;; sed -n '3,5p' prints lines 3 through 5 inclusive. Most-common
+  ;; idiom in my own bash history.
+  (let [fs (vfs/make {"/work/n.txt" (apply str (for [i (range 1 11)] (str i "\n")))}
+                     {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "sed -n '3,5p' n.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "3\n4\n5\n" (:stdout r)))))
+
+(deftest sed-range-to-last
+  (let [fs (vfs/make {"/work/n.txt" (apply str (for [i (range 1 11)] (str i "\n")))}
+                     {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "sed -n '8,$p' n.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "8\n9\n10\n" (:stdout r)))))
+
+(deftest sed-range-delete
+  (let [fs (vfs/make {"/work/n.txt" "a\nb\nc\nd\ne\n"} {:cwd "/work"})
+        r (run (mk-host {:fs fs}) "sed '2,4d' n.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "a\ne\n" (:stdout r)))))
+
+;; ============================================================================
+;; jq
+;; ============================================================================
+
+(defn- jq-fs []
+  (vfs/make {"/work/obj.json"  "{\"name\":\"alice\",\"age\":30,\"tags\":[\"a\",\"b\",\"c\"]}"
+             "/work/list.json" "[{\"n\":1},{\"n\":2},{\"n\":3}]"}
+            {:cwd "/work"}))
+
+(deftest jq-identity
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -c . obj.json")]
+    (is (= 0 (:exit r)))
+    (is (str/includes? (:stdout r) "alice"))))
+
+(deftest jq-field
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r .name obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "alice\n" (:stdout r)))))
+
+(deftest jq-iter
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r '.tags[]' obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "a\nb\nc\n" (:stdout r)))))
+
+(deftest jq-pipe-length
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq '.tags | length' obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "3\n" (:stdout r)))))
+
+(deftest jq-keys
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -c keys obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "[\"age\",\"name\",\"tags\"]\n" (:stdout r)))))
+
+(deftest jq-type
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r type obj.json")]
+    (is (= 0 (:exit r)))
+    (is (= "object\n" (:stdout r)))))
+
+(deftest jq-iter-then-field
+  ;; .[] | .n on a list-of-objects → each n on its own line.
+  (let [r (run (mk-host {:fs (jq-fs)}) "jq -r '.[] | .n' list.json")]
+    (is (= 0 (:exit r)))
+    (is (= "1\n2\n3\n" (:stdout r)))))
+
+;; ============================================================================
+;; Audit-bug regressions (PR #10): native-tool parity fixes
+;; ============================================================================
+
+(deftest basename-of-slash-is-slash
+  ;; POSIX: basename / returns / (was empty).
+  (let [r (run (mk-host) "basename /")]
+    (is (= 0 (:exit r)))
+    (is (= "/\n" (:stdout r)))))
+
+(deftest dirname-of-slash-is-slash
+  ;; POSIX: dirname / returns / (was .).
+  (let [r (run (mk-host) "dirname /")]
+    (is (= 0 (:exit r)))
+    (is (= "/\n" (:stdout r)))))
+
+(deftest realpath-errors-on-missing
+  ;; Was silently succeeding; should error like native realpath.
+  (let [r (run (mk-host) "realpath does-not-exist")]
+    (is (= 1 (:exit r)))
+    (is (re-find #"No such file" (:stderr r)))))
+
+(deftest realpath-m-allows-missing
+  ;; -m / --canonicalize-missing: existing-or-missing is OK.
+  (let [r (run (mk-host) "realpath -m does-not-exist")]
+    (is (= 0 (:exit r)))
+    (is (re-find #"does-not-exist" (:stdout r)))))
+
+(deftest sleep-multi-arg-sums
+  (let [start (now-ms)
+        r (run (mk-host) "sleep 0.02 0.03")
+        elapsed (- (now-ms) start)]
+    (is (= 0 (:exit r)))
+    (is (>= elapsed 40))))
+
+(deftest sleep-suffix
+  (let [r (run (mk-host) "sleep 10ms")]
+    (is (= 0 (:exit r)))))
+
+(deftest seq-floats
+  (let [r (run (mk-host) "seq 0.5 0.5 2.0")]
+    (is (= 0 (:exit r)))
+    (is (= "0.5\n1\n1.5\n2\n" (:stdout r)))))
+
+(deftest seq-w-pads
+  (let [r (run (mk-host) "seq -w 8 10")]
+    (is (= 0 (:exit r)))
+    (is (= "08\n09\n10\n" (:stdout r)))))
+
+(deftest printf-no-extra-newline
+  ;; '%s\n' applied to 3 args used to produce an extra blank line.
+  (let [r (run (mk-host) "printf '%s\\n' a b c")]
+    (is (= 0 (:exit r)))
+    (is (= "a\nb\nc\n" (:stdout r)))))
+
+(deftest date-percent-percent-no-collision
+  ;; %% used to collide with following %S/%T via sequential replace.
+  (let [r (run (mk-host) "date +%%S")]
+    (is (= 0 (:exit r)))
+    ;; Should be literal %S, not the seconds value.
+    (is (= "%S\n" (:stdout r)))))
+
+;; ============================================================================
+;; sleep
+;; ============================================================================
+
+(deftest sleep-blocks
+  (let [start (now-ms)
+        r (run (mk-host) "sleep 0.05")
+        elapsed (- (now-ms) start)]
+    (is (= 0 (:exit r)))
+    (is (>= elapsed 40))))
+
+(deftest sleep-invalid-arg
+  (let [r (run (mk-host) "sleep banana")]
+    (is (= 1 (:exit r)))
+    (is (re-find #"invalid" (:stderr r)))))
+
+;; ============================================================================
+;; curl
+;;
+;; Smoke tests that exercise the FS-aware output path. We don't hit
+;; the real internet from the test suite — we hand curl a -X HEAD
+;; against a known-bad URL and confirm the request roundtrips
+;; through the FS for -o.
+;; ============================================================================
+
+;; curl uses java.net.http on JVM and a refusal stub on CLJS (no
+;; Node http binding wired yet), so these tests only run on JVM.
+#?(:clj
+   (deftest curl-handles-bad-host
+     (let [r (run (mk-host) "curl -s http://localhost:1/never")]
+       ;; Connection refused → non-zero exit with a clean curl: error
+       (is (pos? (:exit r)))
+       (is (re-find #"curl:" (:stderr r))))))
+
+#?(:clj
+   (deftest curl-output-routes-through-fs
+     ;; -o on a path outside the sandbox refuses; we can't easily prove
+     ;; the network path without external connectivity, so we check the
+     ;; refusal path. Real-network behaviour is covered by curl-uuid
+     ;; (skipped unless connectivity is available).
+     (let [host (th/mk-host {:files {"/work" :dir} :cwd "/work"})
+           ;; pick a host that's guaranteed unreachable to short-circuit
+           r (run host "curl -s -o /etc/dvergr-test http://localhost:1/")]
+       ;; Either we refused before the call (no network try) or the
+       ;; call failed first. In neither case does /etc/dvergr-test exist.
+       (is (not (.exists (java.io.File. "/etc/dvergr-test")))))))

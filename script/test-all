@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Run the muschel test suite under JVM, CLJS-on-Node, and babashka.
+# Exits 0 only if all three runtimes pass. Mirrors babashka's own
+# `script/test` pattern (see ../babashka/script/test for the model).
+set -eo pipefail
+
+cd "$(dirname "$0")/.."
+
+echo "==== JVM (Kaocha via clj -M:test)"
+clj -M:test
+
+echo
+echo "==== CLJS (shadow-cljs :ci → Node)"
+npx shadow-cljs compile ci
+node out/ci-tests.js
+
+echo
+echo "==== babashka (bb test)"
+bb test
+
+echo
+echo "==== All three runtimes green."

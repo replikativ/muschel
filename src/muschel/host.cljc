@@ -133,11 +133,30 @@
 ;; Path resolution (portable — works on any host)
 ;; ============================================================================
 
+(defn- normalize-segments
+  "Walk POSIX path segments collapsing `.` and `..`. Returns nil if
+   `..` underflows the absolute root."
+  [segments]
+  (loop [in segments out []]
+    (if-let [s (first in)]
+      (cond
+        (or (= "" s) (= "." s)) (recur (rest in) out)
+        (= ".." s)
+        (if (seq out)
+          (recur (rest in) (vec (butlast out)))
+          nil)        ; .. underflow
+        :else (recur (rest in) (conj out s)))
+      out)))
+
 (defn resolve-path
-  "Join `path` to `cwd` if relative. Pure-string operation; doesn't
-   touch the filesystem. Both host impls share this."
+  "Join `path` to `cwd` if relative and collapse `.`/`..`. Pure-string
+   operation; doesn't touch the filesystem. Returns nil when the path
+   escapes (`..` past root); callers should treat nil as a forbidden
+   path. Both host impls share this."
   [^String cwd ^String path]
-  (cond
-    (or (nil? path) (= "" path)) cwd
-    (str/starts-with? path "/") path
-    :else (str (str/replace cwd #"/$" "") "/" path)))
+  (let [joined (cond
+                 (or (nil? path) (= "" path)) cwd
+                 (str/starts-with? path "/") path
+                 :else (str (str/replace cwd #"/$" "") "/" path))]
+    (when-let [segs (normalize-segments (str/split joined #"/"))]
+      (str "/" (str/join "/" segs)))))

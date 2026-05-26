@@ -1,10 +1,13 @@
 (ns muschel.permit-test
+  "Permit-layer tests: parse-time gating, runtime hook, rule
+   validation. Cross-platform — uses run-and-capture with a sandboxed
+   BuiltinHost instead of raw `exec/run` + JVM streams."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [muschel.env :as env]
-            [muschel.exec :as exec]
+            [muschel.core :as m]
             [muschel.parse :as parse]
-            [muschel.permit :as permit]))
+            [muschel.permit :as permit]
+            [muschel.test-helpers :as th]))
 
 (defn- check
   ([src] (check src {}))
@@ -12,6 +15,19 @@
    (permit/check {:rulesets (or rulesets [permit/default-rules])
                   :ast (parse/parse src)
                   :prompter (or prompter permit/deny-all-prompter)})))
+
+(defn- run-perm
+  "Execute `src` against a sandboxed builtin host with the given
+   permit config. Returns {:exit :stdout :stderr :permit :env}."
+  ([src permit-cfg] (run-perm src permit-cfg {}))
+  ([src permit-cfg extra-opts]
+   (m/run-and-capture
+    (m/new-env) src
+    (merge {:host (th/mk-host)
+            :permit (merge {:rulesets [permit/default-rules]
+                            :prompter permit/deny-all-prompter}
+                           permit-cfg)}
+           extra-opts))))
 
 ;; ============================================================================
 ;; Defaults: auto-allow
@@ -46,6 +62,39 @@
     (is (= :allow (:decision r)))
     (is (= 1 (count (:prompted r))))))
 
+(deftest defaults-argv-shape-git-push
+  ;; `git push` is allowed; force-push variants deny.
+  (is (= :allow (:decision (check "git push origin main"))))
+  (is (= :deny  (:decision (check "git push --force origin main"))))
+  (is (= :deny  (:decision (check "git push -f"))))
+  (is (= :deny  (:decision (check "git push --force-with-lease"))))
+  (is (= :deny  (:decision (check "git push origin --force main")))))
+
+(deftest defaults-argv-shape-git-history-wipes
+  (is (= :deny (:decision (check "git reset --hard HEAD"))))
+  (is (= :deny (:decision (check "git clean -fd"))))
+  (is (= :deny (:decision (check "git clean -fdx")))))
+
+(deftest defaults-argv-shape-chmod-octals
+  ;; Explicit octals: 0755 allowed, 0777 / 0666 denied.
+  (is (= :allow (:decision (check "chmod 0755 script.sh"))))
+  (is (= :deny  (:decision (check "chmod 0777 some.sh"))))
+  (is (= :deny  (:decision (check "chmod 666 readable.txt")))))
+
+(deftest defaults-argv-shape-rm-system-paths
+  (is (= :deny (:decision (check "rm -rf /"))))
+  (is (= :deny (:decision (check "rm -rf /etc"))))
+  (is (= :deny (:decision (check "rm -rf /usr")))))
+
+(deftest defaults-argv-shape-shell-c
+  ;; `sh -c \"…\"` is allowed (muschel re-parses through the same gates);
+  ;; bare `sh` asks.
+  (is (= :allow (:decision (check "sh -c \"echo hi\""))))
+  (is (= :allow (:decision (check "bash -c \"git status\""))))
+  (let [r (check "sh" {:prompter (fn [_] {:result :allow-once})})]
+    (is (= :allow (:decision r)))
+    (is (= 1 (count (:prompted r))))))
+
 ;; ============================================================================
 ;; Matcher kinds
 ;; ============================================================================
@@ -77,6 +126,49 @@
     (is (= :allow (:decision (check "npm install" {:rulesets rs}))))
     (is (= :allow (:decision (check "npm test" {:rulesets rs}))))
     (is (not= :allow (:decision (check "yarn install" {:rulesets rs}))))))
+
+(deftest argv-shape-exact-length
+  ;; Shape matches exact length only — `git push X` doesn't match
+  ;; `["git" "push"]`. This is the key difference from :argv-vec.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape :shape ["git" "push"]}
+              :action :allow}]]]
+    (is (= :allow (:decision (check "git push" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "git push --force" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "git status" {:rulesets rs}))))))
+
+(deftest argv-shape-allow-push-deny-force
+  ;; The headline use case: allow `git push` but deny `git push --force`.
+  ;; Layer broad-allow with specific-deny under last-match-wins.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape :shape ["git" "push" :**]}
+              :action :allow}
+             {:tool :bash :pattern {:kind :argv-shape
+                                    :shape ["git" "push" #{"--force" "-f"} :**]}
+              :action :deny}]]]
+    (is (= :allow (:decision (check "git push"          {:rulesets rs}))))
+    (is (= :allow (:decision (check "git push origin"   {:rulesets rs}))))
+    (is (= :deny  (:decision (check "git push --force"  {:rulesets rs}))))
+    (is (= :deny  (:decision (check "git push -f main"  {:rulesets rs}))))))
+
+(deftest argv-shape-wildcards
+  ;; :* matches exactly one slot; :** matches the rest.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape :shape ["mv" :* :*]}
+              :action :allow}
+             {:tool :bash :pattern {:kind :argv-shape :shape ["touch" :**]}
+              :action :allow}]]]
+    (is (= :allow (:decision (check "mv a b" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "mv a" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "mv a b c" {:rulesets rs}))))
+    (is (= :allow (:decision (check "touch" {:rulesets rs}))))
+    (is (= :allow (:decision (check "touch a" {:rulesets rs}))))
+    (is (= :allow (:decision (check "touch a b c" {:rulesets rs}))))))
+
+(deftest argv-shape-regex
+  ;; A regex slot matches if re-find returns truthy.
+  (let [rs [[{:tool :bash :pattern {:kind :argv-shape
+                                    :shape ["docker" "run" #"^[a-z]+:[\d.]+$"]}
+              :action :allow}]]]
+    (is (= :allow (:decision (check "docker run nginx:1.27" {:rulesets rs}))))
+    (is (not= :allow (:decision (check "docker run nginx:latest-evil" {:rulesets rs}))))))
 
 (deftest ast-pred-matcher
   ;; Allow any call whose first arg starts with "git" (a fake-prefix pred)
@@ -154,27 +246,20 @@
 ;; ============================================================================
 
 (deftest exec-blocks-on-deny
-  (let [r (exec/run (env/new-env) "rm -rf /tmp/test-no-real-deletion"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}})]
+  (let [r (run-perm "rm -rf /tmp/test-no-real-deletion" {})]
     (is (= 126 (:exit r)) "exec returns 126 (permission denied)")
     (is (= :deny (-> r :permit :decision)))))
 
 (deftest exec-runs-on-allow
-  (let [r (exec/run (env/new-env) "echo hi"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "echo hi" {})]
     (is (zero? (:exit r)))
     (is (= :allow (-> r :permit :decision)))))
 
 (deftest exec-ask-with-prompter-allow
-  (let [r (exec/run (env/new-env) "make help"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter (fn [_] {:result :allow-once})}
-                     :out (java.io.ByteArrayOutputStream.)})]
-    ;; make help would fail (no Makefile) but permit check passes,
-    ;; so the exec path runs (with non-zero exit from make itself)
+  (let [r (run-perm "make help" {:prompter (fn [_] {:result :allow-once})})]
+    ;; `make` isn't a builtin and isn't allowlisted on the sandboxed
+    ;; host — the BuiltinHost refuses it after the permit gate, but
+    ;; permit's own decision is what we're asserting here.
     (is (= :allow (-> r :permit :decision)))))
 
 ;; ============================================================================
@@ -204,52 +289,29 @@
 ;; the runtime path catches what static parse-time check can't.
 
 (deftest runtime-hook-blocks-inner-cmd-subst-rm
-  (let [r (exec/run (env/new-env) "echo \"$(rm -rf /)\""
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out (java.io.ByteArrayOutputStream.)
-                     :err (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "echo \"$(rm -rf /)\"" {})]
     ;; The outer echo runs (exit 0), but the inner rm was blocked.
-    (is (zero? (:exit r)) "outer echo succeeds")
-    ;; The captured stderr (via opts :err that wasn't visible here) would
-    ;; have shown the permit denial. We verify behavior by checking the
-    ;; env's :last-exit reflects what bash would do.
-    ))
+    (is (zero? (:exit r)) "outer echo succeeds")))
 
 (deftest runtime-hook-blocks-inner-sudo
-  (let [err-buf (java.io.ByteArrayOutputStream.)
-        out-buf (java.io.ByteArrayOutputStream.)
-        _ (exec/run (env/new-env) "echo $(sudo whoami)"
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out out-buf
-                     :err err-buf})
-        err (.toString err-buf "UTF-8")]
-    (is (str/includes? err "runtime permit denied `sudo`"))))
+  (let [r (run-perm "echo $(sudo whoami)" {})]
+    (is (str/includes? (:stderr r) "runtime permit denied `sudo`"))))
 
 (deftest runtime-hook-blocks-dynamic-command
   ;; cmd=rm; $cmd … — the literal cmd-name `rm` only resolves at runtime.
   ;; Parse-time permit can't see it (the first arg is a var-ref); the
   ;; runtime hook catches it at the spawn site.
-  (let [r (exec/run (env/new-env) "cmd=ls; $cmd /nonexistent-thing-12345"
-                    {:permit {:rulesets
-                              [permit/default-rules
-                               ;; explicit deny on ls to demonstrate hook
-                               [{:tool :bash
-                                 :pattern {:kind :cmd-name :name "ls"}
-                                 :action :deny
-                                 :reason "test override"}]]
-                              :prompter permit/deny-all-prompter}
-                     :out (java.io.ByteArrayOutputStream.)
-                     :err (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "cmd=ls; $cmd /nonexistent-thing-12345"
+                    {:rulesets
+                     [permit/default-rules
+                      ;; explicit deny on ls to demonstrate hook
+                      [{:tool :bash
+                        :pattern {:kind :cmd-name :name "ls"}
+                        :action :deny
+                        :reason "test override"}]]})]
     (is (= 126 (:exit r)) "runtime hook denied the dynamically-resolved ls")))
 
 (deftest runtime-hook-allows-inner-when-rules-allow
-  (let [out-buf (java.io.ByteArrayOutputStream.)
-        r (exec/run (env/new-env) "echo \"date is: $(date +%Y)\""
-                    {:permit {:rulesets [permit/default-rules]
-                              :prompter permit/deny-all-prompter}
-                     :out out-buf
-                     :err (java.io.ByteArrayOutputStream.)})]
+  (let [r (run-perm "echo \"date is: $(date +%Y)\"" {})]
     (is (zero? (:exit r)))
-    (is (str/includes? (.toString out-buf "UTF-8") "date is: 20"))))
+    (is (str/includes? (:stdout r) "date is: 20"))))

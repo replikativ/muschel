@@ -331,14 +331,6 @@
 
 (declare evaluate)
 
-(defn- env-get-int
-  "Read variable `name` as integer.  Unset vars are 0 (bash default).
-   If the value is a valid bash arithmetic expression — including
-   another variable name chain (`a=b; b=5`) — we recursively evaluate
-   it, with a depth limit to prevent cycles."
-  [env nm]
-  (env-get-int env nm 0))
-
 (defn- env-get-int-rec [env nm depth]
   (let [v (env/get-var env nm)]
     (cond
