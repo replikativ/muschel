@@ -26,6 +26,7 @@
   (:refer-clojure :exclude [cat printf])
   (:require [clojure.string :as str]
             [clojure.tools.cli :as cli]
+            [muschel.builtins.awk :as awk-impl]
             [muschel.fs :as fs]
             [muschel.host :as host]))
 
@@ -2857,23 +2858,71 @@
     :else false))
 
 (defn awk
-  "Not implemented. A faithful awk needs the full pattern-action
-   language (BEGIN/END, -v VAR=val, arithmetic, string ops, regex
-   predicates, printf inside actions, associative arrays). A shallow
-   subset is worse than none — agents write idiomatic awk and
-   silently get empty output.
+  "POSIX awk, bounded subset. Dispatches to muschel.builtins.awk.
 
-   For now: use the available text builtins (cut / grep / sed / tr /
-   sort / uniq) and pipe them. For richer tabular work, the host
-   embedding muschel typically exposes a Clojure surface (SCI, REPL,
-   or library calls) better suited to the task."
-  [_argv _fs _env]
-  (err (str "awk: not implemented.\n"
-            "  field projection:  cut -d ' ' -f N\n"
-            "  line filtering:    grep PATTERN\n"
-            "  substitution:      sed 's/.../.../'\n"
-            "  numeric pipelines: prefer the host's Clojure surface")
-       1))
+   Supported:
+     BEGIN / END, pattern { action } rules incl. pat1,pat2 ranges
+     $0 $N NR NF FS OFS ORS RS RSTART RLENGTH FILENAME
+     arithmetic + - * / % ^ **; comparison == != < <= > >=
+     logical && || !; string concat by juxtaposition
+     regex match ~ !~; assignment = += -= *= /= %= ^= **=
+     pre/post inc/dec; ternary ?:
+     if/else, while, do/while, for(;;), for(var in array)
+     break / continue / next / exit; delete a[k] / delete a
+     print (OFS-joined, ORS-terminated), printf (%d %s %x %o %c %% etc.)
+     length(), substr(), index(), split(), sub(), gsub(),
+     sprintf(), match(), tolower(), toupper(), int()
+     sqrt, exp, log, sin, cos, atan2
+     single-dim associative arrays
+     -v VAR=val, -F SEP, -f FILE
+
+   Not supported: user-defined functions, getline, system(),
+   redirects (> >> |), multi-dim arrays via SUBSEP."
+  [argv fs env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-F" "--field-separator SEP" :default " "]
+                         ["-v" "--var KV"
+                          :assoc-fn (fn [m k v] (update m k (fnil conj []) v))
+                          :default []]
+                         ["-f" "--file FILE"]])]
+    (cond
+      err (usage-err "awk" err)
+      :else
+      (let [;; -f FILE → program from file; otherwise first positional.
+            program (cond
+                      (:file opts) (or (fs/read-file fs (:file opts))
+                                       (throw (ex-info (str "awk: " (:file opts)
+                                                            ": No such file or directory") {})))
+                      (seq pos)    (first pos)
+                      :else        nil)
+            files   (if (:file opts) pos (rest pos))
+            stdin   (or (:stdin env) "")
+            input   (cond
+                      (seq files)
+                      (vec (mapcat (fn [f]
+                                     (when-let [c (fs/read-file fs f)]
+                                       (str/split-lines c)))
+                                   files))
+                      (str/blank? stdin) []
+                      :else (str/split-lines stdin))
+            kv-vars (into {}
+                          (for [kv (:var opts)
+                                :let [idx (.indexOf ^String kv "=")]
+                                :when (pos? idx)]
+                            [(subs kv 0 idx) (subs kv (inc idx))]))]
+        (cond
+          (nil? program) (usage-err "awk" "missing program")
+          :else
+          (try
+            (let [result (awk-impl/run {:program program
+                                        :input   input
+                                        :fs      (:field-separator opts)
+                                        :vars    kv-vars})]
+              {:stdout (:stdout result)
+               :stderr ""
+               :exit   (:exit result)})
+            (catch Throwable t
+              (err (str "awk: " (.getMessage t)) 2))))))))
 
 ;; ============================================================================
 ;; jq — JSON projection & filtering

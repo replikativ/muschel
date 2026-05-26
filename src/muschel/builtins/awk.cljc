@@ -1,0 +1,1416 @@
+(ns muschel.builtins.awk
+  "A bounded but faithful awk implementation.
+
+   Modeled on goawk's tree-walking interpreter (MIT-licensed reference at
+   github.com/benhoyt/goawk). We port the **subset** that covers the
+   90% of agent awk-usage:
+
+     BEGIN / END                — yes
+     /re/ { … } and `expr { … }` patterns
+     pat1,pat2 { … } ranges
+     $0  $N  NR NF FS OFS ORS RS
+     arithmetic + - * / % ^ **
+     comparison == != < <= > >=
+     logical && || !
+     string concatenation by juxtaposition
+     regex match ~ !~
+     assignment = += -= *= /= %= ^= **=
+     pre/post inc/dec
+     ternary ?:
+     if/else, while, do/while, for(;;), for(var in array)
+     break / continue / next / exit
+     delete a[k] / delete a
+     print (comma list → OFS join, ORS terminator)
+     printf (full %d %i %x %o %c %s %% format)
+     length() substr() index() split()
+     sub() gsub() sprintf() match()
+     tolower() toupper() int()
+     single-dim associative arrays
+     -v VAR=val  -F SEP  -f FILE
+
+   Skipped (refuses):  user-defined functions, getline, system(),
+   redirects (> >> |), multi-dim arrays via SUBSEP, gensub.
+
+   The value model is the tricky bit. Each value has one of four tags:
+
+     :null    uninitialised. num=0, str=\"\", boolean=false.
+     :num     pure numeric (literal, arithmetic result).
+     :str     literal string or string-returning fn result.
+     :numstr  string from an input field, split result, or -v.
+
+   `=='s ' comparison branches on whether either side is a `true-string`
+   — a `:str` always is, a `:numstr` is iff it doesn't parse as a number,
+   `:num`/`:null` never are. This is why `$1 == 42` and `$1 == \"42\"`
+   both match a field whose text is `42`."
+  (:require [clojure.string :as str]))
+
+;; ============================================================================
+;; Lexer
+;; ============================================================================
+
+(def ^:private keywords
+  {"BEGIN"    :BEGIN  "END"      :END
+   "break"    :break  "continue" :continue
+   "delete"   :delete "do"       :do
+   "else"     :else   "exit"     :exit
+   "for"      :for    "function" :function   ;; function we reject at parse
+   "if"       :if     "in"       :in
+   "next"     :next   "print"    :print
+   "printf"   :printf "return"   :return    ;; return we reject
+   "while"    :while  "getline"  :getline   ;; getline we reject
+   "nextfile" :nextfile})
+
+(def ^:private builtin-fns
+  #{"length" "substr" "index" "split" "sub" "gsub" "sprintf"
+    "match" "tolower" "toupper" "int" "system" "atan2"
+    "cos" "sin" "exp" "log" "sqrt" "rand" "srand"})
+
+(defn- ws? [c] (or (= c \space) (= c \tab)))
+(defn- nl? [c] (= c \newline))
+(defn- digit? [c] (and c (>= (int c) 48) (<= (int c) 57)))
+(defn- name-start? [c]
+  (and c (or (and (>= (int c) 65) (<= (int c) 90))
+             (and (>= (int c) 97) (<= (int c) 122))
+             (= c \_))))
+(defn- name-char? [c] (or (name-start? c) (digit? c)))
+
+(defn- scan-string
+  "Consume a \"…\" or '…' literal. Returns [value next-pos]."
+  [^String src pos quote-ch]
+  (let [n (count src)
+        sb (StringBuilder.)]
+    (loop [i (inc pos)]
+      (cond
+        (>= i n) (throw (ex-info "unterminated string literal" {:pos pos}))
+        (= (.charAt src i) quote-ch) [(.toString sb) (inc i)]
+        (= (.charAt src i) \\)
+        (if (< (inc i) n)
+          (let [c2 (.charAt src (inc i))]
+            (.append sb (case c2
+                          \n \newline \t \tab \r \return
+                          \\ \\ \/ \/
+                          \" \" \' \'
+                          \a (char 7) \b \backspace \f \formfeed
+                          \v (char 11) \0 (char 0)
+                          c2))
+            (recur (+ i 2)))
+          (throw (ex-info "trailing backslash" {:pos i})))
+        :else
+        (do (.append sb (.charAt src i)) (recur (inc i)))))))
+
+(defn- scan-number
+  "Consume an integer / decimal / scientific literal. Returns
+   [double-value next-pos]."
+  [^String src pos]
+  (let [n (count src)
+        ;; Optional leading hex
+        hex? (and (= \0 (.charAt src pos))
+                  (< (inc pos) n)
+                  (#{\x \X} (.charAt src (inc pos))))]
+    (if hex?
+      (let [end (loop [i (+ pos 2)]
+                  (if (and (< i n)
+                           (let [c (.charAt src i)]
+                             (or (digit? c)
+                                 (and (>= (int c) 65) (<= (int c) 70))
+                                 (and (>= (int c) 97) (<= (int c) 102)))))
+                    (recur (inc i))
+                    i))]
+        [(double (Long/parseLong (subs src (+ pos 2) end) 16)) end])
+      (let [end (loop [i pos saw-dot? false saw-e? false]
+                  (if (>= i n)
+                    i
+                    (let [c (.charAt src i)]
+                      (cond
+                        (digit? c) (recur (inc i) saw-dot? saw-e?)
+                        (and (not saw-dot?) (not saw-e?) (= c \.))
+                        (recur (inc i) true saw-e?)
+                        (and (not saw-e?) (or (= c \e) (= c \E)))
+                        (let [j (inc i)
+                              j (if (and (< j n)
+                                         (or (= (.charAt src j) \+)
+                                             (= (.charAt src j) \-)))
+                                  (inc j) j)]
+                          (recur j saw-dot? true))
+                        :else i))))]
+        [(Double/parseDouble (subs src pos end)) end]))))
+
+(defn- scan-name
+  [^String src pos]
+  (let [n (count src)
+        end (loop [i pos]
+              (if (and (< i n) (name-char? (.charAt src i)))
+                (recur (inc i)) i))]
+    [(subs src pos end) end]))
+
+(defn- tokenize
+  "Lex `src` into a vec of {:type kw :value any :line :col} maps.
+   The parser will call `scan-regex` (below) for the contexts where
+   `/` introduces a regex rather than division."
+  [^String src]
+  (let [n (count src)
+        out (transient [])
+        line (volatile! 1)
+        col (volatile! 1)
+        bump (fn [c]
+               (if (nl? c)
+                 (do (vswap! line inc) (vreset! col 1))
+                 (vswap! col inc)))]
+    (loop [i 0]
+      (if (>= i n)
+        (do (conj! out {:type :eof :line @line :col @col})
+            (persistent! out))
+        (let [c (.charAt src i)
+              ln @line cl @col]
+          (cond
+            ;; Comment to end of line
+            (= c \#)
+            (let [j (loop [k i] (if (or (>= k n) (nl? (.charAt src k))) k (recur (inc k))))]
+              (recur j))
+
+            ;; Newline → token (statement terminator)
+            (nl? c)
+            (do (conj! out {:type :newline :line ln :col cl})
+                (bump c) (recur (inc i)))
+
+            ;; Other whitespace
+            (ws? c) (do (bump c) (recur (inc i)))
+
+            ;; Backslash-newline = continuation
+            (and (= c \\) (< (inc i) n) (nl? (.charAt src (inc i))))
+            (do (bump (.charAt src (inc i))) (recur (+ i 2)))
+
+            ;; String literals
+            (or (= c \") (= c \'))
+            (let [[v end] (scan-string src i c)]
+              (conj! out {:type :string :value v :line ln :col cl})
+              (vswap! col + (- end i))
+              (recur end))
+
+            ;; Number
+            (or (digit? c)
+                (and (= c \.) (< (inc i) n) (digit? (.charAt src (inc i)))))
+            (let [[v end] (scan-number src i)]
+              (conj! out {:type :number :value v :line ln :col cl})
+              (vswap! col + (- end i))
+              (recur end))
+
+            ;; Name / keyword / builtin
+            (name-start? c)
+            (let [[nm end] (scan-name src i)]
+              (cond
+                (keywords nm)
+                (conj! out {:type (keywords nm) :value nm :line ln :col cl})
+                (builtin-fns nm)
+                (conj! out {:type :builtin :value nm :line ln :col cl})
+                :else
+                (conj! out {:type :name :value nm :line ln :col cl}))
+              (vswap! col + (- end i))
+              (recur end))
+
+            ;; Multi-char operators (check longest first)
+            :else
+            (let [match (fn [s tok]
+                          (when (and (<= (+ i (count s)) n)
+                                     (= s (subs src i (+ i (count s)))))
+                            tok))
+                  [tok len]
+                  (or (when-let [t (match "**=" :pow-assign)] [t 3])
+                      (when-let [t (match "<<=" nil)] [t 3]) ;; unsupported
+                      (when-let [t (match ">>=" nil)] [t 3]) ;; unsupported
+                      (when-let [t (match "**" :pow)] [t 2])
+                      (when-let [t (match "==" :eq)] [t 2])
+                      (when-let [t (match "!=" :ne)] [t 2])
+                      (when-let [t (match "<=" :le)] [t 2])
+                      (when-let [t (match ">=" :ge)] [t 2])
+                      (when-let [t (match "&&" :and)] [t 2])
+                      (when-let [t (match "||" :or)] [t 2])
+                      (when-let [t (match "++" :incr)] [t 2])
+                      (when-let [t (match "--" :decr)] [t 2])
+                      (when-let [t (match "+=" :add-assign)] [t 2])
+                      (when-let [t (match "-=" :sub-assign)] [t 2])
+                      (when-let [t (match "*=" :mul-assign)] [t 2])
+                      (when-let [t (match "/=" :div-assign)] [t 2])
+                      (when-let [t (match "%=" :mod-assign)] [t 2])
+                      (when-let [t (match "^=" :pow-assign)] [t 2])
+                      (when-let [t (match "!~" :not-match)] [t 2])
+                      (when-let [t (match ">>" nil)] [t 2])
+                      (case c
+                        \+ [:add 1]   \- [:sub 1]
+                        \* [:mul 1]   \/ [:div 1]
+                        \% [:mod 1]   \^ [:pow 1]
+                        \= [:assign 1]
+                        \< [:lt 1]    \> [:gt 1]
+                        \! [:not 1]   \~ [:match 1]
+                        \? [:question 1] \: [:colon 1]
+                        \( [:lparen 1]   \) [:rparen 1]
+                        \{ [:lbrace 1]   \} [:rbrace 1]
+                        \[ [:lbracket 1] \] [:rbracket 1]
+                        \, [:comma 1]    \; [:semicolon 1]
+                        \$ [:dollar 1]   \| [:pipe 1]
+                        [nil 1]))]
+              (if tok
+                (do (conj! out {:type tok :line ln :col cl})
+                    (vswap! col + len)
+                    (recur (+ i len)))
+                (throw (ex-info (str "unexpected char: " (pr-str c))
+                                {:line ln :col cl}))))))))))
+
+;; ============================================================================
+;; Regex scanning — called by parser when it sees `/` in expression position
+;; ============================================================================
+
+(defn- scan-regex
+  "Re-lex from `pos` (which must point at a `/`) as a regex literal.
+   Returns [pattern next-pos]."
+  [^String src pos]
+  (let [n (count src)
+        sb (StringBuilder.)]
+    (loop [i (inc pos)]
+      (cond
+        (>= i n) (throw (ex-info "unterminated regex" {:pos pos}))
+        (= (.charAt src i) \/) [(.toString sb) (inc i)]
+        (= (.charAt src i) \\)
+        (if (< (inc i) n)
+          (do (.append sb \\) (.append sb (.charAt src (inc i)))
+              (recur (+ i 2)))
+          (throw (ex-info "trailing backslash in regex" {:pos i})))
+        :else (do (.append sb (.charAt src i)) (recur (inc i)))))))
+
+;; ============================================================================
+;; Parser — recursive descent. The token stream is held in an atom; helpers
+;; mutate the cursor and return AST nodes.
+;; ============================================================================
+
+(declare parse-expr parse-stmt parse-stmts parse-pattern)
+
+(defn- peek-tok [state]   (nth (:tokens state) @(:pos state) {:type :eof}))
+(defn- peek-tok-at [state offset]
+  (nth (:tokens state) (+ @(:pos state) offset) {:type :eof}))
+(defn- advance! [state] (let [t (peek-tok state)] (vswap! (:pos state) inc) t))
+(defn- at? [state & types] (boolean (some #(= % (:type (peek-tok state))) types)))
+(defn- expect! [state ty]
+  (let [t (peek-tok state)]
+    (when-not (= ty (:type t))
+      (throw (ex-info (str "expected " ty ", got " (:type t)
+                           " at line " (:line t) ":" (:col t))
+                      {:expected ty :actual t})))
+    (advance! state)))
+(defn- skip-terminators! [state]
+  (while (at? state :newline :semicolon) (advance! state)))
+
+(defn- consume-divs-as-regex
+  "When the parser needs a regex (e.g. after ~, !~, or in pattern
+   position), the lexer may have emitted :div / :div-assign. Re-scan
+   from the original source position as a /regex/."
+  [state]
+  (let [t (peek-tok state)]
+    (cond
+      (= :div (:type t))
+      (let [src (:src state)
+            ;; Find the source position of this `/`. We didn't store
+            ;; offsets; use a fallback: just re-lex from the line/col.
+            ;; Easier: store positions in tokens. (Done — line/col only.)
+            ;; Simplest: when at `:div`, treat the rest of the line up
+            ;; to the next `/` as the regex.
+            line (:line t) col (:col t)
+            pos (loop [i 0 ln 1 cl 1]
+                  (cond
+                    (and (= ln line) (= cl col)) i
+                    (>= i (count src)) i
+                    (= \newline (.charAt src i)) (recur (inc i) (inc ln) 1)
+                    :else (recur (inc i) ln (inc cl))))
+            [pat end] (scan-regex src pos)]
+        ;; Now skip the lexer's :div + any tokens up to (exclusive of)
+        ;; the corresponding end position. Simplest: rebuild the
+        ;; remaining tokens by re-tokenising the tail.
+        (vswap! (:pos state) inc)
+        ;; Re-tokenise from `end` and splice in.
+        (let [tail-toks (tokenize (subs src end))
+              kept (subvec (:tokens state) 0 (inc (dec @(:pos state))))
+              new-toks (vec (concat kept tail-toks))]
+          (when (not= new-toks (:tokens state))
+            ;; replace token vector
+            (vswap! (:pos state) (constantly (count kept)))
+            (alter-var-root #'tokenize identity)
+            ;; Mutate state's :tokens — we used vector but it's
+            ;; immutable; carry it via volatile.
+            (vreset! (:tokens-vol state) new-toks)))
+        pat)
+
+      :else nil)))
+
+;; Note on the above: re-lexing inside the parser is fiddly. Simplify:
+;; emit regex tokens directly during lex when we can — most regex
+;; contexts come after specific predecessors. We'll handle the
+;; remaining edge cases in postfix.
+
+;; ---------- Expression parsing (precedence-climbing) ----------
+
+(defn- parse-primary [state]
+  (let [t (peek-tok state)]
+    (case (:type t)
+      :number (do (advance! state) {:type :num :value (:value t)})
+      :string (do (advance! state) {:type :str :value (:value t)})
+      :dollar (do (advance! state)
+                  {:type :field :index (parse-primary state)})
+      :not    (do (advance! state) {:type :unary :op :not :value (parse-primary state)})
+      :sub    (do (advance! state) {:type :unary :op :neg :value (parse-primary state)})
+      :add    (do (advance! state) {:type :unary :op :pos :value (parse-primary state)})
+      :incr   (do (advance! state)
+                  (let [tgt (parse-primary state)]
+                    {:type :incr :op :incr :pre? true :expr tgt}))
+      :decr   (do (advance! state)
+                  (let [tgt (parse-primary state)]
+                    {:type :incr :op :decr :pre? true :expr tgt}))
+      :lparen (do (advance! state)
+                  (let [e (parse-expr state)]
+                    (expect! state :rparen)
+                    e))
+      :name   (let [nm (:value (advance! state))]
+                (if (at? state :lbracket)
+                  (do (advance! state)
+                      (let [idx (parse-expr state)]
+                        (expect! state :rbracket)
+                        {:type :index :array nm :index [idx]}))
+                  {:type :var :name nm}))
+      :builtin
+      (let [fname (:value (advance! state))]
+        (cond
+          ;; length with no parens
+          (and (= fname "length") (not (at? state :lparen)))
+          {:type :call :func :length :args []}
+          :else
+          (do (expect! state :lparen)
+              (let [args (loop [acc []]
+                           (if (at? state :rparen)
+                             acc
+                             (let [e (parse-expr state)
+                                   acc' (conj acc e)]
+                               (if (at? state :comma)
+                                 (do (advance! state) (recur acc'))
+                                 acc'))))]
+                (expect! state :rparen)
+                {:type :call :func (keyword fname) :args args}))))
+      :div
+      ;; Bare regex in primary position.
+      (let [{:keys [src tokens-vol pos]} state
+            tok t
+            line (:line tok) col (:col tok)
+            ;; Compute source offset of this `/`.
+            offset (loop [i 0 ln 1 cl 1]
+                     (cond
+                       (and (= ln line) (= cl col)) i
+                       (>= i (count src)) i
+                       (= \newline (.charAt src i)) (recur (inc i) (inc ln) 1)
+                       :else (recur (inc i) ln (inc cl))))
+            [pat end] (scan-regex src offset)
+            tail-toks (tokenize (subs src end))
+            kept (subvec @tokens-vol 0 @pos)
+            new-toks (vec (concat kept tail-toks))]
+        (vreset! tokens-vol new-toks)
+        (vreset! pos (count kept))
+        {:type :regex :pattern pat})
+      (throw (ex-info (str "unexpected token in primary: " (:type t)
+                           " at line " (:line t) ":" (:col t))
+                      {:token t})))))
+
+(defn- l-value?
+  "True if `e` can appear as the LHS of an assignment / target of
+   ++/--."
+  [e]
+  (case (:type e)
+    :var true :index true :field true
+    false))
+
+(defn- parse-postfix [state]
+  (let [e (parse-primary state)]
+    (cond
+      (and (at? state :incr) (l-value? e))
+      (do (advance! state) {:type :incr :op :incr :pre? false :expr e})
+      (and (at? state :decr) (l-value? e))
+      (do (advance! state) {:type :incr :op :decr :pre? false :expr e})
+      :else e)))
+
+(defn- parse-pow [state]
+  (let [l (parse-postfix state)]
+    (if (at? state :pow)
+      (do (advance! state)
+          {:type :binary :op :pow :left l :right (parse-pow state)})
+      l)))
+
+(defn- parse-mul [state]
+  (loop [l (parse-pow state)]
+    (cond
+      (at? state :mul) (do (advance! state) (recur {:type :binary :op :mul :left l :right (parse-pow state)}))
+      (at? state :div) (do (advance! state) (recur {:type :binary :op :div :left l :right (parse-pow state)}))
+      (at? state :mod) (do (advance! state) (recur {:type :binary :op :mod :left l :right (parse-pow state)}))
+      :else l)))
+
+(defn- parse-add [state]
+  (loop [l (parse-mul state)]
+    (cond
+      (at? state :add) (do (advance! state) (recur {:type :binary :op :add :left l :right (parse-mul state)}))
+      (at? state :sub) (do (advance! state) (recur {:type :binary :op :sub :left l :right (parse-mul state)}))
+      :else l)))
+
+;; Concatenation by juxtaposition — detect by peeking at the next
+;; token; if it starts a primary, treat as :concat.
+(def ^:private concat-starts
+  #{:dollar :not :name :number :string :lparen :incr :decr :builtin})
+
+(defn- parse-concat [state]
+  (loop [l (parse-add state)]
+    (if (concat-starts (:type (peek-tok state)))
+      (recur {:type :binary :op :concat :left l :right (parse-add state)})
+      l)))
+
+(defn- parse-compare [state]
+  (let [l (parse-concat state)
+        op (case (:type (peek-tok state))
+             :eq :eq :ne :ne :lt :lt :le :le :gt :gt :ge :ge nil)]
+    (if op
+      (do (advance! state)
+          {:type :binary :op op :left l :right (parse-concat state)})
+      l)))
+
+(defn- parse-match [state]
+  (let [l (parse-compare state)]
+    (cond
+      (at? state :match)
+      (do (advance! state)
+          {:type :binary :op :match :left l :right (parse-compare state)})
+      (at? state :not-match)
+      (do (advance! state)
+          {:type :binary :op :not-match :left l :right (parse-compare state)})
+      :else l)))
+
+(defn- parse-in [state]
+  (loop [l (parse-match state)]
+    (if (at? state :in)
+      (do (advance! state)
+          (let [arr (advance! state)]
+            (when (not= :name (:type arr))
+              (throw (ex-info "expected array name after `in`" {:tok arr})))
+            (recur {:type :in :index [l] :array (:value arr)})))
+      l)))
+
+(defn- parse-and [state]
+  (loop [l (parse-in state)]
+    (if (at? state :and)
+      (do (advance! state) (recur {:type :binary :op :and :left l :right (parse-in state)}))
+      l)))
+
+(defn- parse-or [state]
+  (loop [l (parse-and state)]
+    (if (at? state :or)
+      (do (advance! state) (recur {:type :binary :op :or :left l :right (parse-and state)}))
+      l)))
+
+(defn- parse-cond [state]
+  (let [l (parse-or state)]
+    (if (at? state :question)
+      (do (advance! state)
+          (let [t (parse-expr state)
+                _ (expect! state :colon)
+                f (parse-expr state)]
+            {:type :cond :cond l :true t :false f}))
+      l)))
+
+(def ^:private aug-ops
+  {:add-assign :add :sub-assign :sub :mul-assign :mul
+   :div-assign :div :mod-assign :mod :pow-assign :pow})
+
+(defn- parse-assign [state]
+  (let [l (parse-cond state)
+        t (:type (peek-tok state))]
+    (cond
+      (and (= t :assign) (l-value? l))
+      (do (advance! state) {:type :assign :left l :right (parse-assign state)})
+      (and (aug-ops t) (l-value? l))
+      (do (advance! state)
+          {:type :aug-assign :op (aug-ops t) :left l :right (parse-assign state)})
+      :else l)))
+
+(defn- parse-expr [state] (parse-assign state))
+
+;; ---------- Statements ----------
+
+(defn- parse-print-args [state]
+  ;; Comma-separated expressions until we hit a redirect, terminator,
+  ;; or rbrace.
+  (loop [acc []]
+    (let [t (peek-tok state)]
+      (cond
+        (#{:newline :semicolon :rbrace :eof :gt :pipe} (:type t)) acc
+        :else
+        (let [e (parse-expr state)
+              acc' (conj acc e)]
+          (if (at? state :comma)
+            (do (advance! state) (recur acc'))
+            acc'))))))
+
+(defn- parse-simple-stmt [state]
+  (let [t (peek-tok state)]
+    (case (:type t)
+      :print  (do (advance! state)
+                  {:type :print :args (parse-print-args state)})
+      :printf (do (advance! state)
+                  {:type :printf :args (parse-print-args state)})
+      :delete (do (advance! state)
+                  (let [nm (advance! state)]
+                    (when (not= :name (:type nm))
+                      (throw (ex-info "delete needs array name" {:tok nm})))
+                    (if (at? state :lbracket)
+                      (do (advance! state)
+                          (let [idx (parse-expr state)]
+                            (expect! state :rbracket)
+                            {:type :delete :array (:value nm) :index [idx]}))
+                      {:type :delete :array (:value nm) :index nil})))
+      ;; bare expression
+      {:type :expr-stmt :expr (parse-expr state)})))
+
+(defn- parse-stmt-block [state]
+  (expect! state :lbrace)
+  (skip-terminators! state)
+  (let [body (loop [acc []]
+               (if (at? state :rbrace)
+                 acc
+                 (let [s (parse-stmt state)]
+                   (skip-terminators! state)
+                   (recur (conj acc s)))))]
+    (advance! state) ; rbrace
+    {:type :block :body body}))
+
+(defn- parse-stmt [state]
+  (let [t (peek-tok state)]
+    (case (:type t)
+      :lbrace (parse-stmt-block state)
+      :if     (do (advance! state)
+                  (expect! state :lparen)
+                  (let [c (parse-expr state)
+                        _ (expect! state :rparen)
+                        _ (skip-terminators! state)
+                        b (parse-stmt state)
+                        _ (skip-terminators! state)
+                        e (when (at? state :else)
+                            (advance! state) (skip-terminators! state)
+                            (parse-stmt state))]
+                    {:type :if :cond c :body b :else e}))
+      :while  (do (advance! state)
+                  (expect! state :lparen)
+                  (let [c (parse-expr state)
+                        _ (expect! state :rparen)
+                        _ (skip-terminators! state)
+                        b (parse-stmt state)]
+                    {:type :while :cond c :body b}))
+      :do     (do (advance! state)
+                  (skip-terminators! state)
+                  (let [b (parse-stmt state)
+                        _ (skip-terminators! state)
+                        _ (expect! state :while)
+                        _ (expect! state :lparen)
+                        c (parse-expr state)
+                        _ (expect! state :rparen)]
+                    {:type :do-while :body b :cond c}))
+      :for    (do (advance! state)
+                  (expect! state :lparen)
+                  ;; Two forms: for (var in array) ... or C-style for(;;)
+                  (let [save-pos @(:pos state)
+                        ;; Probe: name, in, name, rparen
+                        a (peek-tok-at state 0)
+                        b (peek-tok-at state 1)
+                        c (peek-tok-at state 2)
+                        d (peek-tok-at state 3)]
+                    (if (and (= :name (:type a)) (= :in (:type b))
+                             (= :name (:type c)) (= :rparen (:type d)))
+                      (let [v (:value (advance! state))
+                            _ (advance! state) ; in
+                            arr (:value (advance! state))
+                            _ (advance! state) ; rparen
+                            _ (skip-terminators! state)
+                            body (parse-stmt state)]
+                        {:type :for-in :var v :array arr :body body})
+                      (let [pre (when-not (at? state :semicolon)
+                                  (parse-simple-stmt state))
+                            _ (expect! state :semicolon)
+                            cond-e (when-not (at? state :semicolon)
+                                     (parse-expr state))
+                            _ (expect! state :semicolon)
+                            post (when-not (at? state :rparen)
+                                   (parse-simple-stmt state))
+                            _ (expect! state :rparen)
+                            _ (skip-terminators! state)
+                            body (parse-stmt state)]
+                        {:type :for :pre pre :cond cond-e :post post :body body}))))
+      :break    (do (advance! state) {:type :break})
+      :continue (do (advance! state) {:type :continue})
+      :next     (do (advance! state) {:type :next})
+      :exit     (do (advance! state)
+                    (let [code (when-not (#{:newline :semicolon :rbrace :eof}
+                                          (:type (peek-tok state)))
+                                 (parse-expr state))]
+                      {:type :exit :status code}))
+      ;; default — simple stmt
+      (parse-simple-stmt state))))
+
+(defn- parse-pattern [state]
+  ;; Pattern is either `expr`, `expr , expr` (range), or nothing.
+  (let [t (peek-tok state)]
+    (cond
+      (#{:lbrace :eof :newline :semicolon} (:type t)) []
+      :else
+      (let [e1 (parse-expr state)]
+        (if (at? state :comma)
+          (do (advance! state) [e1 (parse-expr state)])
+          [e1])))))
+
+(defn parse
+  "Parse awk source text into a program AST:
+     {:type :program :begin [stmts] :actions [{:pattern :stmts}] :end [stmts]}"
+  [src]
+  (let [tokens-vol (volatile! (tokenize src))
+        state {:src src
+               :tokens-vol tokens-vol
+               :pos (volatile! 0)}
+        ;; Make :tokens dynamic — re-read each peek
+        state (assoc state :tokens @tokens-vol)
+        ;; Wrap peek/advance to always read fresh @tokens-vol
+        ]
+    (with-redefs [peek-tok (fn [_s] (nth @tokens-vol @(:pos state) {:type :eof}))
+                  peek-tok-at (fn [_s o] (nth @tokens-vol (+ @(:pos state) o) {:type :eof}))
+                  advance! (fn [_s]
+                             (let [t (nth @tokens-vol @(:pos state) {:type :eof})]
+                               (vswap! (:pos state) inc) t))]
+      (let [begin (transient [])
+            actions (transient [])
+            end (transient [])]
+        (skip-terminators! state)
+        (while (not= :eof (:type (peek-tok state)))
+          (cond
+            (at? state :BEGIN)
+            (do (advance! state) (skip-terminators! state)
+                (let [b (parse-stmt-block state)]
+                  (conj! begin b)))
+
+            (at? state :END)
+            (do (advance! state) (skip-terminators! state)
+                (let [b (parse-stmt-block state)]
+                  (conj! end b)))
+
+            :else
+            (let [pat (parse-pattern state)
+                  _ (skip-terminators! state)
+                  body (cond
+                         (at? state :lbrace) (parse-stmt-block state)
+                         :else nil)]
+              (conj! actions {:pattern pat :stmts body})))
+          (skip-terminators! state))
+        {:type :program
+         :begin (persistent! begin)
+         :actions (persistent! actions)
+         :end (persistent! end)}))))
+
+;; ============================================================================
+;; Value model — string/number coercion semantics
+;; ============================================================================
+
+(defn- v-null []        {:tag :null})
+(defn- v-num [n]        {:tag :num   :n (double n)})
+(defn- v-str [s]        {:tag :str   :s (str s)})
+(defn- v-numstr [s]     {:tag :numstr :s (str s)})
+
+(defn- parse-num-prefix
+  "Match leading numeric prefix of `s`. Returns [num parsed?] —
+   `parsed?` indicates whether the *whole* string was consumed
+   (numeric throughout)."
+  [^String s]
+  (let [s (str/triml s)]
+    (cond
+      (str/blank? s) [0.0 false]
+      :else
+      (let [m (re-find #"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?" s)]
+        (if m
+          [(Double/parseDouble m) (= (count m) (count s))]
+          [0.0 false])))))
+
+(defn- v->num [v]
+  (case (:tag v)
+    :null 0.0
+    :num  (:n v)
+    (:str :numstr) (first (parse-num-prefix (:s v)))))
+
+(defn- fmt-num
+  "awk's CONVFMT/OFMT formatting. Integers print as integers; doubles
+   use %.6g (matching default CONVFMT)."
+  [n]
+  (cond
+    (Double/isNaN n) "nan"
+    (Double/isInfinite n) (if (pos? n) "inf" "-inf")
+    (== n (Math/floor n)) (str (long n))
+    :else (let [s (format "%.6g" n)
+                ;; Strip trailing zeros in fractional part — but keep
+                ;; at least one digit after the dot.
+                ]
+            s)))
+
+(defn- v->str [v]
+  (case (:tag v)
+    :null ""
+    :num (fmt-num (:n v))
+    (:str :numstr) (:s v)))
+
+(defn- v-true-string?
+  "Returns true if `v` should be compared as a string in mixed ==
+   / < / etc. comparisons. :str always is. :numstr is iff its
+   content does NOT parse as a number. :num/:null never are."
+  [v]
+  (case (:tag v)
+    :str true
+    :numstr (let [[_ parsed?] (parse-num-prefix (:s v))]
+              (not parsed?))
+    false))
+
+(defn- v->bool [v]
+  (case (:tag v)
+    :null false
+    :num (not (zero? (:n v)))
+    :str (not (= "" (:s v)))
+    :numstr (let [[n parsed?] (parse-num-prefix (:s v))]
+              (if parsed? (not (zero? n)) (not (= "" (:s v)))))))
+
+(defn- v-cmp
+  "Awk comparison: if either side is a 'true string', compare as strings;
+   else compare as numbers."
+  [a b]
+  (if (or (v-true-string? a) (v-true-string? b))
+    (compare (v->str a) (v->str b))
+    (compare (v->num a) (v->num b))))
+
+;; ============================================================================
+;; Interpreter — tree walking
+;; ============================================================================
+
+(defn- init-state
+  [{:keys [fs ofs ors rs vars] :or {ofs " " ors "\n" rs "\n"}}]
+  {:globals (atom (or vars {}))
+   :arrays  (atom {})
+   :fields  (atom [])     ; $1..$N
+   :line    (atom "")     ; $0
+   :specials (atom {"NR" (v-num 0) "NF" (v-num 0)
+                    "FS" (v-str (or fs " "))
+                    "OFS" (v-str ofs)
+                    "ORS" (v-str ors)
+                    "RS" (v-str rs)
+                    "FILENAME" (v-str "")
+                    "RSTART" (v-num 0)
+                    "RLENGTH" (v-num -1)
+                    "SUBSEP" (v-str (str (char 28)))
+                    "CONVFMT" (v-str "%.6g")
+                    "OFMT" (v-str "%.6g")})
+   :out     (StringBuilder.)
+   :exit?   (atom false)
+   :exit-code (atom 0)
+   :range-state (atom {})})
+
+(def ^:private special-names
+  #{"NR" "NF" "FS" "OFS" "ORS" "RS" "FILENAME" "RSTART" "RLENGTH"
+    "SUBSEP" "CONVFMT" "OFMT"})
+
+(defn- special-var? [nm] (boolean (special-names nm)))
+
+(defn- get-special [state nm]
+  (or (get @(:specials state) nm) (v-null)))
+
+(defn- set-special! [state nm v]
+  (swap! (:specials state) assoc nm v))
+
+(defn- get-global [state nm]
+  (or (get @(:globals state) nm) (v-null)))
+
+(defn- set-global! [state nm v]
+  (swap! (:globals state) assoc nm v))
+
+(defn- get-array [state nm]
+  (or (get @(:arrays state) nm) {}))
+
+(defn- set-array-elt! [state nm key v]
+  (swap! (:arrays state) update nm assoc key v))
+
+(defn- delete-array-elt! [state nm key]
+  (swap! (:arrays state) update nm dissoc key))
+
+(defn- delete-array! [state nm]
+  (swap! (:arrays state) dissoc nm))
+
+(defn- split-fields
+  "Split `line` by FS. FS rules:
+     \" \"  — whitespace-trim, split on runs of whitespace
+     single char — split on that literal
+     multi-char — treat as regex"
+  [^String line ^String fs]
+  (cond
+    (= line "") []
+    (= fs " ") (vec (str/split (str/trim line) #"\s+"))
+    (= 1 (count fs)) (vec (str/split line (re-pattern (java.util.regex.Pattern/quote fs))))
+    :else (vec (str/split line (re-pattern fs)))))
+
+(defn- set-line! [state ^String line]
+  (reset! (:line state) line)
+  (let [fs (v->str (get-special state "FS"))
+        fields (split-fields line fs)]
+    (reset! (:fields state) fields)
+    (set-special! state "NF" (v-num (count fields)))))
+
+(defn- get-field [state n]
+  (cond
+    (zero? n) (v-numstr @(:line state))
+    (neg? n) (v-str "")
+    :else
+    (let [fs @(:fields state)]
+      (if (> n (count fs))
+        (v-str "")
+        (v-numstr (nth fs (dec n)))))))
+
+(defn- rebuild-line!
+  [state]
+  (let [ofs (v->str (get-special state "OFS"))]
+    (reset! (:line state) (str/join ofs @(:fields state)))
+    (set-special! state "NF" (v-num (count @(:fields state))))))
+
+(defn- set-field! [state n v]
+  (cond
+    (zero? n)
+    (set-line! state (v->str v))
+
+    (pos? n)
+    (let [fs @(:fields state)
+          cur-len (count fs)
+          ;; pad with empties up to n
+          padded (if (>= cur-len n)
+                   fs
+                   (vec (concat fs (repeat (- n cur-len) ""))))
+          new-fields (assoc padded (dec n) (v->str v))]
+      (reset! (:fields state) new-fields)
+      (rebuild-line! state))))
+
+(declare eval-expr exec-stmt)
+
+;; ---- regex cache --------------------------------------------------------
+
+(def ^:private regex-cache (atom {}))
+(defn- compile-re [^String pat]
+  (or (get @regex-cache pat)
+      (let [p (java.util.regex.Pattern/compile pat)]
+        (swap! regex-cache assoc pat p) p)))
+
+;; ---- built-in functions --------------------------------------------------
+
+(defn- bi-length [args state]
+  (let [s (if (empty? args) (v->str (get-field state 0)) (v->str (first args)))]
+    (v-num (count s))))
+
+(defn- bi-substr [args]
+  (let [s (v->str (first args))
+        m (long (v->num (second args)))
+        n (when (>= (count args) 3) (long (v->num (nth args 2))))
+        ;; awk substr is 1-based; m<1 is clamped to 1 but the start
+        ;; counts as if from m (so substr("hello",-2,5)=="he").
+        start (max 1 m)
+        end   (if n
+                (min (count s) (+ m n -1))
+                (count s))
+        end   (max 0 end)
+        start (min start (inc (count s)))]
+    (v-str (if (<= start end)
+             (subs s (dec start) end)
+             ""))))
+
+(defn- bi-index [args]
+  (let [s (v->str (first args))
+        t (v->str (second args))]
+    (v-num (inc (.indexOf ^String s ^String t)))))
+
+(defn- bi-split [ast-args state]
+  ;; `ast-args` are the *unevaluated* parser nodes, because we need to
+  ;; reach inside the 2nd arg (the array reference) and 3rd (which
+  ;; may be a literal /regex/ vs a string).
+  (let [s (v->str (eval-expr state (first ast-args)))
+        arr-name (let [a (second ast-args)]
+                   (when (not= :var (:type a))
+                     (throw (ex-info "split: 2nd arg must be array name" {})))
+                   (:name a))
+        fs (if (>= (count ast-args) 3)
+             (let [third (nth ast-args 2)]
+               (if (= :regex (:type third))
+                 (:pattern third)
+                 (v->str (eval-expr state third))))
+             (v->str (get-special state "FS")))
+        parts (split-fields s fs)]
+    ;; Clear and refill the array.
+    (swap! (:arrays state) assoc arr-name
+           (into {} (map-indexed (fn [i p] [(str (inc i)) (v-numstr p)])
+                                 parts)))
+    (v-num (count parts))))
+
+(defn- expand-repl
+  "Replace `&` with the matched text and `\\&` with literal `&` in an
+   awk replacement string."
+  [^String repl ^String matched]
+  (let [sb (StringBuilder.)
+        n (count repl)]
+    (loop [i 0]
+      (when (< i n)
+        (let [c (.charAt repl i)]
+          (cond
+            (and (= c \\) (< (inc i) n)
+                 (= \& (.charAt repl (inc i))))
+            (do (.append sb \&) (recur (+ i 2)))
+            (= c \&)
+            (do (.append sb matched) (recur (inc i)))
+            :else
+            (do (.append sb c) (recur (inc i)))))))
+    (.toString sb)))
+
+(defn- bi-sub [args state replace-all?]
+  ;; `args` are unevaluated parser nodes — we need the AST shape of
+  ;; the 1st (regex-literal or string-expr) and 3rd (LHS to write back).
+  (let [re-pat (let [a (first args)]
+                 (if (= :regex (:type a))
+                   (:pattern a)
+                   (v->str (eval-expr state a))))
+        repl (v->str (eval-expr state (second args)))
+        target-ref (if (>= (count args) 3) (nth args 2) {:type :field :index {:type :num :value 0}})
+        target-val (eval-expr state target-ref)
+        target-s (v->str target-val)
+        re (compile-re re-pat)
+        m (.matcher re ^String target-s)
+        sb (StringBuffer.)
+        n (volatile! 0)]
+    (loop []
+      (when (.find m)
+        (vswap! n inc)
+        (let [matched (.group m)
+              r (expand-repl repl matched)]
+          (.appendReplacement m sb (java.util.regex.Matcher/quoteReplacement r)))
+        (when replace-all? (recur))))
+    (.appendTail m sb)
+    ;; Write back to target. We need to assign.
+    (let [new-s (.toString sb)
+          new-v (v-str new-s)]
+      (case (:type target-ref)
+        :var   (set-global! state (:name target-ref) new-v)
+        :field (let [idx (long (v->num (eval-expr state (:index target-ref))))]
+                 (set-field! state idx new-v))
+        :index (let [arr (:array target-ref)
+                     k (v->str (eval-expr state (first (:index target-ref))))]
+                 (set-array-elt! state arr k new-v))
+        nil))
+    (v-num @n)))
+
+(defn- bi-match [args state]
+  ;; `args` are unevaluated parser nodes.
+  (let [s (v->str (eval-expr state (first args)))
+        re-pat (let [a (second args)]
+                 (if (= :regex (:type a))
+                   (:pattern a)
+                   (v->str (eval-expr state a))))
+        m (.matcher (compile-re re-pat) ^String s)]
+    (if (.find m)
+      (do (set-special! state "RSTART" (v-num (inc (.start m))))
+          (set-special! state "RLENGTH" (v-num (- (.end m) (.start m))))
+          (v-num (inc (.start m))))
+      (do (set-special! state "RSTART" (v-num 0))
+          (set-special! state "RLENGTH" (v-num -1))
+          (v-num 0)))))
+
+(defn- translate-printf-fmt
+  "awk's printf accepts %i %u %c (with numeric arg → byte) which Java's
+   String/format doesn't. Pre-process the format string and translate
+   each spec, returning [final-fmt arg-fn-coll] where arg-fn-coll
+   contains coercer-fns for each spec."
+  [^String fmt]
+  (let [sb (StringBuilder.)
+        coercers (transient [])
+        n (count fmt)]
+    (loop [i 0]
+      (when (< i n)
+        (let [c (.charAt fmt i)]
+          (cond
+            (and (= c \%) (< (inc i) n))
+            (let [[end spec-body kind] (loop [j (inc i)]
+                                         (if (>= j n) [j (subs fmt (inc i) j) \s]
+                                             (let [ch (.charAt fmt j)]
+                                               (case ch
+                                                 \% [(inc j) "" \%]
+                                                 (\d \i) [(inc j) (subs fmt (inc i) j) \d]
+                                                 (\u)    [(inc j) (subs fmt (inc i) j) \u]
+                                                 (\x \X \o) [(inc j) (subs fmt (inc i) j) ch]
+                                                 (\c)    [(inc j) (subs fmt (inc i) j) \c]
+                                                 (\s)    [(inc j) (subs fmt (inc i) j) \s]
+                                                 (\e \E \f \g \G) [(inc j) (subs fmt (inc i) j) ch]
+                                                 (recur (inc j))))))]
+              (cond
+                (= kind \%) (.append sb "%%")
+                (= kind \u) (do (.append sb \%) (.append sb spec-body) (.append sb \d)
+                                (conj! coercers (fn [v] (long (v->num v)))))
+                (= kind \c) (do (.append sb \%) (.append sb spec-body) (.append sb \s)
+                                (conj! coercers (fn [v]
+                                                  (cond
+                                                    (= :num (:tag v))
+                                                    (str (char (long (:n v))))
+                                                    :else (let [s (v->str v)]
+                                                            (if (empty? s) "" (subs s 0 1)))))))
+                (= kind \d) (do (.append sb \%) (.append sb spec-body) (.append sb \d)
+                                (conj! coercers (fn [v] (long (v->num v)))))
+                (#{\x \X \o} kind) (do (.append sb \%) (.append sb spec-body) (.append sb kind)
+                                       (conj! coercers (fn [v] (long (v->num v)))))
+                (= kind \s) (do (.append sb \%) (.append sb spec-body) (.append sb \s)
+                                (conj! coercers (fn [v] (v->str v))))
+                (#{\e \E \f \g \G} kind)
+                (do (.append sb \%) (.append sb spec-body) (.append sb kind)
+                    (conj! coercers (fn [v] (double (v->num v))))))
+              (recur end))
+            :else
+            (do (.append sb c) (recur (inc i)))))))
+    [(.toString sb) (persistent! coercers)]))
+
+(defn- bi-sprintf [args]
+  (let [fmt (v->str (first args))
+        [final-fmt coercers] (translate-printf-fmt fmt)
+        coerced (mapv (fn [c v] (c v)) coercers (rest args))]
+    (v-str (apply format final-fmt coerced))))
+
+(defn- bi-tolower [args] (v-str (str/lower-case (v->str (first args)))))
+(defn- bi-toupper [args] (v-str (str/upper-case (v->str (first args)))))
+(defn- bi-int     [args] (v-num (long (v->num (first args)))))
+(defn- bi-sqrt    [args] (v-num (Math/sqrt (v->num (first args)))))
+(defn- bi-exp     [args] (v-num (Math/exp (v->num (first args)))))
+(defn- bi-log     [args] (v-num (Math/log (v->num (first args)))))
+(defn- bi-sin     [args] (v-num (Math/sin (v->num (first args)))))
+(defn- bi-cos     [args] (v-num (Math/cos (v->num (first args)))))
+(defn- bi-atan2   [args] (v-num (Math/atan2 (v->num (first args)) (v->num (second args)))))
+
+;; ---- Expression eval -----------------------------------------------------
+
+(defn- arith [op a b]
+  (let [x (v->num a) y (v->num b)]
+    (v-num (case op
+             :add (+ x y) :sub (- x y) :mul (* x y)
+             :div (if (zero? y) (throw (ex-info "division by zero" {})) (/ x y))
+             :mod (if (zero? y) (throw (ex-info "modulo by zero" {})) (rem x y))
+             :pow (Math/pow x y)))))
+
+(defn eval-expr [state expr]
+  (case (:type expr)
+    :num (v-num (:value expr))
+    :str (v-str (:value expr))
+    :regex
+    ;; Bare regex in expression position → $0 ~ /pat/
+    (let [m (.matcher (compile-re (:pattern expr)) ^String (v->str (get-field state 0)))]
+      (v-num (if (.find m) 1 0)))
+
+    :var
+    (let [nm (:name expr)]
+      (case nm
+        ("NR" "NF" "FS" "OFS" "ORS" "RS" "FILENAME" "RSTART" "RLENGTH" "SUBSEP" "CONVFMT" "OFMT")
+        (get-special state nm)
+        (get-global state nm)))
+
+    :field
+    (let [n (long (v->num (eval-expr state (:index expr))))]
+      (get-field state n))
+
+    :index
+    (let [arr (get-array state (:array expr))
+          k (v->str (eval-expr state (first (:index expr))))]
+      (or (get arr k) (v-null)))
+
+    :unary
+    (let [v (eval-expr state (:value expr))]
+      (case (:op expr)
+        :not (v-num (if (v->bool v) 0 1))
+        :neg (v-num (- (v->num v)))
+        :pos (v-num (v->num v))))
+
+    :binary
+    (let [op (:op expr)]
+      (case op
+        :and (v-num (if (and (v->bool (eval-expr state (:left expr)))
+                             (v->bool (eval-expr state (:right expr))))
+                      1 0))
+        :or  (v-num (if (or (v->bool (eval-expr state (:left expr)))
+                            (v->bool (eval-expr state (:right expr))))
+                      1 0))
+        :concat (v-str (str (v->str (eval-expr state (:left expr)))
+                            (v->str (eval-expr state (:right expr)))))
+        :match (let [s (v->str (eval-expr state (:left expr)))
+                     re-pat (let [r (:right expr)]
+                              (if (= :regex (:type r))
+                                (:pattern r)
+                                (v->str (eval-expr state r))))]
+                 (v-num (if (.find (.matcher (compile-re re-pat) ^String s)) 1 0)))
+        :not-match (let [s (v->str (eval-expr state (:left expr)))
+                         re-pat (let [r (:right expr)]
+                                  (if (= :regex (:type r))
+                                    (:pattern r)
+                                    (v->str (eval-expr state r))))]
+                     (v-num (if (.find (.matcher (compile-re re-pat) ^String s)) 0 1)))
+        (let [l (eval-expr state (:left expr))
+              r (eval-expr state (:right expr))]
+          (case op
+            :eq (v-num (if (zero? (v-cmp l r)) 1 0))
+            :ne (v-num (if (zero? (v-cmp l r)) 0 1))
+            :lt (v-num (if (neg? (v-cmp l r)) 1 0))
+            :le (v-num (if (<= (v-cmp l r) 0) 1 0))
+            :gt (v-num (if (pos? (v-cmp l r)) 1 0))
+            :ge (v-num (if (>= (v-cmp l r) 0) 1 0))
+            (arith op l r)))))
+
+    :cond
+    (if (v->bool (eval-expr state (:cond expr)))
+      (eval-expr state (:true expr))
+      (eval-expr state (:false expr)))
+
+    :in
+    (let [k (v->str (eval-expr state (first (:index expr))))]
+      (v-num (if (contains? (get-array state (:array expr)) k) 1 0)))
+
+    :assign
+    (let [v (eval-expr state (:right expr))
+          l (:left expr)]
+      (case (:type l)
+        :var   (if (special-var? (:name l))
+                 (set-special! state (:name l) v)
+                 (set-global! state (:name l) v))
+        :field (set-field! state (long (v->num (eval-expr state (:index l)))) v)
+        :index (let [k (v->str (eval-expr state (first (:index l))))]
+                 (set-array-elt! state (:array l) k v)))
+      v)
+
+    :aug-assign
+    (let [cur (eval-expr state (:left expr))
+          rhs (eval-expr state (:right expr))
+          new (arith (:op expr) cur rhs)]
+      (case (:type (:left expr))
+        :var   (if (special-var? (:name (:left expr)))
+                 (set-special! state (:name (:left expr)) new)
+                 (set-global! state (:name (:left expr)) new))
+        :field (set-field! state (long (v->num (eval-expr state (:index (:left expr))))) new)
+        :index (let [k (v->str (eval-expr state (first (:index (:left expr)))))]
+                 (set-array-elt! state (:array (:left expr)) k new)))
+      new)
+
+    :incr
+    (let [target (:expr expr)
+          cur (eval-expr state target)
+          n (v->num cur)
+          new (v-num (case (:op expr)
+                       :incr (inc n)
+                       :decr (dec n)))]
+      (case (:type target)
+        :var   (if (special-var? (:name target))
+                 (set-special! state (:name target) new)
+                 (set-global! state (:name target) new))
+        :field (set-field! state (long (v->num (eval-expr state (:index target)))) new)
+        :index (let [k (v->str (eval-expr state (first (:index target))))]
+                 (set-array-elt! state (:array target) k new)))
+      (if (:pre? expr) new (v-num n)))
+
+    :call
+    (let [args (mapv #(eval-expr state %) (:args expr))]
+      (case (:func expr)
+        :length (bi-length args state)
+        :substr (bi-substr args)
+        :index  (bi-index args)
+        :split  (bi-split (:args expr) state)
+        :sub    (bi-sub (:args expr) state false)
+        :gsub   (bi-sub (:args expr) state true)
+        :sprintf (bi-sprintf args)
+        :match  (bi-match (:args expr) state)
+        :tolower (bi-tolower args)
+        :toupper (bi-toupper args)
+        :int    (bi-int args)
+        :sqrt   (bi-sqrt args)
+        :exp    (bi-exp args)
+        :log    (bi-log args)
+        :sin    (bi-sin args)
+        :cos    (bi-cos args)
+        :atan2  (bi-atan2 args)
+        :system (throw (ex-info "awk: system() refused in sandbox" {}))
+        (throw (ex-info (str "awk: unknown function " (:func expr)) {}))))
+
+    (throw (ex-info (str "eval: unknown expr type " (:type expr)) {:expr expr}))))
+
+;; ---- Statement exec ------------------------------------------------------
+
+(defn- emit [state ^String s]
+  (.append ^StringBuilder (:out state) s))
+
+(defn exec-stmt [state stmt]
+  (case (:type stmt)
+    :block
+    (doseq [s (:body stmt)] (exec-stmt state s))
+
+    :expr-stmt
+    (eval-expr state (:expr stmt))
+
+    :print
+    (let [args (:args stmt)
+          ofs (v->str (get-special state "OFS"))
+          ors (v->str (get-special state "ORS"))
+          parts (if (empty? args)
+                  [(v->str (get-field state 0))]
+                  (mapv #(v->str (eval-expr state %)) args))]
+      (emit state (str (str/join ofs parts) ors)))
+
+    :printf
+    (let [args (mapv #(eval-expr state %) (:args stmt))
+          fmt (v->str (first args))
+          [final-fmt coercers] (translate-printf-fmt fmt)
+          coerced (mapv (fn [c v] (c v)) coercers (rest args))]
+      (emit state (apply format final-fmt coerced)))
+
+    :if
+    (if (v->bool (eval-expr state (:cond stmt)))
+      (exec-stmt state (:body stmt))
+      (when-let [e (:else stmt)] (exec-stmt state e)))
+
+    :while
+    (try
+      (while (v->bool (eval-expr state (:cond stmt)))
+        (try (exec-stmt state (:body stmt))
+             (catch clojure.lang.ExceptionInfo e
+               (if (= :awk/continue (:awk/control (ex-data e))) nil (throw e)))))
+      (catch clojure.lang.ExceptionInfo e
+        (if (= :awk/break (:awk/control (ex-data e))) nil (throw e))))
+
+    :do-while
+    (try
+      (loop []
+        (try (exec-stmt state (:body stmt))
+             (catch clojure.lang.ExceptionInfo e
+               (when-not (= :awk/continue (:awk/control (ex-data e))) (throw e))))
+        (when (v->bool (eval-expr state (:cond stmt))) (recur)))
+      (catch clojure.lang.ExceptionInfo e
+        (when-not (= :awk/break (:awk/control (ex-data e))) (throw e))))
+
+    :for
+    (do (when-let [pre (:pre stmt)] (exec-stmt state pre))
+        (try
+          (while (if-let [c (:cond stmt)] (v->bool (eval-expr state c)) true)
+            (try (exec-stmt state (:body stmt))
+                 (catch clojure.lang.ExceptionInfo e
+                   (when-not (= :awk/continue (:awk/control (ex-data e))) (throw e))))
+            (when-let [post (:post stmt)] (exec-stmt state post)))
+          (catch clojure.lang.ExceptionInfo e
+            (when-not (= :awk/break (:awk/control (ex-data e))) (throw e)))))
+
+    :for-in
+    (try
+      (doseq [k (keys (get-array state (:array stmt)))]
+        (set-global! state (:var stmt) (v-str k))
+        (try (exec-stmt state (:body stmt))
+             (catch clojure.lang.ExceptionInfo e
+               (when-not (= :awk/continue (:awk/control (ex-data e))) (throw e)))))
+      (catch clojure.lang.ExceptionInfo e
+        (when-not (= :awk/break (:awk/control (ex-data e))) (throw e))))
+
+    :break    (throw (ex-info "break"    {:awk/control :awk/break}))
+    :continue (throw (ex-info "continue" {:awk/control :awk/continue}))
+    :next     (throw (ex-info "next"     {:awk/control :awk/next}))
+    :exit     (do (when-let [c (:status stmt)]
+                    (reset! (:exit-code state) (long (v->num (eval-expr state c)))))
+                  (reset! (:exit? state) true)
+                  (throw (ex-info "exit" {:awk/control :awk/exit})))
+    :delete
+    (if (:index stmt)
+      (let [k (v->str (eval-expr state (first (:index stmt))))]
+        (delete-array-elt! state (:array stmt) k))
+      (delete-array! state (:array stmt)))
+
+    (throw (ex-info (str "unknown stmt type " (:type stmt)) {:stmt stmt}))))
+
+;; ---- Pattern matching for actions ---------------------------------------
+
+(defn- pattern-match? [state action-idx pat]
+  (case (count pat)
+    0 true ; no pattern → match every record
+    1 (let [p (first pat)]
+        (if (= :regex (:type p))
+          (let [m (.matcher (compile-re (:pattern p)) ^String (v->str (get-field state 0)))]
+            (.find m))
+          (v->bool (eval-expr state p))))
+    2 (let [[start end] pat
+            in? (get @(:range-state state) action-idx false)
+            start? (if (= :regex (:type start))
+                     (.find (.matcher (compile-re (:pattern start)) ^String (v->str (get-field state 0))))
+                     (v->bool (eval-expr state start)))
+            end? (if (= :regex (:type end))
+                   (.find (.matcher (compile-re (:pattern end)) ^String (v->str (get-field state 0))))
+                   (v->bool (eval-expr state end)))]
+        (cond
+          (and (not in?) start?)
+          (do (swap! (:range-state state) assoc action-idx (not end?))
+              true)
+          in?
+          (do (when end? (swap! (:range-state state) assoc action-idx false))
+              true)
+          :else false))))
+
+(defn- run-record! [state program record]
+  (set-line! state record)
+  (set-special! state "NR" (v-num (inc (long (v->num (get-special state "NR"))))))
+  (try
+    (doseq [[idx {:keys [pattern stmts]}] (map-indexed vector (:actions program))]
+      (when (pattern-match? state idx pattern)
+        (try
+          (if stmts
+            (exec-stmt state stmts)
+            ;; Implicit `{print}`
+            (exec-stmt state {:type :print :args []}))
+          (catch clojure.lang.ExceptionInfo e
+            (when-not (= :awk/next (:awk/control (ex-data e))) (throw e))
+            (throw e)))))
+    (catch clojure.lang.ExceptionInfo e
+      (when-not (= :awk/next (:awk/control (ex-data e))) (throw e)))))
+
+;; ============================================================================
+;; Top-level entry — called from posix.clj/awk
+;; ============================================================================
+
+(defn- run-blocks [state blocks]
+  (try
+    (doseq [b blocks] (exec-stmt state b))
+    (catch clojure.lang.ExceptionInfo e
+      (when-not (= :awk/exit (:awk/control (ex-data e))) (throw e)))))
+
+(defn run
+  "Top-level awk run.
+
+   Options:
+     :program  the awk source (string) — required
+     :input    seq of input record strings (typically lines from stdin
+               or files), nil for no-input
+     :fs       initial FS (default \" \")
+     :vars     {name → value-string} from `-v VAR=val` (initialised as
+               :numstr before BEGIN runs)
+
+   Returns {:stdout str :exit int}."
+  [{:keys [program input fs vars]}]
+  (let [state (init-state {:fs fs
+                           :vars (into {} (for [[k v] vars] [k (v-numstr v)]))})
+        ast (parse program)]
+    ;; BEGIN
+    (run-blocks state (:begin ast))
+    ;; Per-record actions
+    (when (and (seq (:actions ast)) (not @(:exit? state)))
+      (try
+        (doseq [record (or input []) :while (not @(:exit? state))]
+          (run-record! state ast record))
+        (catch clojure.lang.ExceptionInfo e
+          (when-not (= :awk/exit (:awk/control (ex-data e))) (throw e)))))
+    ;; END
+    (run-blocks state (:end ast))
+    {:stdout (.toString ^StringBuilder (:out state))
+     :exit @(:exit-code state)}))

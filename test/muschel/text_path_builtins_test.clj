@@ -198,12 +198,12 @@
 ;; that steers them to cut+grep or clojure_eval.
 ;; ============================================================================
 
-(deftest awk-refuses-with-guidance
+(deftest awk-works-through-host
+  ;; Sanity check the awk dispatch through the host. Detailed awk
+  ;; semantics are in muschel.awk-test.
   (let [r (run (mk-host) "echo hi | awk '{print}'")]
-    (is (= 1 (:exit r)))
-    (is (re-find #"not implemented" (:stderr r)))
-    (is (re-find #"cut|sed|grep" (:stderr r))
-        "stderr should suggest the available builtins")))
+    (is (= 0 (:exit r)))
+    (is (= "hi\n" (:stdout r)))))
 
 ;; ============================================================================
 ;; sed — range addresses
