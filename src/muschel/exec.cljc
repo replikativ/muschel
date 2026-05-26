@@ -2551,7 +2551,7 @@
    (let [h (or (:host opts) (default-host))
          out-buf (host/string-sink h)
          err-buf (host/string-sink h)
-         {:keys [env exit session permit trace] :as result}
+         {:keys [env exit session permit denied-reason trace]}
          (run env src-or-ast
               (merge opts {:host h :out out-buf :err err-buf}))]
      (cond-> {:env env
@@ -2559,8 +2559,9 @@
               :session session
               :stdout (host/sink->string h out-buf)
               :stderr (host/sink->string h err-buf)}
-       permit (assoc :permit permit)
-       trace  (assoc :trace trace)))))
+       permit        (assoc :permit permit)
+       denied-reason (assoc :denied-reason denied-reason)
+       trace         (assoc :trace trace)))))
 
 ;; Late-bound registration: lets the `sh` builtin call back into the
 ;; executor without a static require of `muschel.exec` from
