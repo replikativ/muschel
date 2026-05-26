@@ -113,6 +113,15 @@
         ;; protocol op the builtin makes is recorded. Wrap is per-call
         ;; so it doesn't leak between invocations.
         fs   (if-let [ts (:trace opts)] (fs.traced/wrap fs ts) fs)
+        ;; The shell tracks cwd in env; builtins consult (fs/cwd fs)
+        ;; and resolve relative paths via the FS. Without this sync,
+        ;; `cd /work && cat a.txt` fails because cat resolves `a.txt`
+        ;; against the FS's (still-stale) cwd. Re-point the FS at the
+        ;; shell's current dir at every dispatch.
+        _    (when-let [dir (:dir opts)]
+               (when (not= dir (fs/cwd fs))
+                 (try (fs/-cd! fs dir)
+                      (catch #?(:clj Throwable :cljs :default) _ nil))))
         env  (build-env opts fallback-host fs)
         started-at (now-ms)
         result
@@ -194,7 +203,20 @@
   (and (map? x) #?(:clj  (instance? clojure.lang.Atom (:acc x))
                    :cljs (instance? cljs.core/Atom (:acc x)))))
 
-(defrecord BuiltinHost [fallback-host builtins fs fallback-allowlist]
+;; `BuiltinHost` is a plain record carrying its dependencies. The Host
+;; protocol implementation is registered below via `extend-type`
+;; rather than inlined in the `defrecord` literal. The two forms are
+;; behaviourally identical at the Clojure level, but the externalised
+;; `extend-type` survives Google Closure `:advanced` DCE (the inlined
+;; form gets pruned when consumers only see the host through opaque
+;; `(host/string-sink h)` wrappers — Closure can't trace the indirect
+;; protocol-method property keys back to the registration). The
+;; symptom under shadow-cljs `:node-library` + `:advanced` was a
+;; runtime "No protocol method Host.-string-sink defined for type
+;; object" — fixed by the rewrite below.
+(defrecord BuiltinHost [fallback-host builtins fs fallback-allowlist])
+
+(extend-type BuiltinHost
   host/Host
   ;; ---- buffers ----
   ;; VFS-owned sinks (`{::buf :sink :acc <atom>}`) are written through
@@ -202,18 +224,18 @@
   ;; Node / Browser) never sees a shape it can't handle. Anything else
   ;; — `OutputStream` on JVM, BrowserHost's own `:acc`-tagged sinks —
   ;; falls through to the fallback.
-  (-write-string! [_ sink s]
+  (-write-string! [this sink s]
     (cond
       (atom-sink? sink) (swap! (:acc sink) str s)
-      :else             (host/-write-string! fallback-host sink s)))
-  (-read-all-string  [_ source] (host/-read-all-string  fallback-host source))
-  (-close!           [_ io]     (host/-close!           fallback-host io))
-  (-string-sink      [_]        (host/-string-sink      fallback-host))
-  (-sink->string [_ sink]
+      :else             (host/-write-string! (:fallback-host this) sink s)))
+  (-read-all-string  [this source] (host/-read-all-string  (:fallback-host this) source))
+  (-close!           [this io]     (host/-close!           (:fallback-host this) io))
+  (-string-sink      [this]        (host/-string-sink      (:fallback-host this)))
+  (-sink->string [this sink]
     (cond
       (atom-sink? sink) @(:acc sink)
-      :else             (host/-sink->string fallback-host sink)))
-  (-string-source    [_ s]      (host/-string-source    fallback-host s))
+      :else             (host/-sink->string (:fallback-host this) sink)))
+  (-string-source    [this s]      (host/-string-source    (:fallback-host this) s))
 
   ;; ---- files ---- routed through FS for containment.
   ;;
@@ -229,56 +251,58 @@
   ;; every pipeline. Refusing it would force `2>&1 | grep -v error`
   ;; gymnastics. We model it as a stream that swallows writes /
   ;; produces no bytes, regardless of FS containment.
-  (-open-file-sink [_ p _append?]
+  (-open-file-sink [this p _append?]
     (cond
-      (= "/dev/null" p) (dev-null-sink fallback-host)
+      (= "/dev/null" p) (dev-null-sink (:fallback-host this))
       :else
-      (or (fs/-open-sink fs p _append?)
+      (or (fs/-open-sink (:fs this) p _append?)
           (throw (not-in-root-ex p "not writable")))))
-  (-open-file-source [_ p]
+  (-open-file-source [this p]
     (cond
-      (= "/dev/null" p) (dev-null-source fallback-host)
+      (= "/dev/null" p) (dev-null-source (:fallback-host this))
       :else
-      (or (fs/-open-source fs p)
+      (or (fs/-open-source (:fs this) p)
           (throw (not-in-root-ex p "missing")))))
-  (-file-info [_ p]
+  (-file-info [this p]
     (cond
       (= "/dev/null" p)
       {:exists? true :file? true :dir? false :symlink? false
        :readable? true :writable? true :executable? false :size 0}
       :else
-      (stat->info (fs/-stat fs p))))
-  (-read-file [_ p]
+      (stat->info (fs/-stat (:fs this) p))))
+  (-read-file [this p]
     (cond
       (= "/dev/null" p) ""
-      :else             (fs/-read-file fs p)))
+      :else             (fs/-read-file (:fs this) p)))
 
   ;; ---- pipes ----
-  (-make-pipe        [_]        (host/-make-pipe fallback-host))
+  (-make-pipe        [this]        (host/-make-pipe (:fallback-host this)))
 
   ;; ---- spawn — the override ----
   (-spawn [this opts]
-    (let [cmd (:cmd opts)]
+    (let [cmd      (:cmd opts)
+          builtins (:builtins this)
+          fb       (:fallback-host this)
+          allow    (:fallback-allowlist this)]
       (cond
         ;; Built-in: invoke in-process against the FS.
         (contains? builtins cmd)
-        (invoke-builtin! this fallback-host (get builtins cmd) opts fs)
+        (invoke-builtin! this fb (get builtins cmd) opts (:fs this))
 
         ;; Explicitly allowlisted system tool: delegate.
-        (contains? fallback-allowlist cmd)
-        (host/-spawn fallback-host opts)
+        (contains? allow cmd)
+        (host/-spawn fb opts)
 
         ;; Refuse anything else.
         :else
-        (refuse! fallback-host opts
+        (refuse! fb opts
                  (cc/fmt-many
                   "not a builtin and not in fallback-allowlist (allowed: %s)"
-                  [(pr-str (sort (concat (keys builtins)
-                                         fallback-allowlist)))])))))
+                  [(pr-str (sort (concat (keys builtins) allow)))])))))
 
   ;; ---- async ----
-  (-async [_ thunk] (host/-async fallback-host thunk))
-  (-await [_ h]     (host/-await fallback-host h)))
+  (-async [this thunk] (host/-async (:fallback-host this) thunk))
+  (-await [this h]     (host/-await (:fallback-host this) h)))
 
 (defn make
   "Construct a builtin-dispatching host.

@@ -55,6 +55,20 @@
         {:keys [env]} (run "cd /tmp && pwd" :host host)]
     (is (= "/tmp" (:cwd env)))))
 
+(deftest cd-then-relative-path-resolves
+  ;; Builtins consult (fs/cwd fs) — so the BuiltinHost must sync the
+  ;; FS cwd to env's cwd at dispatch, otherwise `cd /work && cat a.txt`
+  ;; fails because `cat` looks for `a.txt` under the FS's stale cwd.
+  (let [host (th/mk-host {:files {"/work/a.txt" "alpha\nbeta\n"}})]
+    (testing "cat reads a relative path after cd within a single run"
+      (let [{:keys [exit stdout]} (run "cd /work && cat a.txt" :host host)]
+        (is (zero? exit))
+        (is (= "alpha\nbeta\n" stdout))))
+    (testing "pwd reports the env's cwd after cd"
+      (let [{:keys [exit stdout]} (run "cd /work && pwd" :host host)]
+        (is (zero? exit))
+        (is (= "/work\n" stdout))))))
+
 (deftest builtin-export-changes-process-env
   (let [{:keys [env]} (run "export FOO=bar")]
     (is (env/exported? env "FOO"))
