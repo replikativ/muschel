@@ -1,7 +1,5 @@
 (ns muschel.posix-cljs-smoke-test
-  "Force the CLJS build to compile muschel.builtins.posix. Once the
-   port is complete, the build succeeds and a handful of common
-   builtins are smoke-tested against a virtual host on Node."
+  "Force the CLJS build to compile muschel.builtins.posix."
   (:require [clojure.test :refer [deftest is]]
             [muschel.builtins.posix :as posix]))
 

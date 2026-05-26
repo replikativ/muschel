@@ -133,10 +133,7 @@
   (let [e (-> (env/new-env) (env/set-var "X" "hello"))]
     (is (= "hello\n" (stdout "echo $X" :env e)))
     (is (= "hello world\n" (stdout "echo \"$X world\"" :env e)))
-    ;; TODO ${UNSET:-default} returns "" on CLJS for an as-yet-untraced
-    ;; reason in expand-string-in-env. JVM passes. Pinning to :clj until
-    ;; we root-cause.
-    #?(:clj (is (= "default\n" (stdout "echo ${UNSET:-default}" :env e))))))
+    (is (= "default\n" (stdout "echo ${UNSET:-default}" :env e)))))
 
 ;; ============================================================================
 ;; Redirections
