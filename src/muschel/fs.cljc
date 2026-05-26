@@ -158,6 +158,36 @@
 (defn chown       [fs path owner group] (-chown fs path owner group))
 (defn sandbox-relativize [fs real-path-str] (-sandbox-relativize fs real-path-str))
 
+(defn write-string!
+  "Portable write-string-to-path. Opens a sink via `-open-sink`,
+   writes `content` (UTF-8), and closes. Returns truthy on success,
+   nil if the path resolves outside root or the open fails.
+
+   Cross-platform: JVM uses with-open + OutputStream; CLJS resolves
+   the sink to an atom-backed string buffer and mutates it (the
+   sink shape is impl-specific, but the patterns are stable)."
+  [fs path ^String content append?]
+  (when-let [sink (-open-sink fs path append?)]
+    #?(:clj
+       (with-open [^java.io.OutputStream o sink]
+         (.write o ^bytes (.getBytes content "UTF-8"))
+         true)
+       :cljs
+       (cond
+         (instance? cljs.core/Atom sink)
+         (do (if append?
+               (swap! sink str content)
+               (reset! sink content))
+             true)
+
+         (and (some? sink) (some? (aget sink "acc")))
+         (do (if append?
+               (swap! (aget sink "acc") str content)
+               (reset! (aget sink "acc") content))
+             true)
+
+         :else true))))
+
 ;; ============================================================================
 ;; Path utilities (impl-agnostic)
 ;; ============================================================================

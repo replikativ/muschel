@@ -1914,15 +1914,14 @@
         {:stdout @stdout :stderr @stderr :exit (if @any-err? 1 0)}))))
 
 (defn- copy-file! [fs src dst]
-  (let [bytes (fs/read-bytes fs src)
-        out   (fs/open-sink fs dst false)]
-    (if (and bytes out)
-      (with-open [^java.io.OutputStream o out]
-        (cond
-          (bytes? bytes)  (.write o ^bytes bytes)
-          (string? bytes) (.write o (.getBytes ^String bytes "UTF-8")))
-        true)
-      false)))
+  (let [bytes (fs/read-bytes fs src)]
+    (when bytes
+      (let [s (cond
+                (string? bytes) bytes
+                #?@(:clj  [(bytes? bytes) (String. ^bytes bytes "UTF-8")]
+                    :cljs [(string? bytes) bytes])
+                :else (str bytes))]
+        (boolean (fs/write-string! fs dst s false))))))
 
 (defn- copy-tree! [fs src dst]
   (let [s (fs/stat fs src)]
@@ -2198,14 +2197,13 @@
             any-err? (volatile! false)]
         (doseq [f pos]
           (try
-            (let [out (fs/open-sink fs f (boolean (:append opts)))]
-              (if out
-                (with-open [^java.io.OutputStream o out]
-                  (.write o (.getBytes ^String stdin "UTF-8")))
-                (do (vswap! stderr str "tee: " f ": cannot open for writing\n")
-                    (vreset! any-err? true))))
+            (if (fs/write-string! fs f stdin (boolean (:append opts)))
+              nil
+              (do (vswap! stderr str "tee: " f ": cannot open for writing\n")
+                  (vreset! any-err? true)))
             (catch #?(:clj Throwable :cljs :default) t
-              (vswap! stderr str "tee: " f ": " (.getMessage t) "\n")
+              (vswap! stderr str "tee: " f ": "
+                      #?(:clj (.getMessage t) :cljs (.-message t)) "\n")
               (vreset! any-err? true))))
         {:stdout stdin :stderr @stderr :exit (if @any-err? 1 0)}))))
 
@@ -2802,8 +2800,7 @@
                    (if-let [c (fs/read-file fs f)]
                      (let [out (process-text c)]
                        (when (:in-place opts)
-                         (with-open [^java.io.OutputStream o (fs/open-sink fs f false)]
-                           (.write o (.getBytes ^String out "UTF-8"))))
+                         (fs/write-string! fs f out false))
                        (if (:in-place opts) nil out))
                      (do (vswap! stderr str "sed: " f ": No such file or directory\n")
                          (vreset! any-err? true)
