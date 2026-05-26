@@ -126,7 +126,14 @@
      users; same-user is a no-op). On virtual FS the values are
      stored opaquely and surface through `:owner` / `:group` on
      `-stat`. Either argument may be nil to leave unchanged. Returns
-     truthy on success."))
+     truthy on success.")
+
+  (-sandbox-relativize [this real-path-str]
+    "Translate a backend-internal absolute path (e.g. a real disk path
+     like `/tmp/muschel-xyz/foo`) into a sandbox-rooted display path
+     (e.g. `/foo`). Used by builtins like `pwd` and `realpath` to keep
+     the host's mount prefix out of the agent's view. For VFS this is
+     identity — VFS paths are already sandbox-rooted."))
 
 ;; ============================================================================
 ;; Public wrappers
@@ -149,6 +156,7 @@
 (defn chmod       [fs path mode] (-chmod fs path mode))
 (defn symlink     [fs target link-path] (-symlink fs target link-path))
 (defn chown       [fs path owner group] (-chown fs path owner group))
+(defn sandbox-relativize [fs real-path-str] (-sandbox-relativize fs real-path-str))
 
 ;; ============================================================================
 ;; Path utilities (impl-agnostic)

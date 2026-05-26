@@ -94,9 +94,11 @@
 
 (defn pwd
   "POSIX pwd. -L and -P are accepted but currently treat the env's
-   logical cwd as both — the muschel session tracks logical cwd."
+   logical cwd as both — the muschel session tracks logical cwd.
+   Output is sandbox-relativised (so a disk-backed FS doesn't leak the
+   host mount prefix)."
   [_argv fs _env]
-  (ok (str (fs/cwd fs) "\n")))
+  (ok (str (fs/sandbox-relativize fs (fs/cwd fs)) "\n")))
 
 ;; ============================================================================
 ;; echo
@@ -2255,15 +2257,16 @@
             lines
             (mapv (fn [p]
                     (if-let [resolved (fs/resolve fs p)]
-                      (cond
-                        ;; -m: accept whatever resolves, even if missing.
-                        (:canonicalize-missing opts) resolved
-                        ;; Default + -e: refuse if it doesn't exist.
-                        (fs/exists? fs p) resolved
-                        :else
-                        (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
-                            (vreset! any-err? true)
-                            nil))
+                      (let [sandbox (fs/sandbox-relativize fs resolved)]
+                        (cond
+                          ;; -m: accept whatever resolves, even if missing.
+                          (:canonicalize-missing opts) sandbox
+                          ;; Default + -e: refuse if it doesn't exist.
+                          (fs/exists? fs p) sandbox
+                          :else
+                          (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
+                              (vreset! any-err? true)
+                              nil)))
                       (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
                           (vreset! any-err? true)
                           nil)))
@@ -2913,14 +2916,19 @@
           (nil? program) (usage-err "awk" "missing program")
           :else
           (try
-            (let [result (awk-impl/run {:program   program
-                                        :raw-input raw
-                                        :fs        (:field-separator opts)
-                                        :vars      kv-vars})]
+            (let [result (awk-impl/run {:program      program
+                                        :raw-input    raw
+                                        :fs           (:field-separator opts)
+                                        :vars         kv-vars
+                                        :interrupt-fn (:interrupt-fn env)})]
               {:stdout (:stdout result)
                :stderr ""
                :exit   (:exit result)})
             (catch Throwable t
+              ;; Let budget interrupts propagate up to run-and-capture.
+              (when (and (instance? clojure.lang.ExceptionInfo t)
+                         (:muschel/budget (ex-data t)))
+                (throw t))
               (err (str "awk: " (.getMessage t)) 2))))))))
 
 ;; ============================================================================

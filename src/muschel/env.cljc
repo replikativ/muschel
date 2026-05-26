@@ -251,24 +251,27 @@
 ;; Working directory
 ;; ============================================================================
 
-(defn- absolutize [^String cwd ^String path]
-  #?(:clj
-     (let [f (java.io.File. path)]
-       (.getCanonicalPath
-        (if (.isAbsolute f) f (java.io.File. cwd path))))
-     :cljs
-     ;; In node, use the `path` module's resolve (works like java's
-     ;; getCanonicalPath for path-string purposes, without filesystem
-     ;; existence requirement). In the browser, treat paths as opaque.
-     (if (and (exists? js/require))
-       (let [path-mod (js/require "path")]
-         (.resolve path-mod cwd path))
-       ;; Browser: pure-string concatenation, no `.` / `..` resolution.
-       ;; Good enough for in-memory shells that don't touch a real fs.
-       (cond
-         (clojure.string/starts-with? path "/") path
-         (= "" path) cwd
-         :else (str (clojure.string/replace cwd #"/$" "") "/" path)))))
+(defn- absolutize
+  "Pure-string absolute-and-normalize. NEVER touches the filesystem —
+   that would canonicalise symlinks against the host root and leak
+   the real mount path into the sandbox's view of the cwd. The FS
+   layer is the only place authorised to follow links."
+  [^String cwd ^String path]
+  (let [joined (cond
+                 (clojure.string/starts-with? path "/") path
+                 (= "" path) cwd
+                 :else (str (clojure.string/replace cwd #"/$" "") "/" path))
+        segs (clojure.string/split joined #"/")
+        normalized (loop [in segs out []]
+                     (if-let [s (first in)]
+                       (cond
+                         (or (= "" s) (= "." s)) (recur (rest in) out)
+                         (= ".." s)
+                         (recur (rest in)
+                                (if (seq out) (vec (butlast out)) out))
+                         :else (recur (rest in) (conj out s)))
+                       out))]
+    (str "/" (clojure.string/join "/" normalized))))
 
 (defn cd
   "Change to `path` (absolute or relative to current cwd). Returns new

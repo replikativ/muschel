@@ -261,10 +261,22 @@
 
   (-symlink [this target link-path]
     (when-let [resolved (fs/-resolve this link-path)]
-      (when-not (get @entries-atom resolved)
-        (swap! entries-atom assoc resolved
-               {:type :symlink :target target :mtime-ms (mtime)})
-        true)))
+      ;; Refuse symlinks whose target lexically escapes the sandbox.
+      ;; The VFS doesn't currently follow symlinks on read either, so
+      ;; this pairs with that — disk-vs-virtual behave the same way
+      ;; on both create AND read.
+      (let [parent-segs (vec (butlast (fs/split-path resolved)))
+            target-segs (fs/split-path
+                         (cond
+                           (clojure.string/starts-with? target "/") target
+                           :else
+                           (str (fs/join-path "" parent-segs) "/" target)))
+            normalized (fs/normalize-segments target-segs)]
+        (when (and (some? normalized)
+                   (not (get @entries-atom resolved)))
+          (swap! entries-atom assoc resolved
+                 {:type :symlink :target target :mtime-ms (mtime)})
+          true))))
 
   (-chown [this path owner group]
     (when-let [resolved (fs/-resolve this path)]
@@ -274,7 +286,11 @@
                  (cond-> e
                    owner (assoc :owner owner)
                    group (assoc :group group))))
-        true))))
+        true)))
+
+  (-sandbox-relativize [_ path]
+    ;; VFS paths are already sandbox-rooted (start at "/"). Pass through.
+    path))
 
 (defn- coerce-content
   "Accept legacy `:bytes` keys as well as the canonical `:content`,

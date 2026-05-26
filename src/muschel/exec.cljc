@@ -30,6 +30,7 @@
             #?(:cljs [goog.string.format])
             [muschel.arith :as arith]
             [muschel.ast :as ast]
+            [muschel.budget :as budget]
             [muschel.env :as env]
             [muschel.errors :as err]
             [muschel.expand :as expand]
@@ -333,15 +334,21 @@
 
 (defn- builtin-pwd
   "POSIX `pwd [-L|-P]`. We don't distinguish logical vs physical paths
-   (no symlink resolution), but we still reject unknown flags."
+   (no symlink resolution), but we still reject unknown flags. The
+   printed cwd is sandbox-relative when the host carries a sandbox-
+   aware FS so the host mount prefix doesn't leak."
   [env args opts]
   (if-let [bad (some #(when (and (str/starts-with? % "-")
                                  (not (re-matches #"-[LP]+" %))) %)
                      args)]
     (do (write-line opts :err (str "invalid option: \"" bad "\"\n"))
         (env/record-exit env 2))
-    (do (write-line opts :out (str (:cwd env) "\n"))
-        (env/record-exit env 0))))
+    (let [raw (:cwd env)
+          shown (if-let [fs (:fs env)]
+                  (mfs/sandbox-relativize fs raw)
+                  raw)]
+      (write-line opts :out (str shown "\n"))
+      (env/record-exit env 0))))
 
 (defn- builtin-echo
   "bash `echo [-neE] [arg ...]`. Flags only count if they appear at
@@ -1716,9 +1723,14 @@
                         :extra-env (merge (env/to-process-env env) extra-env)
                         :in   (:in opts)
                         :out  (:out opts)
-                        :err  (:err opts)}
+                        :err  (:err opts)
+                        :interrupt-fn (:interrupt-fn env)}
             result (try (host/spawn h spawn-opts)
                         (catch #?(:clj Throwable :cljs :default) e
+                          ;; Budget-exceeded interrupts must propagate
+                          ;; up to run-and-capture's boundary, not be
+                          ;; logged-and-swallowed.
+                          (when (budget/budget-exceeded? e) (throw e))
                           (write-line opts :err
                                       (str name ": "
                                            #?(:clj (.getMessage ^Throwable e)
@@ -1926,12 +1938,23 @@
                                 (when-not (= i last-idx)
                                   (host/close! h (nth sinks i)))
                                 env')
-                              (catch #?(:clj Throwable :cljs :default) _
+                              (catch #?(:clj Throwable :cljs :default) t
                                 (when-not (= i last-idx)
                                   (host/close! h (nth sinks i)))
-                                (env/record-exit env 1)))))))
+                                (if (budget/budget-exceeded? t)
+                                  (throw t)
+                                  (env/record-exit env 1))))))))
           stmts))
-        results (mapv #(host/await-async h %) tasks)
+        results (try (mapv #(host/await-async h %) tasks)
+                     (catch #?(:clj Throwable :cljs :default) t
+                       ;; Java futures wrap the worker's throw in
+                       ;; ExecutionException. Unwrap so budget-exceeded
+                       ;; comes through cleanly.
+                       (let [cause #?(:clj (or (.getCause ^Throwable t) t)
+                                      :cljs t)]
+                         (if (budget/budget-exceeded? cause)
+                           (throw cause)
+                           (throw t)))))
         ;; Per POSIX (and default bash), pipeline exit = last cmd's exit.
         ;; pipefail uses the RIGHTMOST non-zero (bash semantics).
         last-exit (or (:last-exit (last results)) 0)
@@ -2376,6 +2399,7 @@
    exec-stmt-body and read+cleared here."
   [env stmts opts]
   (reduce (fn [env st]
+            (budget/check-interrupt! env)
             (cond
               (stop-propagating? env) (reduced env)
               :else
@@ -2412,9 +2436,16 @@
    provided, `env` overrides the session's current value at start —
    pass `(session/-env sess)` to thread without override."
   ([env src-or-ast] (run env src-or-ast {}))
-  ([env src-or-ast {:keys [in out err session permit] :as opts}]
+  ([env src-or-ast {:keys [in out err session permit
+                           interrupt-fn timeout-ms] :as opts}]
    (let [ast (if (string? src-or-ast) (parse/parse src-or-ast) src-or-ast)
          sess (or session (session/atom-session env))
+         ;; Resource-budget interrupt (cooperative). The caller can
+         ;; pass `interrupt-fn` directly OR a `timeout-ms` (we
+         ;; synthesise a deadline-based interrupt for them); when both
+         ;; are present we combine.
+         ifn (budget/combine interrupt-fn
+                             (when timeout-ms (budget/deadline-interrupt timeout-ms)))
          ;; Optional permit check before any exec.
          permit-result (when permit (permit/check (assoc permit :ast ast)))]
      (if (and permit-result (= :deny (:decision permit-result)))
@@ -2436,7 +2467,8 @@
                    host-fs                                    (assoc :fs host-fs)
                    (and host-fs (not= (:cwd env) (mfs/cwd host-fs)))
                    (assoc :cwd (mfs/cwd host-fs)
-                          :prev-cwd (mfs/cwd host-fs)))
+                          :prev-cwd (mfs/cwd host-fs))
+                   ifn                                        (assoc :interrupt-fn ifn))
              opts' (cond-> {:in  (or in #?(:clj System/in :cljs nil))
                             :out (or out #?(:clj System/out :cljs (host/string-sink h)))
                             :err (or err #?(:clj System/err :cljs (host/string-sink h)))

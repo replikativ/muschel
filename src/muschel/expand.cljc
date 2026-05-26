@@ -1079,10 +1079,14 @@
    Skipped when env's :noglob option is true.
 
    When env carries `:fs` (a muschel.fs FS handle — installed by
-   `muschel.exec/run` when the host is sandboxed) the walk goes
-   through that handle, so globs cannot escape the FS root. With no
-   `:fs`, falls back to `babashka.fs/glob` against the real disk
-   (legacy callers / non-sandboxed runs).
+   `muschel.exec/run` when the host is a `BuiltinHost`) the walk
+   goes through that handle, so globs cannot escape the FS root.
+
+   With no `:fs` we fall back to `babashka.fs/glob` against the real
+   disk. This case is only hit when the caller chose `JvmHost`
+   directly (i.e. explicit unsandboxed mode); `BuiltinHost.make` has
+   a `(some? fs)` precondition, so a sandboxed run can never reach
+   this branch with `:fs` missing.
 
    bash quirk: leading `./` is preserved in the result (we strip it
    before globbing and re-attach to each match)."

@@ -1476,6 +1476,7 @@
     :while
     (try
       (while (v->bool (eval-expr state (:cond stmt)))
+        (when-let [ifn (:interrupt-fn state)] (ifn))
         (try (exec-stmt state (:body stmt))
              (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
                (if (= :awk/continue (:awk/control (ex-data e))) nil (throw e)))))
@@ -1485,6 +1486,7 @@
     :do-while
     (try
       (loop []
+        (when-let [ifn (:interrupt-fn state)] (ifn))
         (try (exec-stmt state (:body stmt))
              (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
                (when-not (= :awk/continue (:awk/control (ex-data e))) (throw e))))
@@ -1496,6 +1498,7 @@
     (do (when-let [pre (:pre stmt)] (exec-stmt state pre))
         (try
           (while (if-let [c (:cond stmt)] (v->bool (eval-expr state c)) true)
+            (when-let [ifn (:interrupt-fn state)] (ifn))
             (try (exec-stmt state (:body stmt))
                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
                    (when-not (= :awk/continue (:awk/control (ex-data e))) (throw e))))
@@ -1506,6 +1509,7 @@
     :for-in
     (try
       (doseq [k (keys (get-array state (:array stmt)))]
+        (when-let [ifn (:interrupt-fn state)] (ifn))
         (set-global! state (:var stmt) (v-str k))
         (try (exec-stmt state (:body stmt))
              (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
@@ -1558,6 +1562,7 @@
           :else false))))
 
 (defn- run-record! [state program record]
+  (when-let [ifn (:interrupt-fn state)] (ifn))
   (set-line! state record)
   (set-special! state "NR" (v-num (inc (long (v->num (get-special state "NR"))))))
   (set-special! state "FNR" (v-num (inc (long (v->num (get-special state "FNR"))))))
@@ -1605,19 +1610,23 @@
   "Top-level awk run.
 
    Options:
-     :program  the awk source (string) — required
-     :input    seq of input record strings (already split by RS), OR
-     :raw-input  a single string to split internally by RS after BEGIN
-     :fs       initial FS (default \" \")
-     :vars     {name → value-string} from `-v VAR=val` (initialised as
-               :numstr before BEGIN runs)
+     :program     the awk source (string) — required
+     :input       seq of input record strings (already split by RS), OR
+     :raw-input   a single string to split internally by RS after BEGIN
+     :fs          initial FS (default \" \")
+     :vars        {name → value-string} from `-v VAR=val` (initialised
+                  as :numstr before BEGIN runs)
+     :interrupt-fn 0-arg fn called at every loop boundary (record loop,
+                  for/while/do-while bodies). Throws to abort. Pair
+                  with muschel.budget/deadline-interrupt for timeouts.
 
    Returns {:stdout str :exit int}."
-  [{:keys [program input raw-input fs vars]}]
+  [{:keys [program input raw-input fs vars interrupt-fn]}]
   ;; Reset CONVFMT so a prior run's setting doesn't leak in.
   (cc/set-convfmt! "%.6g")
-  (let [state (init-state {:fs fs
-                           :vars (into {} (for [[k v] vars] [k (v-numstr v)]))})
+  (let [state (-> (init-state {:fs fs
+                               :vars (into {} (for [[k v] vars] [k (v-numstr v)]))})
+                  (cond-> interrupt-fn (assoc :interrupt-fn interrupt-fn)))
         ast (parse program)]
     ;; BEGIN — may change RS, so don't split raw-input yet
     (run-blocks state (:begin ast))

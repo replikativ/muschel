@@ -62,21 +62,74 @@
   (or (= root candidate)
       (.startsWith candidate root)))
 
-(defn- resolve* [^Path root ^String cwd ^String path]
+(defn- sandbox-relative
+  "Strip the disk root prefix from `real-path-str` to produce a path
+   rooted at the sandbox `/`. So `/tmp/muschel-xyz/foo/bar` becomes
+   `/foo/bar`, and the sandbox root itself becomes `/`. Used by
+   `-resolve` so callers (and the `realpath` builtin) never see the
+   host mount prefix."
+  [^Path root ^String real-path-str]
+  (let [rs (str root)]
+    (cond
+      (= real-path-str rs) "/"
+      (.startsWith real-path-str (str rs "/"))
+      (subs real-path-str (count rs))
+      :else real-path-str)))
+
+(defn- starts-with-str [^String s ^String prefix]
+  (.startsWith s prefix))
+
+(defn- ^Path lex-normalize
+  "Lexical absolute + .. collapse, no real-disk lookup. Returns nil for
+   ~/-prefixed paths (muschel.expand handles those upstream)."
+  [^String cwd ^String path]
   (when (and (string? path) (not (str/blank? path)))
-    (let [;; Absolute paths are absolute. Relative paths attach to cwd.
-          base (cond
-                 (.startsWith path "/")             (str->path path)
-                 (.startsWith path "~/")            nil   ;; muschel.expand handles ~
-                 :else                              (str->path (str cwd "/" path)))]
+    (let [base (cond
+                 (starts-with-str path "/")  (str->path path)
+                 (starts-with-str path "~/") nil
+                 :else                       (str->path (str cwd "/" path)))]
       (when base
-        (let [normalized (.normalize (.toAbsolutePath base))]
-          ;; Real-path first (follows links). If missing, fall back to
-          ;; normalized — useful for stat-not-existing-file etc., but
-          ;; in those cases existence checks downstream return nil.
-          (let [resolved (or (safe-real-path normalized) normalized)]
-            (when (inside? root resolved)
-              (str resolved))))))))
+        (.normalize (.toAbsolutePath base))))))
+
+(defn- resolve*
+  "Read-mode resolution: real-path the full path (follows ALL symlinks)
+   and check containment. If the leaf doesn't exist, fall back to the
+   parent-real-path (which MUST exist and be inside-root) joined with
+   the leaf name. This way a write to `evil/newfile` — where `evil` is
+   a symlink to `/etc` — resolves to `/etc/newfile`, fails the
+   parent-inside-root check, and is rejected.
+
+   Returns a string of the resolved real path on success, nil if the
+   path escapes the sandbox or is malformed. The returned path is
+   guaranteed to be inside root."
+  [^Path root ^String cwd ^String path]
+  (when-let [normalized (lex-normalize cwd path)]
+    (let [real (safe-real-path normalized)]
+      (cond
+        ;; Whole-path exists and is real — straightforward.
+        (some? real)
+        (when (inside? root real) (str real))
+
+        ;; Leaf doesn't exist (writing a new file, etc.). Walk to the
+        ;; nearest ancestor that DOES exist, real-resolve it, then
+        ;; rejoin the tail lexically. Reject if the realized ancestor
+        ;; escapes root.
+        :else
+        (loop [p     (.getParent normalized)
+               tail  (list (.getFileName normalized))]
+          (cond
+            (nil? p) nil
+            :else
+            (if-let [real-anc (safe-real-path p)]
+              (when (inside? root real-anc)
+                (let [rebuilt (reduce (fn [^Path acc ^Path seg]
+                                        (.resolve acc seg))
+                                      real-anc
+                                      tail)]
+                  (when (inside? root rebuilt)
+                    (str rebuilt))))
+              (recur (.getParent p)
+                     (conj tail (.getFileName p))))))))))
 
 (defn- type-of [^Path p]
   (cond
@@ -229,11 +282,27 @@
 
   (-symlink [_ target link-path]
     (when-let [resolved (resolve* root @cwd-atom link-path)]
-      (try (Files/createSymbolicLink (str->path resolved)
-                                     (str->path target)
-                                     (make-array java.nio.file.attribute.FileAttribute 0))
-           true
-           (catch Throwable _ nil))))
+      ;; Refuse symlinks whose target lexically escapes the sandbox.
+      ;; Absolute outside targets are obvious. For relative targets,
+      ;; resolve against the link's parent dir lexically (before any
+      ;; physical link-following) and check inside-root. This pairs
+      ;; with the read-time guard so even if someone bypasses this,
+      ;; resolve* on a path through the link fails.
+      (let [link-p (str->path resolved)
+            link-parent (.getParent link-p)
+            target-p (str->path target)
+            target-abs (if (.isAbsolute target-p)
+                         target-p
+                         (.resolve link-parent target-p))
+            target-norm (.normalize target-abs)]
+        (when (inside? root target-norm)
+          (try (Files/createSymbolicLink link-p target-p
+                                         (make-array java.nio.file.attribute.FileAttribute 0))
+               true
+               (catch Throwable _ nil))))))
+
+  (-sandbox-relativize [_ real-path-str]
+    (sandbox-relative root real-path-str))
 
   (-chown [_ path owner group]
     (when-let [resolved (resolve* root @cwd-atom path)]

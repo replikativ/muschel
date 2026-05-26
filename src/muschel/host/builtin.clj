@@ -49,14 +49,19 @@
    :extra-env vars under :vars, and the resolved :stdin string for
    builtins that read from it (grep/cat with no file args, tr, cut,
    xargs, …). We resolve :in eagerly via the fallback host's
-   -read-all-string — fine for the bounded inputs builtins handle."
-  [{:keys [dir extra-env in]} fallback-host fallback-fs]
+   -read-all-string — fine for the bounded inputs builtins handle.
+
+   Also forwards `:interrupt-fn` so long-running builtins (awk's
+   record loop, find recursion, xargs per-arg, etc.) can honour the
+   caller's resource budget."
+  [{:keys [dir extra-env in interrupt-fn]} fallback-host fallback-fs]
   (let [stdin (when in
                 (try (host/-read-all-string fallback-host in)
                      (catch Throwable _ nil)))]
     (cond-> {:cwd  (or dir (fs/cwd fallback-fs))
              :vars (or extra-env {})}
-      stdin (assoc :stdin stdin))))
+      stdin        (assoc :stdin stdin)
+      interrupt-fn (assoc :interrupt-fn interrupt-fn))))
 
 (defn- invoke-builtin!
   "Run a builtin fn synchronously, write its stdout/stderr to the
@@ -82,6 +87,11 @@
           (try (builtin-fn argv fs env)
                (finally (pop-thread-bindings)))
           (catch Throwable t
+            ;; Don't swallow resource-budget interrupts — those need
+            ;; to propagate so the caller's run-and-capture can abort.
+            (when (and (instance? clojure.lang.ExceptionInfo t)
+                       (:muschel/budget (ex-data t)))
+              (throw t))
             {:stdout ""
              :stderr (str (:cmd opts) ": " (.getMessage t) "\n")
              :exit 1}))]
