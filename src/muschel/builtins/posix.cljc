@@ -37,8 +37,11 @@
      the command name as the first element — caller doesn't strip it).
    - `fs` is a muschel.fs/FS handle (containment + read-file etc.).
    - `env` is the muschel env value (for $PWD, $HOME etc.) plus
-     `:stdin` (string, optional) injected by the host wrapper for
-     builtins that read from stdin (xargs, tr, cut, …).
+     `:stdin` (delay, optional) injected by the host wrapper for
+     builtins that read from stdin (xargs, tr, cut, …). Read via
+     `read-stdin` / `stdin-available?`, never directly — forcing
+     it eagerly defeats the laziness that keeps stdin-less builtins
+     from blocking on an open stream.
 
    Coverage in v1 (read-only):
 
@@ -77,6 +80,27 @@
 (def ^:private max-shell-depth
   "Cap on nested `sh -c …` / `find -exec` / `xargs` chains."
   32)
+
+;; ============================================================================
+;; Stdin access — `:stdin` is a `delay` installed by `host.builtin/build-env`.
+;; Builtins should NOT touch the raw key (forcing it eagerly would re-introduce
+;; the System/in blocking bug); use the helpers below so that builtins which
+;; never read stdin (e.g. `grep pattern file.txt`, `ls`) don't pay the slurp.
+;; ============================================================================
+
+(defn read-stdin
+  "Force the env's stdin delay into a string. Empty string if no stdin
+   source was provided. Caches inside the delay — repeated calls in
+   the same builtin invocation hit the cached value."
+  [env]
+  (if-let [d (:stdin env)] @d ""))
+
+(defn stdin-available?
+  "True iff a stdin source was provided to this builtin invocation.
+   Does NOT force the delay — safe to call before deciding whether
+   the builtin should read stdin or fall back to a file."
+  [env]
+  (some? (:stdin env)))
 
 ;; ============================================================================
 ;; Result builders
@@ -249,7 +273,7 @@
             num-nb?     (:number-nonblank opts)
             squeeze?    (:squeeze-blank opts)
             show-end?   (or (:show-ends opts) (:show-all opts))
-            stdin       (or (:stdin env) "")
+            stdin       (read-stdin env)
             files       (if (seq pos) pos ["-"])
             stderr      (volatile! "")
             any-err?    (volatile! false)
@@ -354,7 +378,7 @@
     (if err
       (usage-err "head" err)
       (let [n        (:lines opts)
-            stdin    (or (:stdin env) "")
+            stdin    (read-stdin env)
             files    (if (seq pos) pos ["-"])
             multi?   (> (count files) 1)
             show-h?  (or (:verbose opts)
@@ -394,7 +418,7 @@
     (if err
       (usage-err "tail" err)
       (let [n        (:lines opts)
-            stdin    (or (:stdin env) "")
+            stdin    (read-stdin env)
             files    (if (seq pos) pos ["-"])
             multi?   (> (count files) 1)
             show-h?  (or (:verbose opts)
@@ -476,7 +500,7 @@
             show-w?   (or (not explicit?) (boolean (:words opts)))
             show-c?   (or (not explicit?) (boolean (:bytes opts)))
             show-m?   (boolean (:chars opts))
-            stdin     (or (:stdin env) "")
+            stdin     (read-stdin env)
             files     (if (seq pos) pos ["-"])
             stderr    (volatile! "")
             any-err?  (volatile! false)
@@ -650,7 +674,7 @@
   "Concatenate stdin (when `-` or no args) and named files. Returns
    `[content err? stderr]`."
   [files fs env cmd]
-  (let [stdin    (or (:stdin env) "")
+  (let [stdin    (read-stdin env)
         targets  (if (seq files) files ["-"])
         stderr   (volatile! "")
         any-err? (volatile! false)
@@ -826,7 +850,7 @@
           (empty? patterns) (usage-err "grep" "missing pattern")
           :else
           (let [compiled (mapv #(compile-pattern % opts) patterns)
-                stdin-mode? (and (empty? files) (contains? env :stdin))
+                stdin-mode? (and (empty? files) (stdin-available? env))
                 targets (cond
                           stdin-mode?
                           [{:path "(standard input)" :show-name? false}]
@@ -850,8 +874,8 @@
             (doseq [{:keys [path] :as target} targets]
               (let [content
                     (cond
-                      stdin-mode? (:stdin env)
-                      (= "-" path) (or (:stdin env) "")
+                      stdin-mode? (read-stdin env)
+                      (= "-" path) (read-stdin env)
                       :else
                       (let [c (fs/read-file fs path)]
                         (when (nil? c)
@@ -1389,7 +1413,7 @@
             set2-raw (second pos)
             set1     (expand-set set1-raw)
             set2     (when set2-raw (expand-set set2-raw))
-            input    (or (:stdin env) "")
+            input    (read-stdin env)
             in-set1? (if (:complement opts)
                        (fn [c] (not (str/includes? set1 (str c))))
                        (fn [c] (str/includes? set1 (str c))))
@@ -1722,7 +1746,7 @@
       (>= *depth* max-shell-depth)
       (err "xargs: too many nested invocations" 2)
       :else
-      (let [stdin    (or (:stdin env) "")
+      (let [stdin    (read-stdin env)
             tokens   (xargs-tokens stdin opts)
             cmd-argv (if (seq pos) pos ["echo"])
             cmd      (first cmd-argv)
@@ -2241,7 +2265,7 @@
     (cond
       err (usage-err "tee" err)
       :else
-      (let [stdin    (or (:stdin env) "")
+      (let [stdin    (read-stdin env)
             stderr   (volatile! "")
             any-err? (volatile! false)]
         (doseq [f pos]
@@ -2834,7 +2858,7 @@
                 [(first pos) (rest pos)]
                 ["" []]))
             cmds (parse-sed-script script-s)
-            stdin (or (:stdin env) "")
+            stdin (read-stdin env)
             stderr (volatile! "")
             any-err? (volatile! false)
             process-text
@@ -3023,7 +3047,7 @@
                       (seq pos)    (first pos)
                       :else        nil)
             files   (if (:file opts) pos (rest pos))
-            stdin   (or (:stdin env) "")
+            stdin   (read-stdin env)
             ;; Pass raw text — awk-impl/run splits it internally by
             ;; the current RS (which may have been changed in BEGIN).
             raw     (cond
@@ -3292,7 +3316,7 @@
       :else
       (let [expr  (first pos)
             files (rest pos)
-            stdin (or (:stdin env) "")
+            stdin (read-stdin env)
             input-text (cond
                          (:null-input opts) "null"
                          (seq files)
