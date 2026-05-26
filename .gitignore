@@ -17,9 +17,14 @@ node_modules/
 dist/muschel.js
 dist/playground/
 
-# `npm-pack`/`npm-publish` mirrors `dist/playground/` into
-# `npm-package/dist/playground/` so the playground ships inside the
-# npm tarball (and unpkg can serve it). Build output — not committed.
+# npm-package/ holds a few tracked source files (LICENSE, README.md,
+# index.d.ts, package.template.json) plus build outputs that are
+# regenerated on every `clojure -T:build npm-pack` / `npm-publish`.
+# The outputs aren't committed — they bloat history and any diff is
+# noise. Matches datahike's pattern.
+npm-package/muschel.js
+npm-package/muschel.js.map
+npm-package/package.json
 npm-package/dist/
 
 # Private corpus — 485-line sample of real LLM-emitted bash from
