@@ -120,36 +120,61 @@
   ;; with nil — same behaviour as opening a non-existent file. We do
   ;; NOT delegate to the fallback host: a leaked path would otherwise
   ;; reach raw java.io and read/write real disk.
+  ;;
+  ;; Special case: `/dev/null` is the universal write-and-discard /
+  ;; read-zero-bytes sink. Agents reach for `2>/dev/null` in almost
+  ;; every pipeline. Refusing it would force `2>&1 | grep -v error`
+  ;; gymnastics. We model it as a stream that swallows writes /
+  ;; produces no bytes, regardless of FS containment.
   (-open-file-sink [_ p append?]
-    (or (fs/-open-sink fs p append?)
-        (throw (java.io.FileNotFoundException.
-                (str p " (not in muschel FS root or not writable)")))))
+    (cond
+      (= "/dev/null" p)
+      (proxy [java.io.OutputStream] []
+        (write
+          ([_b])
+          ([_b _o _l]))
+        (flush []))
+      :else
+      (or (fs/-open-sink fs p append?)
+          (throw (java.io.FileNotFoundException.
+                  (str p " (not in muschel FS root or not writable)"))))))
   (-open-file-source [_ p]
-    (or (fs/-open-source fs p)
-        (throw (java.io.FileNotFoundException.
-                (str p " (not in muschel FS root or missing)")))))
+    (cond
+      (= "/dev/null" p)
+      (java.io.ByteArrayInputStream. (byte-array 0))
+      :else
+      (or (fs/-open-source fs p)
+          (throw (java.io.FileNotFoundException.
+                  (str p " (not in muschel FS root or missing)"))))))
   (-file-info [_ p]
     ;; Translate the muschel.fs stat shape into the predicate-style
     ;; map the rest of muschel (test/[, redirect open-checks, …)
     ;; consume. Outside-root or missing paths return `:exists? false`,
     ;; matching the jvm host's behaviour for a missing file.
-    (if-let [s (fs/-stat fs p)]
-      {:exists?     true
-       :file?       (= :file (:type s))
-       :dir?        (= :dir  (:type s))
-       :symlink?    (= :symlink (:type s))
-       ;; muschel.fs doesn't model unix-style perm bits richly enough
-       ;; to distinguish r/w/x. Treat all in-root files as readable +
-       ;; writable; executable only if the FS reports it via mode bits.
-       :readable?   true
-       :writable?   true
-       :executable? (when-let [m (:perms-mode s)]
-                      (pos? (bit-and m 0111)))
-       :size        (:size s)
-       :mtime-ms    (:mtime-ms s)}
-      {:exists? false}))
+    (cond
+      (= "/dev/null" p)
+      {:exists? true :file? true :dir? false :symlink? false
+       :readable? true :writable? true :executable? false :size 0}
+      :else
+      (if-let [s (fs/-stat fs p)]
+        {:exists?     true
+         :file?       (= :file (:type s))
+         :dir?        (= :dir  (:type s))
+         :symlink?    (= :symlink (:type s))
+         ;; muschel.fs doesn't model unix-style perm bits richly enough
+         ;; to distinguish r/w/x. Treat all in-root files as readable +
+         ;; writable; executable only if the FS reports it via mode bits.
+         :readable?   true
+         :writable?   true
+         :executable? (when-let [m (:perms-mode s)]
+                        (pos? (bit-and m 0111)))
+         :size        (:size s)
+         :mtime-ms    (:mtime-ms s)}
+        {:exists? false})))
   (-read-file [_ p]
-    (fs/-read-file fs p))
+    (cond
+      (= "/dev/null" p) ""
+      :else             (fs/-read-file fs p)))
 
   ;; ---- pipes ----
   (-make-pipe        [_]        (host/-make-pipe fallback-host))
