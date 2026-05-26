@@ -1,17 +1,39 @@
 (ns muschel.fs.virtual
-  "In-memory FS for tests and the browser playground.
+  "In-memory FS for tests, the browser playground, and substrate-fork
+   scenarios where we want a cheap, serializable copy of the
+   filesystem state.
 
-   Underlying state: an atom holding {path-string → entry-map}, where
-   entry is one of:
+   ## Underlying state
 
-     {:type :dir}
-     {:type :file :bytes <byte-array-or-string> :mtime-ms long}
+   An atom holding `{path-string → entry-map}`. Entry shapes:
+
+     {:type :dir     :mtime-ms long}
+     {:type :file    :content str :mtime-ms long :perms-mode int?}
+     {:type :symlink :target str :mtime-ms long}
+
+   Content is stored as a Clojure string. JVM `String`s and cljs
+   strings are immutable, so forks (via `clojure.core/atom` deref +
+   re-wrap, or via spindel `fork-context`) share the underlying data
+   without copying and never see each other's writes.
+
+   This shape is pure persistent Clojure data — fully serialisable
+   via EDN or Transit. Use `serialise` / `deserialise` (below) to
+   round-trip a snapshot between muschel instances.
+
+   ## Trade-off
+
+   Storing files as strings means a 10 MB write produces a 10 MB
+   immutable string allocation. For agent workloads (KB-sized files)
+   that's irrelevant. If we ever need GB-scale binary blobs the
+   entry shape can grow a `{:type :file :chunks [strs]}` variant
+   without changing the FS protocol surface — readers still see a
+   string.
+
+   ## Containment
 
    The 'root' is implicit — paths use Unix-style absolute strings,
    typically `/`. There's no external filesystem to escape to, so
    containment is structural: anything not in the map doesn't exist.
-   Used primarily for unit tests of the builtin host + commands, and
-   as the storage backend for a browser playground.
 
    :cwd is tracked in an atom alongside the entries. -cd! refuses
    paths that don't resolve to a :dir entry."
@@ -62,12 +84,11 @@
     (when-let [resolved (fs/-resolve this path)]
       (when-let [entry (get @entries-atom resolved)]
         {:type     (:type entry)
-         :size     (cond
-                     (= :dir (:type entry))     0
-                     (= :symlink (:type entry)) (count (or (:target entry) ""))
-                     (string? (:bytes entry))   (count (:bytes entry))
-                     (nil? (:bytes entry))      0
-                     :else                      (alength ^bytes (:bytes entry)))
+         :size     (case (:type entry)
+                     :dir     0
+                     :symlink (count (or (:target entry) ""))
+                     :file    (count (or (:content entry) ""))
+                     0)
          :mtime-ms   (or (:mtime-ms entry) 0)
          :perms      nil
          :perms-mode (:perms-mode entry)
@@ -91,59 +112,78 @@
                            (when-not (str/includes? tail "/")
                              {:name tail
                               :type (:type e)
-                              :size (cond
-                                      (= :dir (:type e)) 0
-                                      (string? (:bytes e)) (count (:bytes e))
-                                      :else (alength ^bytes (:bytes e)))
+                              :size (case (:type e)
+                                      :dir 0
+                                      :file (count (or (:content e) ""))
+                                      :symlink (count (or (:target e) ""))
+                                      0)
                               :mtime-ms (or (:mtime-ms e) 0)})))))
                (sort-by :name))))))
 
   (-read-file [this path]
-    (when-let [bs (fs/-read-bytes this path)]
-      (if (string? bs)
-        bs
-        #?(:clj  (String. ^bytes bs "UTF-8")
-           :cljs (str bs)))))
-
-  (-read-bytes [this path]
     (when-let [resolved (fs/-resolve this path)]
       (let [entry (get @entries-atom resolved)]
         (when (= :file (:type entry))
-          (:bytes entry)))))
+          (or (:content entry) "")))))
+
+  (-read-bytes [this path]
+    ;; The VFS stores text. Callers that want bytes get UTF-8.
+    (when-let [s (fs/-read-file this path)]
+      #?(:clj  (.getBytes ^String s "UTF-8")
+         :cljs s)))
 
   (-open-source [this path]
     #?(:clj
-       (when-let [bs (fs/-read-bytes this path)]
+       (when-let [s (fs/-read-file this path)]
          (java.io.ByteArrayInputStream.
-          (cond
-            (bytes? bs) bs
-            (string? bs) (.getBytes ^String bs "UTF-8")
-            :else (byte-array 0))))
-       :cljs nil))
+          (.getBytes ^String s "UTF-8")))
+       :cljs
+       ;; In cljs there's no InputStream — callers should use
+       ;; -read-file directly. Return the string itself, which any
+       ;; builtin reading "from stdin via -read-all-string" can
+       ;; treat as content.
+       (when-let [s (fs/-read-file this path)] s)))
 
   (-open-sink [this path append?]
     #?(:clj
        (when-let [resolved (fs/-resolve this path)]
-         ;; Build an in-memory buffer; on close, commit to entries-atom.
-         ;; For append mode, seed with existing bytes if present.
+         ;; Build an in-memory buffer; on close commit the bytes
+         ;; (UTF-8 decoded) into the entries map as a Clojure string.
+         ;; For append mode, seed with the existing content first.
          (let [existing (when append?
                           (when-let [e (get @entries-atom resolved)]
-                            (when (= :file (:type e)) (:bytes e))))
-               seed     (cond
-                          (nil? existing) nil
-                          (string? existing) (.getBytes ^String existing "UTF-8")
-                          :else existing)
+                            (when (= :file (:type e)) (:content e))))
                baos     (proxy [java.io.ByteArrayOutputStream] []
                           (close []
                             (proxy-super close)
-                            (let [bytes (.toByteArray ^java.io.ByteArrayOutputStream this)]
+                            (let [s (.toString ^java.io.ByteArrayOutputStream this "UTF-8")]
                               (swap! entries-atom assoc resolved
                                      {:type :file
-                                      :bytes bytes
+                                      :content s
                                       :mtime-ms (mtime)}))))]
-           (when seed (.write ^java.io.ByteArrayOutputStream baos ^bytes seed 0 (alength ^bytes seed)))
+           (when existing
+             (let [bs (.getBytes ^String existing "UTF-8")]
+               (.write ^java.io.ByteArrayOutputStream baos ^bytes bs
+                       0 (alength bs))))
            baos))
-       :cljs nil))
+       :cljs
+       ;; In cljs, return a tiny accumulator the caller can append
+       ;; strings to and close. Minimal interface: this object
+       ;; supports `(.append o s)` and on close commits to vfs.
+       (when-let [resolved (fs/-resolve this path)]
+         (let [existing (when append?
+                          (when-let [e (get @entries-atom resolved)]
+                            (when (= :file (:type e)) (:content e))))
+               buf      (atom (or existing ""))]
+           ;; A lightweight js object emulating .write/.close
+           #js {:write  (fn [s] (swap! buf str s))
+                :close  (fn []
+                         (swap! entries-atom assoc resolved
+                                {:type :file
+                                 :content @buf
+                                 :mtime-ms (mtime)}))
+                :flush  (fn [] nil)
+                :muschel-sink? true}))))
 
   (-mkdir [this path]
     (when-let [resolved (fs/-resolve this path)]
@@ -208,7 +248,7 @@
                (fn [m]
                  (if-let [e (get m resolved)]
                    (assoc m resolved (assoc e :mtime-ms now))
-                   (assoc m resolved {:type :file :bytes "" :mtime-ms now}))))
+                   (assoc m resolved {:type :file :content "" :mtime-ms now}))))
         true)))
 
   (-chmod [this path mode]
@@ -224,13 +264,25 @@
                {:type :symlink :target target :mtime-ms (mtime)})
         true))))
 
+(defn- coerce-content
+  "Accept legacy `:bytes` keys as well as the canonical `:content`,
+   and JVM byte-arrays for callers that still hand them in. Return
+   a Clojure string."
+  [^String _path v]
+  (cond
+    (nil? v) ""
+    (string? v) v
+    #?@(:clj [(bytes? v) (String. ^bytes v "UTF-8")])
+    :else (str v)))
+
 (defn make
   "Construct a virtual FS pre-populated with `entries`, a map of
    absolute-path → either:
 
      :dir                       ; bare keyword
      {:type :dir}
-     {:type :file :content str-or-bytes}
+     {:type :file :content STR}
+     STR                        ; sugar for `{:type :file :content STR}`
 
    The map is normalised internally to the entry shape -stat expects.
    Parent directories are auto-created.
@@ -241,33 +293,39 @@
   ([entries] (make entries {}))
   ([entries {:keys [cwd] :or {cwd "/"}}]
    (let [now (mtime)
-         ;; Normalise entries into the internal shape.
-         norm-entries (reduce-kv
-                       (fn [acc path v]
-                         (let [entry (cond
-                                       (= :dir v)
-                                       {:type :dir :mtime-ms now}
+         norm-entries
+         (reduce-kv
+          (fn [acc path v]
+            (let [entry (cond
+                          (= :dir v)
+                          {:type :dir :mtime-ms now}
 
-                                       (map? v)
-                                       (case (:type v)
-                                         :dir  {:type :dir :mtime-ms (or (:mtime-ms v) now)}
-                                         :file {:type :file
-                                                :bytes (or (:bytes v) (:content v) "")
-                                                :mtime-ms (or (:mtime-ms v) now)}
-                                          ;; default to file
-                                         {:type :file
-                                          :bytes (or (:bytes v) (:content v) "")
-                                          :mtime-ms (or (:mtime-ms v) now)})
+                          (map? v)
+                          (case (:type v)
+                            :dir     {:type :dir :mtime-ms (or (:mtime-ms v) now)}
+                            :symlink {:type :symlink
+                                      :target (:target v)
+                                      :mtime-ms (or (:mtime-ms v) now)}
+                            :file    {:type :file
+                                      :content  (coerce-content path
+                                                                (or (:content v) (:bytes v)))
+                                      :mtime-ms (or (:mtime-ms v) now)
+                                      :perms-mode (:perms-mode v)}
+                            ;; default: file
+                            {:type :file
+                             :content  (coerce-content path
+                                                       (or (:content v) (:bytes v)))
+                             :mtime-ms (or (:mtime-ms v) now)})
 
-                                       (string? v)
-                                       {:type :file :bytes v :mtime-ms now}
+                          (string? v)
+                          {:type :file :content v :mtime-ms now}
 
-                                       :else
-                                       (throw (ex-info "Invalid virtual FS entry"
-                                                       {:path path :value v})))]
-                           (assoc acc path entry)))
-                       {}
-                       entries)
+                          :else
+                          (throw (ex-info "Invalid virtual FS entry"
+                                          {:path path :value v})))]
+              (assoc acc path entry)))
+          {}
+          entries)
          ;; Auto-create intermediate dirs.
          with-dirs (reduce
                     (fn [acc path]
@@ -286,3 +344,28 @@
                        with-dirs
                        (assoc with-dirs "/" {:type :dir :mtime-ms now}))]
      (->VirtualFS (atom all-entries) (atom cwd)))))
+
+;; ============================================================================
+;; Serialisation: send / restore a VFS snapshot between instances
+;; ============================================================================
+
+(defn snapshot
+  "Return a serialisable plain-data view of the FS state:
+
+     {:entries {path → entry} :cwd path}
+
+   The result is pure persistent Clojure data — `pr-str`, EDN write,
+   Transit, anything that can serialise nested maps + strings will
+   round-trip it. No byte-arrays, no atoms, no live references."
+  [^VirtualFS fs]
+  {:entries @(:entries-atom fs)
+   :cwd     @(:cwd-atom fs)})
+
+(defn restore
+  "Re-hydrate a VirtualFS from a snapshot map (the result of
+   `snapshot`). The new VFS shares no mutable state with anything
+   that previously held the snapshot — write the snapshot to a file,
+   read it back later, restore it, and you have an independent fork."
+  [{:keys [entries cwd]}]
+  (->VirtualFS (atom (or entries {"/" {:type :dir :mtime-ms (mtime)}}))
+               (atom (or cwd "/"))))

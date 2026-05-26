@@ -1,5 +1,6 @@
 (ns muschel.fs-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
             [muschel.fs :as fs]
             [muschel.fs.virtual :as vfs]))
 
@@ -82,3 +83,41 @@
     (is (nil? (fs/cd! fs "no-such"))
         "cd into nonexistent returns nil; cwd unchanged")
     (is (= "/work/sub" (fs/cwd fs)))))
+
+;; ============================================================================
+;; VirtualFS snapshot / restore: send-between-instances round-trip
+;; ============================================================================
+
+(deftest vfs-snapshot-pure-data
+  ;; The snapshot must be plain persistent data — no atoms, no
+  ;; byte-arrays, no live host references — so it can be sent over
+  ;; the wire (EDN / Transit / pr-str) and rebuilt on the other end.
+  (let [fs (vfs/make {"/a.txt"   "hello"
+                      "/dir"     :dir
+                      "/dir/b"   "world"}
+                     {:cwd "/dir"})
+        snap (vfs/snapshot fs)]
+    (is (map? snap))
+    (is (map? (:entries snap)))
+    (is (= "/dir" (:cwd snap)))
+    (is (= "hello" (get-in snap [:entries "/a.txt" :content])))
+    (is (= :file   (get-in snap [:entries "/a.txt" :type])))
+    ;; pr-str / read-string round-trip — proves it's pure data.
+    (let [restored-data (edn/read-string (pr-str snap))]
+      (is (= snap restored-data))
+      (let [fs2 (vfs/restore restored-data)]
+        (is (= "hello" (fs/read-file fs2 "/a.txt")))
+        (is (= "world" (fs/read-file fs2 "/dir/b")))
+        (is (= "/dir"  (fs/cwd fs2)))))))
+
+(deftest vfs-snapshot-forks-isolate
+  ;; Writes to one fork must not affect the other.
+  (let [fs1 (vfs/make {"/x" "v1"} {:cwd "/"})
+        fs2 (vfs/restore (vfs/snapshot fs1))]
+    (let [out (fs/open-sink fs2 "/x" false)]
+      #?(:clj  (with-open [^java.io.OutputStream o out]
+                 (.write o (.getBytes "v2" "UTF-8")))
+         :cljs (do ((.-write out) "v2")
+                   ((.-close out)))))
+    (is (= "v1" (fs/read-file fs1 "/x")) "parent fork unchanged")
+    (is (= "v2" (fs/read-file fs2 "/x")) "child fork has the write")))
