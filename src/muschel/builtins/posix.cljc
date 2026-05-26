@@ -1,6 +1,34 @@
 (ns muschel.builtins.posix
   "Pure-Clojure implementations of a useful subset of POSIX coreutils.
 
+   ## Cross-platform port — WORK IN PROGRESS
+
+   This file was renamed `.clj` → `.cljc` to start the cross-platform
+   port (JVM + CLJS + babashka). The body is still JVM-only today;
+   the port is staged so the JVM tests keep passing while we
+   incrementally swap Java interop for `muschel.builtins.awk-compat`
+   shims or `#?` reader conditionals. See the TODOs at the bottom of
+   this docstring for the work map.
+
+   No CLJS namespace requires this file yet, so the unported Java
+   interop is unreached by the CLJS compiler. To enable Node /
+   browser dispatch, a follow-up will:
+
+     1. Replace the dynamic `(require 'muschel.parse 'muschel.exec …)`
+        in `sh` with a registry pattern (exec sets the fn refs at
+        load time).
+     2. Convert ~8 `java.util.regex.Pattern` uses to `awk-compat`
+        `re-compile` / `re-quote`.
+     3. Convert `java.io.OutputStream` with-open blocks to shims
+        (or quarantine behind :clj).
+     4. Convert ~13 `(catch Throwable …)` to
+        `#?(:clj Throwable :cljs :default)`.
+     5. Replace `java.util.ArrayList` with `(transient [])`.
+     6. Shim `java.util.Calendar`/`Date` in the `date` builtin.
+     7. Shim `java.util.Base64` using `js/Buffer` on CLJS.
+     8. Quarantine `curl` (java.net.http) behind
+        `#?(:clj … :bb babashka.http-client :cljs refuse-stub)`.
+
    Each fn has the same shape:
 
        (cmd-fn argv fs env) → {:stdout str :stderr str :exit int}
