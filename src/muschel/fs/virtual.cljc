@@ -92,7 +92,9 @@
          :mtime-ms   (or (:mtime-ms entry) 0)
          :perms      nil
          :perms-mode (:perms-mode entry)
-         :target     (:target entry)})))
+         :target     (:target entry)
+         :owner      (:owner entry)
+         :group      (:group entry)})))
 
   (-list-dir [this path]
     (when-let [resolved (fs/-resolve this path)]
@@ -262,6 +264,16 @@
       (when-not (get @entries-atom resolved)
         (swap! entries-atom assoc resolved
                {:type :symlink :target target :mtime-ms (mtime)})
+        true)))
+
+  (-chown [this path owner group]
+    (when-let [resolved (fs/-resolve this path)]
+      (when (get @entries-atom resolved)
+        (swap! entries-atom update resolved
+               (fn [e]
+                 (cond-> e
+                   owner (assoc :owner owner)
+                   group (assoc :group group))))
         true))))
 
 (defn- coerce-content

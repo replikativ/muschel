@@ -118,7 +118,15 @@
      `link-path` must resolve inside the root; `target` is stored as
      given (may be relative or absolute — symlink-resolution at
      read-time still goes through the FS, which catches outside-root
-     targets at follow time)."))
+     targets at follow time).")
+
+  (-chown [this path owner group]
+    "Set owner / group on `path`. On real-disk FS this requires the
+     OS user has the capability (typically root for changing across
+     users; same-user is a no-op). On virtual FS the values are
+     stored opaquely and surface through `:owner` / `:group` on
+     `-stat`. Either argument may be nil to leave unchanged. Returns
+     truthy on success."))
 
 ;; ============================================================================
 ;; Public wrappers
@@ -140,6 +148,7 @@
 (defn touch       [fs path] (-touch fs path))
 (defn chmod       [fs path mode] (-chmod fs path mode))
 (defn symlink     [fs target link-path] (-symlink fs target link-path))
+(defn chown       [fs path owner group] (-chown fs path owner group))
 
 ;; ============================================================================
 ;; Path utilities (impl-agnostic)

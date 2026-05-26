@@ -194,7 +194,7 @@
 (deftest ln-hard-link-refused
   (let [[_ host] (fs+host)
         r (run host "ln a.txt b.txt")]
-    (is (= 2 (:exit r)))
+    (is (= 1 (:exit r)))
     (is (re-find #"only -s" (:stderr r)))))
 
 (deftest tee-writes-file-and-stdout
@@ -208,6 +208,63 @@
   (let [[fs host] (fs+host {"/work" :dir "/work/log" "init\n"})]
     (run host "echo more | tee -a log")
     (is (= "init\nmore\n" (fs/read-file fs "/work/log")))))
+
+;; ============================================================================
+;; Audit-bug regressions: write-side
+;; ============================================================================
+
+(deftest mkdir-m-applies-mode
+  ;; Previously parsed but silently ignored.
+  (let [[fs host] (fs+host)
+        r (run host "mkdir -m 0700 secret")]
+    (is (= 0 (:exit r)))
+    (is (= 0700 (-> (fs/stat fs "/work/secret") :perms-mode (or 0))))))
+
+(deftest rmdir-p-walks-parents
+  (let [[fs host] (fs+host {"/work" :dir
+                            "/work/a" :dir
+                            "/work/a/b" :dir
+                            "/work/a/b/c" :dir})
+        r (run host "rmdir -p a/b/c")]
+    (is (= 0 (:exit r)))
+    (is (not (fs/exists? fs "/work/a/b/c")))
+    (is (not (fs/exists? fs "/work/a/b")))
+    (is (not (fs/exists? fs "/work/a")))))
+
+(deftest chmod-symbolic-u-plus-x
+  (let [[fs host] (fs+host)
+        ;; Start at 0644
+        _ (run host "chmod 0644 a.txt")
+        r (run host "chmod u+x a.txt")]
+    (is (= 0 (:exit r)))
+    (is (= 0744 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
+
+(deftest chmod-symbolic-a-equals-r
+  (let [[fs host] (fs+host)
+        r (run host "chmod a=r a.txt")]
+    (is (= 0 (:exit r)))
+    (is (= 0444 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
+
+(deftest chmod-symbolic-go-minus-w
+  (let [[fs host] (fs+host)
+        _ (run host "chmod 0666 a.txt")
+        r (run host "chmod go-w a.txt")]
+    (is (= 0 (:exit r)))
+    (is (= 0644 (-> (fs/stat fs "/work/a.txt") :perms-mode (or 0))))))
+
+(deftest chown-records-owner-group
+  (let [[fs host] (fs+host)
+        r (run host "chown alice:dev a.txt")]
+    (is (= 0 (:exit r)))
+    (let [s (fs/stat fs "/work/a.txt")]
+      (is (= "alice" (:owner s)))
+      (is (= "dev"   (:group s))))))
+
+(deftest chown-owner-only
+  (let [[fs host] (fs+host)
+        r (run host "chown alice a.txt")]
+    (is (= 0 (:exit r)))
+    (is (= "alice" (:owner (fs/stat fs "/work/a.txt"))))))
 
 ;; ============================================================================
 ;; Write builtins respect FS containment

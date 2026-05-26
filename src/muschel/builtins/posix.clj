@@ -59,8 +59,11 @@
   ([msg]      {:stdout "" :stderr (str msg "\n") :exit 1})
   ([msg code] {:stdout "" :stderr (str msg "\n") :exit code}))
 
-(defn- usage-err [cmd msg]
-  (err (str cmd ": " msg) 2))
+(defn- usage-err
+  "Usage errors exit 1 (matches GNU coreutils + POSIX). 2 is
+   reserved for higher-tier protocol errors (some greps + diffs)."
+  [cmd msg]
+  (err (str cmd ": " msg) 1))
 
 ;; ============================================================================
 ;; tools.cli wrapper — every builtin's argv goes through this.
@@ -1729,59 +1732,96 @@
          (fs/mkdir fs p)))
      steps)))
 
+(declare parse-mode)
+
 (defn mkdir
-  "POSIX mkdir. -p creates parents (and is idempotent on existing dirs)."
+  "POSIX mkdir. -p creates parents (idempotent on existing dirs).
+   -m MODE applies an octal or symbolic mode to created dirs."
   [argv fs _env]
   (let [{:keys [opts pos err]}
         (cli-parse argv [["-p" "--parents"]
-                         ["-m" "--mode MODE"]])]
+                         ["-m" "--mode MODE"]
+                         ["-v" "--verbose"]])]
     (cond
       err (usage-err "mkdir" err)
       (empty? pos) (usage-err "mkdir" "missing operand")
       :else
       (let [stderr (volatile! "")
-            any-err? (volatile! false)]
+            stdout (volatile! "")
+            any-err? (volatile! false)
+            mode-val (when (:mode opts)
+                       (parse-mode (:mode opts) 0755))
+            note-creation (fn [d]
+                            (when (:verbose opts)
+                              (vswap! stdout str "mkdir: created directory '" d "'\n"))
+                            (when mode-val
+                              (fs/chmod fs d mode-val)))]
         (doseq [d pos]
           (cond
             (:parents opts)
-            (when-not (mkdir-p fs d)
-              (vswap! stderr str "mkdir: cannot create directory '" d "'\n")
-              (vreset! any-err? true))
+            (if (mkdir-p fs d)
+              (note-creation d)
+              (do (vswap! stderr str "mkdir: cannot create directory '" d "'\n")
+                  (vreset! any-err? true)))
+
             (fs/exists? fs d)
             (do (vswap! stderr str "mkdir: cannot create directory '" d "': File exists\n")
                 (vreset! any-err? true))
+
             :else
-            (when-not (fs/mkdir fs d)
-              (vswap! stderr str "mkdir: cannot create directory '" d "'\n")
-              (vreset! any-err? true))))
-        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
+            (if (fs/mkdir fs d)
+              (note-creation d)
+              (do (vswap! stderr str "mkdir: cannot create directory '" d "'\n")
+                  (vreset! any-err? true)))))
+        {:stdout @stdout :stderr @stderr :exit (if @any-err? 1 0)}))))
 
 (defn rmdir
-  "POSIX rmdir — empty directories only."
+  "POSIX rmdir — empty directories only. -p also removes empty
+   parent directories on the way up."
   [argv fs _env]
-  (let [{:keys [pos err]} (cli-parse argv [["-p" "--parents"]])]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-p" "--parents"]])]
     (cond
       err (usage-err "rmdir" err)
       (empty? pos) (usage-err "rmdir" "missing operand")
       :else
       (let [stderr (volatile! "")
-            any-err? (volatile! false)]
+            any-err? (volatile! false)
+            remove-one!
+            (fn [d]
+              (let [s (fs/stat fs d)]
+                (cond
+                  (nil? s)
+                  (do (vswap! stderr str "rmdir: failed to remove '" d "': No such file or directory\n")
+                      (vreset! any-err? true)
+                      false)
+                  (not= :dir (:type s))
+                  (do (vswap! stderr str "rmdir: failed to remove '" d "': Not a directory\n")
+                      (vreset! any-err? true)
+                      false)
+                  (seq (fs/list-dir fs d))
+                  (do (vswap! stderr str "rmdir: failed to remove '" d "': Directory not empty\n")
+                      (vreset! any-err? true)
+                      false)
+                  :else
+                  (if (fs/delete fs d)
+                    true
+                    (do (vswap! stderr str "rmdir: failed to remove '" d "'\n")
+                        (vreset! any-err? true)
+                        false)))))]
         (doseq [d pos]
-          (let [s (fs/stat fs d)]
-            (cond
-              (nil? s)
-              (do (vswap! stderr str "rmdir: failed to remove '" d "': No such file or directory\n")
-                  (vreset! any-err? true))
-              (not= :dir (:type s))
-              (do (vswap! stderr str "rmdir: failed to remove '" d "': Not a directory\n")
-                  (vreset! any-err? true))
-              (seq (fs/list-dir fs d))
-              (do (vswap! stderr str "rmdir: failed to remove '" d "': Directory not empty\n")
-                  (vreset! any-err? true))
-              :else
-              (when-not (fs/delete fs d)
-                (vswap! stderr str "rmdir: failed to remove '" d "'\n")
-                (vreset! any-err? true)))))
+          (when (remove-one! d)
+            (when (:parents opts)
+              ;; Walk up; stop when a parent is non-empty or removal fails.
+              (loop [path d]
+                (let [idx (.lastIndexOf ^String path "/")
+                      parent (cond
+                               (neg? idx)  nil
+                               (zero? idx) nil           ; "/a" → "/", stop
+                               :else       (subs path 0 idx))]
+                  (when (and parent (not= "" parent) (not= "." parent))
+                    (when (remove-one! parent)
+                      (recur parent))))))))
         {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
 
 (defn- delete-recursive!
@@ -1920,31 +1960,148 @@
               (vreset! any-err? true))))
         {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
 
-(defn- parse-mode
-  "Parse an octal mode string (`755`, `0755`) into an int. Returns
-   nil on malformed input. Symbolic modes (`u+x`) are not supported."
+(defn- parse-mode-octal
+  "Parse `755`, `0755`, `0o755` → integer. Returns nil on malformed."
   [^String s]
-  (try (Long/parseLong s 8) (catch Throwable _ nil)))
+  (try (Long/parseLong (str/replace s #"^0o?" "") 8)
+       (catch Throwable _ nil)))
+
+(defn- apply-symbolic-mode
+  "Apply one symbolic mode clause (e.g. `u+x`, `go-w`, `a=r`) to an
+   octal `base`. Returns the new mode. Supports who={u,g,o,a}, op={
+   +,-,=}, perms={r,w,x,X,s,t}."
+  [^long base ^String clause]
+  (if-let [[_ who op perms] (re-matches #"([ugoa]*)([+\-=])([rwxX]+)" clause)]
+    (let [who-bits (cond
+                     (or (= "" who) (= "a" who)) 0777
+                     :else
+                     (reduce + 0
+                             (for [c who]
+                               (case c
+                                 \u 0700
+                                 \g 0070
+                                 \o 0007
+                                 0))))
+          ;; Build the perm-bit triplet from perms (`rwx` → 7).
+          perm-triplet (reduce + 0 (for [c perms]
+                                     (case c
+                                       \r 4
+                                       \w 2
+                                       (\x \X) 1
+                                       0)))
+          ;; Expand triplet across each who-octet.
+          new-bits (cond-> 0
+                     (pos? (bit-and who-bits 0700)) (bit-or (* perm-triplet 64))
+                     (pos? (bit-and who-bits 0070)) (bit-or (* perm-triplet 8))
+                     (pos? (bit-and who-bits 0007)) (bit-or perm-triplet))]
+      (case op
+        "+" (bit-or base new-bits)
+        "-" (bit-and base (bit-not new-bits))
+        "=" (bit-or (bit-and base (bit-not who-bits)) new-bits)))
+    nil))
+
+(defn- parse-mode
+  "Parse either an octal mode (`755`, `0755`) or a symbolic mode
+   (`u+x`, `a=r`, `go-w`, `u+x,g-w`). Returns a function that takes
+   the current mode and returns the new one — symbolic modes can
+   compose, octal is a constant override."
+  [^String s base]
+  (cond
+    (re-matches #"0?o?[0-7]+" s)
+    (parse-mode-octal s)
+
+    :else
+    ;; Comma-separated clauses, each acting on the running mode.
+    (let [clauses (str/split s #",")]
+      (reduce (fn [m clause]
+                (when m
+                  (apply-symbolic-mode m clause)))
+              (or base 0644)
+              clauses))))
 
 (defn chmod
-  "POSIX chmod, octal modes only."
+  "POSIX chmod. Octal (`0755`, `755`) or symbolic (`u+x`, `a=r`,
+   `go-w`, comma-separated clauses). -R recursive."
   [argv fs _env]
-  (let [args (vec (rest argv))]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-R" "--recursive"]
+                         ["-v" "--verbose"]
+                         ["-c" "--changes"]
+                         ["-f" "--silent"]])]
     (cond
-      (< (count args) 2) (usage-err "chmod" "missing operand")
+      err (usage-err "chmod" err)
+      (< (count pos) 2) (usage-err "chmod" "missing operand")
       :else
-      (let [mode-s (first args)
-            files  (rest args)
-            mode   (parse-mode mode-s)]
-        (if (nil? mode)
-          (usage-err "chmod" (str "invalid mode: " mode-s))
-          (let [stderr   (volatile! "")
-                any-err? (volatile! false)]
-            (doseq [f files]
-              (when-not (fs/chmod fs f mode)
-                (vswap! stderr str "chmod: cannot chmod '" f "'\n")
-                (vreset! any-err? true)))
-            {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))))
+      (let [mode-s (first pos)
+            files  (rest pos)
+            stderr   (volatile! "")
+            any-err? (volatile! false)
+            chmod-one!
+            (fn [path]
+              (let [cur (or (:perms-mode (fs/stat fs path)) 0644)
+                    new-mode (parse-mode mode-s cur)]
+                (cond
+                  (nil? new-mode)
+                  (do (vswap! stderr str "chmod: invalid mode: '" mode-s "'\n")
+                      (vreset! any-err? true))
+                  (not (fs/chmod fs path new-mode))
+                  (when-not (:silent opts)
+                    (vswap! stderr str "chmod: cannot operate on '" path "'\n")
+                    (vreset! any-err? true)))))]
+        (doseq [f files]
+          (chmod-one! f)
+          (when (:recursive opts)
+            (let [s (fs/stat fs f)]
+              (when (and s (= :dir (:type s)))
+                (let [walk (fn walk [p]
+                             (doseq [{:keys [name type]} (or (fs/list-dir fs p) [])]
+                               (let [child (str (str/replace p #"/+$" "") "/" name)]
+                                 (chmod-one! child)
+                                 (when (= :dir type) (walk child)))))]
+                  (walk f))))))
+        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
+
+(defn chown
+  "POSIX chown OWNER[:GROUP] FILE...
+
+   In the sandbox, ownership writes are best-effort: real-disk chown
+   needs root for cross-user changes, and the virtual FS just stores
+   the strings for stat round-trip. The agent gets non-zero exit when
+   the underlying FS rejects."
+  [argv fs _env]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-R" "--recursive"]
+                         ["-v" "--verbose"]
+                         ["-f" "--silent"]])]
+    (cond
+      err (usage-err "chown" err)
+      (< (count pos) 2) (usage-err "chown" "missing operand")
+      :else
+      (let [[owner-spec & files] pos
+            [owner group] (if (str/includes? owner-spec ":")
+                            (str/split owner-spec #":" 2)
+                            [owner-spec nil])
+            owner (when (and owner (not= "" owner)) owner)
+            stderr   (volatile! "")
+            any-err? (volatile! false)
+            chown-one!
+            (fn [path]
+              (when-not (fs/chown fs path owner group)
+                (when-not (:silent opts)
+                  (vswap! stderr str "chown: cannot change ownership of '" path "'\n")
+                  (vreset! any-err? true))))]
+        (doseq [f files]
+          (chown-one! f)
+          (when (:recursive opts)
+            (let [s (fs/stat fs f)]
+              (when (and s (= :dir (:type s)))
+                (let [walk (fn walk [p]
+                             (doseq [{:keys [name type]} (or (fs/list-dir fs p) [])]
+                               (let [child (str (str/replace p #"/+$" "") "/" name)]
+                                 (chown-one! child)
+                                 (when (= :dir type) (walk child)))))]
+                  (walk f))))))
+        {:stdout "" :stderr @stderr :exit (if @any-err? 1 0)}))))
 
 (defn ln
   "Symbolic link via `-s` only. Hard links aren't meaningful inside
@@ -2002,14 +2159,19 @@
       (empty? args) (usage-err "basename" "missing operand")
       :else
       (let [[path suffix] args
-            ;; Strip trailing slashes, then take the last segment.
-            trimmed (str/replace path #"/+$" "")
-            base    (or (last (str/split trimmed #"/")) "")
-            base'   (if (and suffix
-                             (not= base suffix)
-                             (str/ends-with? base suffix))
-                      (subs base 0 (- (count base) (count suffix)))
-                      base)]
+            base
+            (cond
+              ;; POSIX: basename of `/` is `/`.
+              (re-matches #"/+" path) "/"
+              :else
+              (let [trimmed (str/replace path #"/+$" "")
+                    last-seg (last (str/split trimmed #"/"))]
+                (or last-seg trimmed)))
+            base' (if (and suffix
+                           (not= base suffix)
+                           (str/ends-with? base suffix))
+                    (subs base 0 (- (count base) (count suffix)))
+                    base)]
         (ok (str base' "\n"))))))
 
 (defn dirname
@@ -2021,33 +2183,52 @@
       :else
       (let [out (str/join "\n"
                           (for [p paths]
-                            (let [trimmed (str/replace p #"/+$" "")
-                                  idx     (.lastIndexOf ^String trimmed "/")]
-                              (cond
-                                (neg? idx)        "."
-                                (zero? idx)       "/"
-                                :else             (subs trimmed 0 idx)))))]
+                            (cond
+                              ;; POSIX: dirname of `/` is `/`. Of `//` is `//`.
+                              (re-matches #"/+" p) "/"
+                              :else
+                              (let [trimmed (str/replace p #"/+$" "")
+                                    idx     (.lastIndexOf ^String trimmed "/")]
+                                (cond
+                                  (neg? idx)  "."
+                                  (zero? idx) "/"
+                                  :else       (subs trimmed 0 idx))))))]
         (ok (str out "\n"))))))
 
 (defn realpath
-  "Canonicalise a path through the FS. Outside-root paths produce an
-   error. We don't follow symlinks any deeper than the FS does."
+  "Canonicalise a path through the FS. -m (canonicalize-missing) lets
+   missing paths through; default mode errors on missing (matches
+   GNU). -e requires the full path to exist (same as default for us)."
   [argv fs _env]
-  (let [paths (rest argv)]
+  (let [{:keys [opts pos err]}
+        (cli-parse argv [["-e" "--canonicalize-existing"]
+                         ["-m" "--canonicalize-missing"]
+                         ["-s" "--strip"]
+                         ["-z" "--zero"]])]
     (cond
-      (empty? paths) (usage-err "realpath" "missing operand")
+      err (usage-err "realpath" err)
+      (empty? pos) (usage-err "realpath" "missing operand")
       :else
       (let [stderr   (volatile! "")
             any-err? (volatile! false)
+            sep      (if (:zero opts) "\0" "\n")
             lines
             (mapv (fn [p]
                     (if-let [resolved (fs/resolve fs p)]
-                      resolved
+                      (cond
+                        ;; -m: accept whatever resolves, even if missing.
+                        (:canonicalize-missing opts) resolved
+                        ;; Default + -e: refuse if it doesn't exist.
+                        (fs/exists? fs p) resolved
+                        :else
+                        (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
+                            (vreset! any-err? true)
+                            nil))
                       (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
                           (vreset! any-err? true)
                           nil)))
-                  paths)]
-        {:stdout (str/join "" (for [l lines :when l] (str l "\n")))
+                  pos)]
+        {:stdout (str/join "" (for [l lines :when l] (str l sep)))
          :stderr @stderr
          :exit (if @any-err? 1 0)}))))
 
@@ -2069,7 +2250,8 @@
   "POSIX printf FORMAT [ARG]...
 
    Recognised specifiers: %s %d %i %x %o %c %% with width/precision.
-   Format string is reused if there are more args than placeholders."
+   Format string is reused if there are more args than placeholders;
+   if the spec count is zero, the format prints once (no reuse)."
   [argv _fs _env]
   (let [args (rest argv)]
     (cond
@@ -2077,9 +2259,8 @@
       :else
       (let [fmt   (printf-process-escapes (first args))
             xs    (vec (rest args))
-            specs (re-seq #"%[-+# 0]*\d*(?:\.\d+)?[sdiouxXc%]" fmt)
+            specs (vec (re-seq #"%[-+# 0]*\d*(?:\.\d+)?[sdiouxXc%]" fmt))
             n     (count specs)
-            ;; Format takes a string per %s, long per %d/%x/%o/%i, etc.
             coerce
             (fn [^String spec ^String arg]
               (let [last-ch (.charAt spec (dec (count spec)))]
@@ -2092,20 +2273,26 @@
                          (try (Long/parseLong arg 16)
                               (catch Throwable _ 0))))
                   arg)))
-            ;; If no args and no specs, format runs once.
-            ;; If args, batch (count specs) per cycle.
-            cycles (if (zero? n)
-                     [[]]
-                     (mapv vec (partition-all n (concat xs (repeat (rem n (max 1 (count xs))) "")))))
             out (StringBuilder.)]
-        (doseq [batch cycles]
-          (try
-            (.append out (apply format fmt
-                                (map-indexed (fn [i a] (coerce (nth specs (mod i (max 1 n))) (str a)))
-                                             batch)))
-            (catch Throwable t
-              (.append out (printf-process-escapes fmt))
-              (binding [*err* *err*] (println "printf:" (.getMessage t))))))
+        (cond
+          (zero? n)
+          ;; No specifiers: emit format once, ignore extra args.
+          (.append out fmt)
+          :else
+          ;; Walk args in groups of `n`, emit format per group. When
+          ;; the last group is short, pad with empty strings so each
+          ;; %s slot fills cleanly (matches GNU printf).
+          (let [groups (partition-all n xs)
+                groups (if (empty? groups) [(repeat n "")] groups)]
+            (doseq [grp groups]
+              (let [batch (vec (take n (concat grp (repeat ""))))]
+                (try
+                  (.append out (apply format fmt
+                                      (map-indexed
+                                       (fn [i a] (coerce (nth specs i) (str a)))
+                                       batch)))
+                  (catch Throwable _
+                    (.append out fmt)))))))
         (ok (.toString out))))))
 
 ;; ============================================================================
@@ -2122,74 +2309,130 @@
                          (str k "=" v)))]
     (ok (if (seq out) (str out "\n") ""))))
 
+(defn- date-translate
+  "Walk the format string once, emitting each substitution. This is
+   a left-to-right pass — unlike sequential str/replace, `%%` can't
+   collide with `%S`/`%T` etc. because we consume two chars per
+   directive instead of doing global text-replace."
+  [^String fmt now cal]
+  (let [n (count fmt)
+        out (StringBuilder.)
+        d2 (fn [v] (format "%02d" v))
+        d3 (fn [v] (format "%03d" v))
+        y  (.get cal java.util.Calendar/YEAR)
+        mo (inc (.get cal java.util.Calendar/MONTH))
+        d  (.get cal java.util.Calendar/DAY_OF_MONTH)
+        h  (.get cal java.util.Calendar/HOUR_OF_DAY)
+        mi (.get cal java.util.Calendar/MINUTE)
+        s  (.get cal java.util.Calendar/SECOND)
+        j  (.get cal java.util.Calendar/DAY_OF_YEAR)]
+    (loop [i 0]
+      (when (< i n)
+        (let [c (.charAt fmt i)]
+          (cond
+            (and (= c \%) (< (inc i) n))
+            (let [d2c (.charAt fmt (inc i))]
+              (case d2c
+                \%   (do (.append out \%) (recur (+ i 2)))
+                \Y   (do (.append out (str y))      (recur (+ i 2)))
+                \m   (do (.append out (d2 mo))      (recur (+ i 2)))
+                \d   (do (.append out (d2 d))       (recur (+ i 2)))
+                \H   (do (.append out (d2 h))       (recur (+ i 2)))
+                \M   (do (.append out (d2 mi))      (recur (+ i 2)))
+                \S   (do (.append out (d2 s))       (recur (+ i 2)))
+                \j   (do (.append out (d3 j))       (recur (+ i 2)))
+                \F   (do (.append out (format "%04d-%02d-%02d" y mo d))
+                         (recur (+ i 2)))
+                \T   (do (.append out (format "%02d:%02d:%02d" h mi s))
+                         (recur (+ i 2)))
+                \s   (do (.append out (str (quot (.getTime ^java.util.Date now) 1000)))
+                         (recur (+ i 2)))
+                \n   (do (.append out \newline) (recur (+ i 2)))
+                \t   (do (.append out \tab)     (recur (+ i 2)))
+                ;; unknown directive: pass through literally
+                (do (.append out c) (.append out d2c) (recur (+ i 2)))))
+            :else
+            (do (.append out c) (recur (inc i)))))))
+    (.toString out)))
+
 (defn date-fn
   "POSIX date. With +FORMAT prints the current time per format
-   string; without args, prints a default \"Day Mon DD HH:MM:SS\" form.
+   string; without args, prints a default \"%F %T\" form.
 
-   Format directives supported: %Y %m %d %H %M %S %j %F %T %s %% (a
-   pragmatic subset agents reach for)."
+   Format directives supported: %Y %m %d %H %M %S %j %F %T %s %% %n %t
+   (a pragmatic subset; unknown directives pass through literally)."
   [argv _fs _env]
   (let [args (rest argv)
         fmt-arg (first args)
         now (java.util.Date.)
-        cal (doto (java.util.Calendar/getInstance) (.setTime now))
-        translate
-        (fn [^String f]
-          (-> f
-              (str/replace "%Y" (str (.get cal java.util.Calendar/YEAR)))
-              (str/replace "%m" (format "%02d" (inc (.get cal java.util.Calendar/MONTH))))
-              (str/replace "%d" (format "%02d" (.get cal java.util.Calendar/DAY_OF_MONTH)))
-              (str/replace "%H" (format "%02d" (.get cal java.util.Calendar/HOUR_OF_DAY)))
-              (str/replace "%M" (format "%02d" (.get cal java.util.Calendar/MINUTE)))
-              (str/replace "%S" (format "%02d" (.get cal java.util.Calendar/SECOND)))
-              (str/replace "%j" (format "%03d" (.get cal java.util.Calendar/DAY_OF_YEAR)))
-              (str/replace "%F" (format "%04d-%02d-%02d"
-                                        (.get cal java.util.Calendar/YEAR)
-                                        (inc (.get cal java.util.Calendar/MONTH))
-                                        (.get cal java.util.Calendar/DAY_OF_MONTH)))
-              (str/replace "%T" (format "%02d:%02d:%02d"
-                                        (.get cal java.util.Calendar/HOUR_OF_DAY)
-                                        (.get cal java.util.Calendar/MINUTE)
-                                        (.get cal java.util.Calendar/SECOND)))
-              (str/replace "%s" (str (quot (.getTime now) 1000)))
-              (str/replace "%%" "%")))]
+        cal (doto (java.util.Calendar/getInstance) (.setTime now))]
     (cond
       (and fmt-arg (str/starts-with? fmt-arg "+"))
-      (ok (str (translate (subs fmt-arg 1)) "\n"))
+      (ok (str (date-translate (subs fmt-arg 1) now cal) "\n"))
       :else
-      (ok (str (translate "%F %T") "\n")))))
+      (ok (str (date-translate "%F %T" now cal) "\n")))))
+
+(defn- seq-format-int? [n]
+  ;; Whole number that's representable losslessly as a long.
+  (and (== n (long n)) (Double/isFinite n)))
 
 (defn seq-fn
   "POSIX seq:
      seq LAST                start=1, step=1
      seq FIRST LAST          step=1
-     seq FIRST STEP LAST"
+     seq FIRST STEP LAST
+
+   Numbers may be integer or decimal (`seq 0.5 0.5 2.0`). -w pads
+   to equal width with leading zeros."
   [argv _fs _env]
   (let [{:keys [opts pos err]}
         (cli-parse argv [["-s" "--separator S" :default "\n"]
-                         ["-w" "--equal-width"]])]
+                         ["-w" "--equal-width"]
+                         ["-f" "--format FMT"]])]
     (cond
       err (usage-err "seq" err)
       (empty? pos) (usage-err "seq" "missing operand")
       :else
       (try
-        (let [nums (mapv #(Long/parseLong %) pos)
+        (let [nums (mapv #(Double/parseDouble %) pos)
               [start step end] (case (count nums)
-                                 1 [1 1 (first nums)]
-                                 2 [(first nums) 1 (second nums)]
+                                 1 [1.0 1.0 (first nums)]
+                                 2 [(first nums) 1.0 (second nums)]
                                  3 [(first nums) (second nums) (nth nums 2)]
                                  (throw (ex-info "too many operands" {})))
               sep (:separator opts)
               positive-step? (pos? step)
+              ;; Use a small epsilon to defend against float drift.
+              eps 1e-9
               values (loop [v start acc []]
                        (cond
                          (zero? step) acc
-                         (and positive-step? (> v end)) acc
-                         (and (not positive-step?) (< v end)) acc
-                         :else (recur (+ v step) (conj acc v))))]
-          (ok (str (str/join sep values) (when (seq values) "\n"))))
+                         (and positive-step? (> v (+ end eps))) acc
+                         (and (not positive-step?) (< v (- end eps))) acc
+                         :else (recur (+ v step) (conj acc v))))
+              all-int? (every? seq-format-int? values)
+              fmt-one (fn [v]
+                        (if all-int?
+                          (str (long v))
+                          ;; Strip trailing zeros for tidy output
+                          (let [s (format "%.10f" (double v))
+                                s (str/replace s #"0+$" "")
+                                s (str/replace s #"\.$" "")]
+                            s)))
+              rendered (mapv fmt-one values)
+              padded (if (:equal-width opts)
+                       (let [width (apply max 0 (map count rendered))]
+                         (mapv (fn [s]
+                                 ;; Java's %s spec doesn't zero-pad
+                                 ;; strings (only numerics). Manual.
+                                 (let [pad (- width (count s))]
+                                   (str (apply str (repeat (max 0 pad) "0")) s)))
+                               rendered))
+                       rendered)]
+          (ok (str (str/join sep padded) (when (seq padded) "\n"))))
         (catch Throwable t
-          (usage-err "seq" (.getMessage t)))))))
+          (usage-err "seq" (str "invalid floating point argument: "
+                                (.getMessage t))))))))
 
 ;; ============================================================================
 ;; test / [ — file-and-string predicates
@@ -2939,21 +3182,37 @@
 ;; sleep
 ;; ============================================================================
 
+(defn- parse-duration
+  "Parse `5m`, `1h`, `100ms`, `2.5s`, plain `30` (seconds) into ms.
+   Returns nil on malformed input."
+  [^String s]
+  (try
+    (let [[_ num-s unit] (re-matches #"(?i)^\s*([0-9.]+)\s*(ms|s|m|h|d)?\s*$" s)]
+      (when num-s
+        (let [n (Double/parseDouble num-s)
+              mul (case (str/lower-case (or unit "s"))
+                    "ms" 1
+                    "s"  1000
+                    "m"  60000
+                    "h"  3600000
+                    "d"  86400000)]
+          (long (* n mul)))))
+    (catch Throwable _ nil)))
+
 (defn sleep
-  "POSIX sleep. Accepts an integer or decimal number of seconds.
-   Suffix-style durations (10m, 1h) are not implemented."
+  "POSIX sleep. Accepts integer or decimal seconds; GNU-style suffix
+   durations (`5m`, `1h`, `100ms`, `2.5s`, `1d`); and multiple args
+   which sum together (per GNU)."
   [argv _fs _env]
-  (let [arg (second argv)]
+  (let [args (rest argv)]
     (cond
-      (nil? arg) (usage-err "sleep" "missing operand")
+      (empty? args) (usage-err "sleep" "missing operand")
       :else
-      (try
-        (let [secs (Double/parseDouble arg)
-              ms   (long (* secs 1000))]
-          (Thread/sleep (max 0 ms))
-          {:stdout "" :stderr "" :exit 0})
-        (catch Throwable _
-          (usage-err "sleep" (str "invalid time interval: " arg)))))))
+      (let [parsed (mapv parse-duration args)]
+        (if (some nil? parsed)
+          (usage-err "sleep" (str "invalid time interval: " (nth args (.indexOf parsed nil))))
+          (do (Thread/sleep (long (reduce + 0 parsed)))
+              {:stdout "" :stderr "" :exit 0}))))))
 
 ;; ============================================================================
 ;; Registry — the canonical builtin map
@@ -2997,6 +3256,7 @@
           "cp"       cp
           "mv"       mv
           "chmod"    chmod
+          "chown"    chown
           "ln"       ln
           "tee"      tee
           ;; text + path

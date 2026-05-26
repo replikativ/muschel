@@ -73,7 +73,7 @@
 
 (deftest sh-c-no-script-errors
   (let [r (run (mk-host) "sh -c")]
-    (is (= 2 (:exit r)))
+    (is (= 1 (:exit r)) "usage errors exit 1 (GNU coreutils convention)")
     (is (re-find #"Missing required argument" (:stderr r)))))
 
 (deftest bash-alias-works
@@ -263,9 +263,9 @@
     (is (= "HELLO\n" (:stdout r)))))
 
 (deftest tr-rejects-extra-operand-with-d
-  ;; GNU tr exits non-zero on `tr -d SET1 SET2`. We used to silently drop SET2.
+  ;; GNU tr exits 1 on `tr -d SET1 SET2`. We used to silently drop SET2.
   (let [r (run (mk-host) "echo abc | tr -d a b")]
-    (is (= 2 (:exit r)))
+    (is (= 1 (:exit r)))
     (is (re-find #"extra operand" (:stderr r)))))
 
 ;; ============================================================================

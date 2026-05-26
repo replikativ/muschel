@@ -292,6 +292,68 @@
     (is (= "1\n2\n3\n" (:stdout r)))))
 
 ;; ============================================================================
+;; Audit-bug regressions (PR #10): native-tool parity fixes
+;; ============================================================================
+
+(deftest basename-of-slash-is-slash
+  ;; POSIX: basename / returns / (was empty).
+  (let [r (run (mk-host) "basename /")]
+    (is (= 0 (:exit r)))
+    (is (= "/\n" (:stdout r)))))
+
+(deftest dirname-of-slash-is-slash
+  ;; POSIX: dirname / returns / (was .).
+  (let [r (run (mk-host) "dirname /")]
+    (is (= 0 (:exit r)))
+    (is (= "/\n" (:stdout r)))))
+
+(deftest realpath-errors-on-missing
+  ;; Was silently succeeding; should error like native realpath.
+  (let [r (run (mk-host) "realpath does-not-exist")]
+    (is (= 1 (:exit r)))
+    (is (re-find #"No such file" (:stderr r)))))
+
+(deftest realpath-m-allows-missing
+  ;; -m / --canonicalize-missing: existing-or-missing is OK.
+  (let [r (run (mk-host) "realpath -m does-not-exist")]
+    (is (= 0 (:exit r)))
+    (is (re-find #"does-not-exist" (:stdout r)))))
+
+(deftest sleep-multi-arg-sums
+  (let [start (System/currentTimeMillis)
+        r (run (mk-host) "sleep 0.02 0.03")
+        elapsed (- (System/currentTimeMillis) start)]
+    (is (= 0 (:exit r)))
+    (is (>= elapsed 40))))
+
+(deftest sleep-suffix
+  (let [r (run (mk-host) "sleep 10ms")]
+    (is (= 0 (:exit r)))))
+
+(deftest seq-floats
+  (let [r (run (mk-host) "seq 0.5 0.5 2.0")]
+    (is (= 0 (:exit r)))
+    (is (= "0.5\n1\n1.5\n2\n" (:stdout r)))))
+
+(deftest seq-w-pads
+  (let [r (run (mk-host) "seq -w 8 10")]
+    (is (= 0 (:exit r)))
+    (is (= "08\n09\n10\n" (:stdout r)))))
+
+(deftest printf-no-extra-newline
+  ;; '%s\n' applied to 3 args used to produce an extra blank line.
+  (let [r (run (mk-host) "printf '%s\\n' a b c")]
+    (is (= 0 (:exit r)))
+    (is (= "a\nb\nc\n" (:stdout r)))))
+
+(deftest date-percent-percent-no-collision
+  ;; %% used to collide with following %S/%T via sequential replace.
+  (let [r (run (mk-host) "date +%%S")]
+    (is (= 0 (:exit r)))
+    ;; Should be literal %S, not the seconds value.
+    (is (= "%S\n" (:stdout r)))))
+
+;; ============================================================================
 ;; sleep
 ;; ============================================================================
 
@@ -304,7 +366,7 @@
 
 (deftest sleep-invalid-arg
   (let [r (run (mk-host) "sleep banana")]
-    (is (= 2 (:exit r)))
+    (is (= 1 (:exit r)))
     (is (re-find #"invalid" (:stderr r)))))
 
 ;; ============================================================================

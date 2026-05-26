@@ -233,7 +233,22 @@
                                      (str->path target)
                                      (make-array java.nio.file.attribute.FileAttribute 0))
            true
-           (catch Throwable _ nil)))))
+           (catch Throwable _ nil))))
+
+  (-chown [_ path owner group]
+    (when-let [resolved (resolve* root @cwd-atom path)]
+      (let [p (str->path resolved)
+            fs-svc (-> p .getFileSystem)
+            lookup (-> fs-svc .getUserPrincipalLookupService)]
+        (try
+          (when owner
+            (Files/setOwner p (.lookupPrincipalByName lookup ^String owner)))
+          (when group
+            (let [view (Files/getFileAttributeView
+                        p java.nio.file.attribute.PosixFileAttributeView follow)]
+              (.setGroup view (.lookupPrincipalByGroupName lookup ^String group))))
+          true
+          (catch Throwable _ nil))))))
 
 (defn make
   "Construct a disk FS pinned to `root`. All paths resolve under root;
