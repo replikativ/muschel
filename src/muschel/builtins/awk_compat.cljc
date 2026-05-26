@@ -219,6 +219,17 @@
   [re ^String s]
   (some? (re-find-pos re s 0)))
 
+(defn re-full-match?
+  "True iff `re` matches `s` end-to-end (anchored, no partial). Portable
+   replacement for JVM's `(.matches (.matcher re s))`."
+  [re ^String s]
+  #?(:clj  (.matches (.matcher ^java.util.regex.Pattern re s))
+     :cljs (let [n (count s)]
+             (boolean
+              (when-let [hit (re-find-pos re s 0)]
+                (and (zero? (:start hit))
+                     (= n (:end hit))))))))
+
 (defn re-pattern-icase
   "Build a case-insensitive `re-pattern`-style regex by prepending the
    `(?i)` inline flag. Works on both Java regex and JS regex."

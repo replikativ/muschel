@@ -1091,7 +1091,7 @@
                 re    (glob->re pat')
                 base  (or (last (str/split (:path entry) #"/")) "")
                 base' (if ci? (str/lower-case base) base)]
-            (.matches (.matcher re base')))
+            (cc/re-full-match? re base'))
     :type (= (:type entry)
              (case t "f" :file "d" :dir "l" :symlink (keyword t)))
     :maxdepth (<= (:depth entry) n)
@@ -1311,7 +1311,7 @@
    - literal chars otherwise"
   [^String s]
   (let [sb (cc/sbuf)
-        n  (.length s)]
+        n  (count s)]
     (loop [i 0]
       (when (< i n)
         (let [c (.charAt s i)]
@@ -1325,28 +1325,28 @@
                 (do (.append sb c) (recur (inc i)))
                 (let [cls-name (subs s (+ i 2) end)]
                   (if-let [chars (get tr-char-classes cls-name)]
-                    (do (doseq [ch chars] (.append sb ^char ch))
+                    (do (doseq [ch chars] (.append sb ch))
                         (recur (+ end 2)))
                     (do (.append sb c) (recur (inc i)))))))
 
             ;; Escape sequence
             (and (= \\ c) (< (inc i) n))
             (if-let [[ch n-consumed] (expand-escape (.charAt s (inc i)))]
-              (do (.append sb ^char ch) (recur (+ i n-consumed)))
+              (do (.append sb ch) (recur (+ i n-consumed)))
               (do (.append sb c) (recur (inc i))))
 
             ;; Range a-z
             (and (< (+ i 2) n) (= \- (.charAt s (inc i))))
-            (let [start (int c) end (int (.charAt s (+ i 2)))]
+            (let [start (cc/char-code c)
+                  end   (cc/char-code (.charAt s (+ i 2)))]
               (if (<= start end)
                 (do (doseq [k (range start (inc end))] (.append sb (char k)))
                     (recur (+ i 3)))
                 (do (.append sb c) (recur (inc i)))))
 
             :else
-            (do (.append sb c) (recur (inc i))))))
-      )
-    (.toString sb)))
+            (do (.append sb c) (recur (inc i)))))))
+    (cc/sbstr sb)))
 
 (defn tr
   "POSIX tr, subset: SET1 SET2 transliteration; -d delete SET1;

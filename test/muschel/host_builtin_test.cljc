@@ -1,12 +1,14 @@
 (ns muschel.host-builtin-test
   "End-to-end tests through the builtin host: dispatch, refusal,
-   recursive sh -c, allowlist fallthrough."
-  (:require [clojure.test :refer [deftest is testing]]
+   recursive sh -c, allowlist fallthrough. Cross-platform: runs on
+   JVM (`host.jvm`) and Node / ClojureScript (`host.browser`)."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [muschel.builtins.posix :as posix]
             [muschel.core :as m]
             [muschel.fs.virtual :as vfs]
             [muschel.host.builtin :as hb]
-            [muschel.host.jvm :as jvm]
-            [muschel.builtins.posix :as posix]))
+            [muschel.test-helpers :as th]))
 
 (defn- mk-host
   ([] (mk-host {}))
@@ -16,7 +18,7 @@
                        {:cwd "/work"})
           allowlist #{}}}]
    (hb/make {:fs fs
-             :fallback-host (jvm/make)
+             :fallback-host (th/fallback-host)
              :builtins posix/standard-read-only
              :fallback-allowlist allowlist})))
 
@@ -62,8 +64,8 @@
 (deftest sh-c-runs-via-same-host
   (let [r (run (mk-host) "sh -c \"echo hello && cat a.txt\"")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "hello"))
-    (is (.contains ^String (:stdout r) "alpha"))))
+    (is (str/includes? (:stdout r) "hello"))
+    (is (str/includes? (:stdout r) "alpha"))))
 
 (deftest sh-c-cannot-escape-builtin-set
   ;; rm isn't a builtin nor allowlisted — bash -c can't reach it.
@@ -79,7 +81,7 @@
 (deftest bash-alias-works
   (let [r (run (mk-host) "bash -c \"echo bashing\"")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "bashing"))))
+    (is (str/includes? (:stdout r) "bashing"))))
 
 ;; ============================================================================
 ;; which — registry visibility
@@ -88,7 +90,7 @@
 (deftest which-finds-builtin
   (let [r (run (mk-host) "which cat")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "cat"))))
+    (is (str/includes? (:stdout r) "cat"))))
 
 (deftest which-misses-unknown
   (let [r (run (mk-host) "which nopenope")]
@@ -140,9 +142,9 @@
   ;; through without confusing tools.cli.
   (let [r (run (mk-host) "grep -e alpha -e gamma a.txt")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "alpha"))
-    (is (.contains ^String (:stdout r) "gamma"))
-    (is (not (.contains ^String (:stdout r) "beta")))))
+    (is (str/includes? (:stdout r) "alpha"))
+    (is (str/includes? (:stdout r) "gamma"))
+    (is (not (str/includes? (:stdout r) "beta")))))
 
 (deftest grep-word-regexp
   (let [fs (vfs/make {"/work/x.txt" "foobar\nfoo\nbarfoo"} {:cwd "/work"})
@@ -154,7 +156,7 @@
   ;; Regression: -L in stdin mode used to print `nil`.
   (let [r (run (mk-host) "echo hello | grep -L bye")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "standard input"))))
+    (is (str/includes? (:stdout r) "standard input"))))
 
 ;; ============================================================================
 ;; find
@@ -163,8 +165,8 @@
 (deftest find-lists-files
   (let [r (run (mk-host) "find .")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "a.txt"))
-    (is (.contains ^String (:stdout r) "b.txt"))))
+    (is (str/includes? (:stdout r) "a.txt"))
+    (is (str/includes? (:stdout r) "b.txt"))))
 
 (deftest find-name-filter
   (let [fs (vfs/make {"/work/foo.txt" "x"
@@ -173,16 +175,16 @@
                      {:cwd "/work"})
         r (run (mk-host {:fs fs}) "find . -name '*.txt'")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "foo.txt"))
-    (is (.contains ^String (:stdout r) "baz.txt"))
-    (is (not (.contains ^String (:stdout r) "bar.md")))))
+    (is (str/includes? (:stdout r) "foo.txt"))
+    (is (str/includes? (:stdout r) "baz.txt"))
+    (is (not (str/includes? (:stdout r) "bar.md")))))
 
 (deftest find-type-filter
   ;; Paths are relative to the root we hand find — `find .` → "./dir".
   (let [fs (vfs/make {"/work/a" "x" "/work/dir/b" "y"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "find . -type d")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "./dir"))
+    (is (str/includes? (:stdout r) "./dir"))
     (is (not (re-find #"\./a$" (:stdout r))))))
 
 (deftest find-exec-cannot-escape
@@ -205,37 +207,37 @@
   (let [fs (vfs/make {"/a" "x" "/b" "y"} {:cwd "/"})
         r (run (mk-host {:fs fs}) "find /")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "/a"))
-    (is (.contains ^String (:stdout r) "/b"))))
+    (is (str/includes? (:stdout r) "/a"))
+    (is (str/includes? (:stdout r) "/b"))))
 
 (deftest find-or-operator
   (let [fs (vfs/make {"/work/a.txt" "x" "/work/b.md" "y" "/work/c.org" "z"}
                      {:cwd "/work"})
         r (run (mk-host {:fs fs}) "find . -name '*.txt' -o -name '*.md'")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "a.txt"))
-    (is (.contains ^String (:stdout r) "b.md"))
-    (is (not (.contains ^String (:stdout r) "c.org")))))
+    (is (str/includes? (:stdout r) "a.txt"))
+    (is (str/includes? (:stdout r) "b.md"))
+    (is (not (str/includes? (:stdout r) "c.org")))))
 
 (deftest find-not-operator
   (let [fs (vfs/make {"/work/a.txt" "x" "/work/b.md" "y"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "find . -type f -not -name '*.txt'")]
     (is (= 0 (:exit r)))
-    (is (not (.contains ^String (:stdout r) "a.txt")))
-    (is (.contains ^String (:stdout r) "b.md"))))
+    (is (not (str/includes? (:stdout r) "a.txt")))
+    (is (str/includes? (:stdout r) "b.md"))))
 
 (deftest find-mindepth
   (let [fs (vfs/make {"/work/a" "x" "/work/sub/b" "y"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "find . -mindepth 2")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "sub/b"))
+    (is (str/includes? (:stdout r) "sub/b"))
     (is (not (re-find #"^\./a$" (:stdout r))))))
 
 (deftest find-iname-case-insensitive
   (let [fs (vfs/make {"/work/README.MD" "x" "/work/notes.md" "y"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "find . -iname '*.md'")]
-    (is (.contains ^String (:stdout r) "README.MD"))
-    (is (.contains ^String (:stdout r) "notes.md"))))
+    (is (str/includes? (:stdout r) "README.MD"))
+    (is (str/includes? (:stdout r) "notes.md"))))
 
 ;; ============================================================================
 ;; tr — stdin-only character transforms
@@ -304,11 +306,11 @@
   (let [fs (vfs/make {"/work/x" "a\nb\nc\n" "/work/y" "a\nB\nc\n"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "diff x y")]
     (is (= 1 (:exit r)))
-    (is (.contains ^String (:stdout r) "--- x"))
-    (is (.contains ^String (:stdout r) "+++ y"))
-    (is (.contains ^String (:stdout r) "@@ -1,3 +1,3 @@"))
-    (is (.contains ^String (:stdout r) "-b"))
-    (is (.contains ^String (:stdout r) "+B"))))
+    (is (str/includes? (:stdout r) "--- x"))
+    (is (str/includes? (:stdout r) "+++ y"))
+    (is (str/includes? (:stdout r) "@@ -1,3 +1,3 @@"))
+    (is (str/includes? (:stdout r) "-b"))
+    (is (str/includes? (:stdout r) "+B"))))
 
 (deftest diff-size-mismatch-no-IOOB
   ;; Regression: prior diff threw IndexOutOfBoundsException whenever
@@ -317,14 +319,14 @@
   (let [fs (vfs/make {"/work/x" "a\n" "/work/y" "a\nb\nc\n"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "diff x y")]
     (is (= 1 (:exit r)))
-    (is (.contains ^String (:stdout r) "+b"))
-    (is (.contains ^String (:stdout r) "+c"))))
+    (is (str/includes? (:stdout r) "+b"))
+    (is (str/includes? (:stdout r) "+c"))))
 
 (deftest diff-brief
   (let [fs (vfs/make {"/work/x" "a" "/work/y" "b"} {:cwd "/work"})
         r (run (mk-host {:fs fs}) "diff -q x y")]
     (is (= 1 (:exit r)))
-    (is (.contains ^String (:stdout r) "differ"))))
+    (is (str/includes? (:stdout r) "differ"))))
 
 ;; ============================================================================
 ;; xargs — dispatch through same host
@@ -333,9 +335,9 @@
 (deftest xargs-echo
   (let [r (run (mk-host) "echo one two three | xargs echo")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "one"))
-    (is (.contains ^String (:stdout r) "two"))
-    (is (.contains ^String (:stdout r) "three"))))
+    (is (str/includes? (:stdout r) "one"))
+    (is (str/includes? (:stdout r) "two"))
+    (is (str/includes? (:stdout r) "three"))))
 
 (deftest xargs-cannot-escape
   ;; rm isn't a builtin → xargs can't reach it either.
@@ -348,8 +350,8 @@
   ;; produce two lines on stdin so the two invocations are reachable.
   (let [r (run (mk-host) "echo -e \"one\\ntwo\" | xargs -I X echo got X")]
     (is (= 0 (:exit r)))
-    (is (.contains ^String (:stdout r) "got one"))
-    (is (.contains ^String (:stdout r) "got two"))))
+    (is (str/includes? (:stdout r) "got one"))
+    (is (str/includes? (:stdout r) "got two"))))
 
 (deftest xargs-no-run-if-empty
   ;; -r / --no-run-if-empty: when stdin produces no tokens, skip the

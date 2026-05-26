@@ -1,18 +1,13 @@
 (ns muschel.trace-test
-  "Tests for the trace introspection layer."
+  "Tests for the trace introspection layer. Cross-platform: runs on
+   JVM (`host.jvm`) and Node / ClojureScript (`host.browser`)."
   (:require [clojure.test :refer [deftest is testing]]
-            [muschel.builtins.posix :as posix]
             [muschel.core :as m]
-            [muschel.fs.virtual :as vfs]
-            [muschel.host.builtin :as hb]
-            [muschel.host.jvm :as jvm]))
+            [muschel.test-helpers :as th]))
 
 (defn- mk-host
-  ([] (mk-host {}))
-  ([files]
-   (hb/make {:fs (vfs/make (or files {}) {:cwd "/"})
-             :fallback-host (jvm/make)
-             :builtins posix/standard})))
+  ([] (th/mk-host))
+  ([files] (th/mk-host {:files (or files {})})))
 
 ;; ============================================================================
 ;; Bounded accumulator

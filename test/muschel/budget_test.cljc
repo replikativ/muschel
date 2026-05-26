@@ -2,20 +2,15 @@
   "Resource-budget tests. Each test installs an interrupt-fn that
    aborts after a known number of invocations / known wall-clock
    delay, runs a script that would otherwise loop forever or eat
-   bytes, and asserts the throw fires."
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
-            [muschel.builtins.posix :as posix]
+   bytes, and asserts the throw fires.
+
+   Cross-platform: runs on JVM and Node / ClojureScript."
+  (:require [clojure.test :refer [deftest is testing]]
             [muschel.budget :as bud]
             [muschel.core :as m]
-            [muschel.fs.virtual :as vfs]
-            [muschel.host.builtin :as hb]
-            [muschel.host.jvm :as jvm]))
+            [muschel.test-helpers :as th]))
 
-(defn- mk-host []
-  (hb/make {:fs (vfs/make {} {:cwd "/"})
-            :fallback-host (jvm/make)
-            :builtins posix/standard}))
+(defn- mk-host [] (th/mk-host))
 
 (deftest step-interrupt-fires
   (testing "step-interrupt aborts after N invocations"
@@ -27,7 +22,7 @@
                 "i=0; while [ \"$i\" -lt 1000 ]; do i=$((i+1)); done"
                 {:host host :interrupt-fn ifn})
                nil
-               (catch clojure.lang.ExceptionInfo e e))]
+               (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e e))]
       (is (some? ex)
           "step-interrupt should have aborted the infinite-ish loop")
       (when ex
@@ -43,7 +38,7 @@
                 "while true; do :; done"
                 {:host host :timeout-ms 50})
                nil
-               (catch clojure.lang.ExceptionInfo e e))]
+               (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e e))]
       (is (some? ex)
           "infinite while-loop should have been aborted by timeout")
       (when ex
@@ -55,10 +50,7 @@
     (let [;; Pre-seed a VFS file with N lines so awk reads from a file
           ;; (no seq-piped allocation that could trip budgets first).
           input-lines (apply str (for [i (range 1000)] (str i "\n")))
-          fs (vfs/make {"/input.txt" input-lines} {:cwd "/"})
-          host (hb/make {:fs fs
-                        :fallback-host (jvm/make)
-                        :builtins posix/standard})
+          host (th/mk-host {:files {"/input.txt" input-lines}})
           ex (try
                (m/run-and-capture
                 (m/new-env)
@@ -66,7 +58,7 @@
                 {:host host
                  :interrupt-fn (bud/step-interrupt 20)})
                nil
-               (catch clojure.lang.ExceptionInfo e e))]
+               (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e e))]
       (is (some? ex)
           "awk's per-record loop should have been aborted")
       (when ex (is (bud/budget-exceeded? ex))))))
@@ -81,7 +73,7 @@
                 {:host host
                  :interrupt-fn (bud/step-interrupt 10)})
                nil
-               (catch clojure.lang.ExceptionInfo e e))]
+               (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e e))]
       (is (some? ex) "awk for-loop should have been aborted")
       (when ex (is (bud/budget-exceeded? ex))))))
 
