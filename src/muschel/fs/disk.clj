@@ -81,11 +81,25 @@
 
 (defn- ^Path lex-normalize
   "Lexical absolute + .. collapse, no real-disk lookup. Returns nil for
-   ~/-prefixed paths (muschel.expand handles those upstream)."
-  [^String cwd ^String path]
+   ~/-prefixed paths (muschel.expand handles those upstream).
+
+   The sandbox presents itself rooted at `/` (pwd/realpath report jail-relative
+   paths), so an ABSOLUTE path — `/`, `/src` — that the agent types is a
+   SANDBOX-absolute path and must be re-rooted under the disk `root`, NOT the
+   host filesystem root. But the exec/env layer ALSO feeds back host-absolute
+   cwd paths (`<root>/…`), which are already correct — re-rooting those would
+   double them. So re-root IDEMPOTENTLY: a path already at/under root is kept;
+   anything else absolute is treated as sandbox-absolute and joined under root.
+   Normalizing afterwards keeps `..` from escaping (any climb above root is
+   caught by the inside?-check in resolve*)."
+  [^Path root ^String cwd ^String path]
   (when (and (string? path) (not (str/blank? path)))
-    (let [base (cond
-                 (starts-with-str path "/")  (str->path path)
+    (let [root-str (str root)
+          base (cond
+                 (or (= path root-str)
+                     (starts-with-str path (str root-str "/")))
+                 (str->path path)                       ;; host-absolute, under root — keep
+                 (starts-with-str path "/")  (str->path (str root-str path))  ;; sandbox-absolute — re-root
                  (starts-with-str path "~/") nil
                  :else                       (str->path (str cwd "/" path)))]
       (when base
@@ -103,7 +117,7 @@
    path escapes the sandbox or is malformed. The returned path is
    guaranteed to be inside root."
   [^Path root ^String cwd ^String path]
-  (when-let [normalized (lex-normalize cwd path)]
+  (when-let [normalized (lex-normalize root cwd path)]
     (let [real (safe-real-path normalized)]
       (cond
         ;; Whole-path exists and is real — straightforward.
@@ -332,7 +346,9 @@
    (let [canonical (canonical-root root)
          root-str  (str canonical)
          init-cwd  (or cwd root-str)
-         ;; Resolve initial cwd against root to enforce containment.
+         ;; Resolve initial cwd against root to enforce containment. The cwd is
+         ;; a host-absolute path already under root, so resolve*'s re-rooting is
+         ;; idempotent on it (see lex-normalize).
          resolved-cwd (resolve* canonical root-str init-cwd)]
      (when-not resolved-cwd
        (throw (ex-info "Initial :cwd is outside :root"

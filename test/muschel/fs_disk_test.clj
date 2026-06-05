@@ -35,15 +35,19 @@
 ;; Containment — the safety guarantee
 ;; ============================================================================
 
-(deftest disk-fs-rejects-absolute-outside-root
+(deftest disk-fs-absolute-paths-are-jail-relative
   (let [root (mk-tmp-dir)
         _    (write-file! root "a.txt" "ok")
         fs   (disk/make root)]
-    ;; /etc/passwd exists on every Linux box, but our FS is rooted at `root`,
-    ;; so it must return nil and read-file must fail.
-    (is (nil? (fs/resolve   fs "/etc/passwd")))
-    (is (nil? (fs/read-file fs "/etc/passwd")))
-    (is (not (fs/exists?    fs "/etc/passwd")))))
+    ;; The sandbox is rooted at `/`, so an absolute path is JAIL-relative:
+    ;; `/etc/passwd` means `<root>/etc/passwd` (which doesn't exist) and never
+    ;; reaches the host's real /etc/passwd — read-file/exists? confirm that.
+    (is (= (str root "/etc/passwd") (fs/resolve fs "/etc/passwd"))
+        "absolute path re-roots under the sandbox root, not the host root")
+    (is (nil? (fs/read-file fs "/etc/passwd")) "host /etc/passwd is unreachable")
+    (is (not (fs/exists?    fs "/etc/passwd")))
+    ;; A jail-absolute path resolves a file at the sandbox root.
+    (is (= "ok" (fs/read-file fs "/a.txt")) "jail-absolute path reaches root file")))
 
 (deftest disk-fs-rejects-traversal-past-root
   (let [root (mk-tmp-dir)
