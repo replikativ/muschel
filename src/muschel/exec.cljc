@@ -365,11 +365,11 @@
                      args)]
     (do (write-line opts :err (str "invalid option: \"" bad "\"\n"))
         (env/record-exit env 2))
-    (let [raw (:cwd env)
-          shown (if-let [fs (:fs env)]
-                  (mfs/sandbox-relativize fs raw)
-                  raw)]
-      (write-line opts :out (str shown "\n"))
+    ;; env :cwd is sandbox-relative throughout (DiskFS' -cwd returns
+    ;; sandbox paths, env/cd stores them, exec syncs via fs/cwd).
+    ;; No display translation needed.
+    (let [raw (:cwd env)]
+      (write-line opts :out (str raw "\n"))
       (env/record-exit env 0))))
 
 (defn- builtin-echo

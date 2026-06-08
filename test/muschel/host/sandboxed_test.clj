@@ -80,13 +80,14 @@
     (spawn! h {:cmd "ls"})
     (is (= "/home/agent" (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
 
-(deftest chdir-strips-real-disk-prefix-prepends-mount
-  ;; muschel's env :cwd is typically the canonical real-disk path of
-  ;; the workspace; the decorator translates it back to the sandbox
-  ;; view by stripping the bind source and prepending mount-at.
+(deftest chdir-passes-sandbox-dir-through
+  ;; Under the sandbox-space FS protocol contract, :dir is already
+  ;; sandbox-shaped (env :cwd is sandbox; the OS-spawn boundary
+  ;; translation happens in JvmHost via fs/physical-path). The
+  ;; decorator just plumbs it into bwrap's --chdir.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :dir "/tmp/sbx/home/agent/work"})
+    (spawn! h {:cmd "ls" :dir "/home/agent/work"})
     (is (= "/home/agent/work"
            (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
 
@@ -99,18 +100,18 @@
     (is (= "/home/agent/x"
            (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
 
-(deftest dir-equal-to-bind-source-maps-to-mount-at
-  ;; :dir = <bind-root>/home/agent → --chdir /home/agent.
+(deftest dir-at-mount-root-is-mount-at
+  ;; :dir = mount-at (the agent's HOME) → --chdir /home/agent.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :dir "/tmp/sbx/home/agent"})
+    (spawn! h {:cmd "ls" :dir "/home/agent"})
     (is (= "/home/agent" (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
 
 (deftest dir-is-consumed-not-passed-through
   ;; bwrap handles cwd via --chdir; the wrapped host should see no :dir.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :dir "/tmp/sbx/home/agent"})
+    (spawn! h {:cmd "ls" :dir "/home/agent"})
     (is (nil? (:dir @recorded)))))
 
 ;; ============================================================================
@@ -134,13 +135,13 @@
   ;; / (no nested home/agent subdir).
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx" :mount-at "/"})]
-    (spawn! h {:cmd "ls" :dir "/tmp/sbx/sub"})
+    (spawn! h {:cmd "ls" :dir "/sub"})
     (let [argv (vec (recorded-cmd+args recorded))]
       (is (= "/tmp/sbx" (value-after argv "--bind"))
           "bind source is bind-root itself when mount-at = /")
       (is (= "/" (nth argv (+ 2 (.indexOf ^java.util.List argv "--bind")))))
       (is (= "/sub" (value-after argv "--chdir"))
-          "chdir is sandbox-relative under /, same as the pre-mount-at behavior"))))
+          ":dir is sandbox-shaped and passes through to --chdir"))))
 
 ;; ============================================================================
 ;; Networking + binds + cgroups

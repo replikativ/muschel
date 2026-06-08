@@ -52,9 +52,10 @@
     ;; With :mount-at "/", the sandbox is rooted at `/`, so an absolute
     ;; path is JAIL-relative: `/etc/passwd` means `<root>/etc/passwd`
     ;; (which doesn't exist) and never reaches the host's real
-    ;; /etc/passwd — read-file/exists? confirm that.
-    (is (= (str root "/etc/passwd") (fs/resolve fs "/etc/passwd"))
-        "absolute path re-roots under the sandbox root, not the host root")
+    ;; /etc/passwd. resolve now returns sandbox-relative; the
+    ;; equivalent observable check is read/exists.
+    (is (= "/etc/passwd" (fs/resolve fs "/etc/passwd"))
+        "absolute path resolves to the sandbox-relative form, jailed under root")
     (is (nil? (fs/read-file fs "/etc/passwd")) "host /etc/passwd is unreachable")
     (is (not (fs/exists?    fs "/etc/passwd")))
     ;; A jail-absolute path resolves a file at the sandbox root.
@@ -109,11 +110,11 @@
         fs (disk/make wrapper)]
     (is (.exists (io/file wrapper "home/agent"))
         "construction auto-creates <wrapper>/home/agent")
+    (is (= "/home/agent" (fs/cwd fs))
+        "cwd is the sandbox-relative mount path")
     (is (= (str wrapper "/home/agent")
-           (fs/cwd fs))
-        "cwd defaults to the internal real-root")
-    (is (= "/home/agent" (fs/sandbox-relativize fs (fs/cwd fs)))
-        "sandbox display strips the host prefix and prepends mount-at")))
+           (fs/physical-path fs "/home/agent"))
+        "-physical-path translates sandbox → real-disk for OS-spawn boundary")))
 
 (deftest disk-fs-mount-at-paths-resolve-under-mount
   (let [wrapper (mk-tmp-dir)
@@ -125,15 +126,41 @@
         "relative against default cwd (mount root) reaches the file")))
 
 (deftest disk-fs-paths-outside-mount-are-unreachable
-  ;; With default mount-at /home/agent, paths above the mount
-  ;; (`/`, `/etc/...`, `/home/something-else`) resolve to nil. They
-  ;; only become visible through an OS sandbox like bwrap.
+  ;; With default mount-at /home/agent, paths under the mount resolve
+  ;; normally. Ancestor paths (/, /home) resolve as virtual
+  ;; directories — see disk-fs-ancestor-view below. Sibling paths
+  ;; (/etc/passwd, /home/somethingelse) are outside both and resolve
+  ;; to nil; reads return nil.
   (let [wrapper (mk-tmp-dir)
         fs (disk/make wrapper)]
-    (is (nil? (fs/resolve fs "/")) "/ above mount returns nil")
     (is (nil? (fs/resolve fs "/etc/passwd")))
     (is (nil? (fs/resolve fs "/home/somethingelse")))
     (is (nil? (fs/read-file fs "/etc/passwd")))))
+
+(deftest disk-fs-ancestor-view
+  ;; Strict prefixes of mount-at are virtual read-only directories.
+  ;; `cd /` works, `stat /` reports a dir, `list-dir /` returns just
+  ;; the next segment toward the mount. Writes return nil.
+  (let [wrapper (mk-tmp-dir)
+        fs (disk/make wrapper)]
+    (is (= "/" (fs/resolve fs "/")))
+    (is (= "/home" (fs/resolve fs "/home")))
+    (is (= :dir (:type (fs/stat fs "/"))))
+    (is (= :dir (:type (fs/stat fs "/home"))))
+    (is (true? (fs/exists? fs "/")))
+    (is (= [{:name "home" :type :dir :size 0 :mtime-ms 0}]
+           (fs/list-dir fs "/"))
+        "ls / shows only the path toward the mount")
+    (is (= [{:name "agent" :type :dir :size 0 :mtime-ms 0}]
+           (fs/list-dir fs "/home")))
+    (is (some? (fs/cd! fs "/")))
+    (is (= "/" (fs/cwd fs)))
+    (is (some? (fs/cd! fs "/home")))
+    (is (= "/home" (fs/cwd fs)))
+    (is (some? (fs/cd! fs "/home/agent")))
+    ;; Writes anywhere above the mount are silently refused.
+    (is (nil? (fs/-open-sink fs "/probe.txt" false)))
+    (is (nil? (fs/-mkdir fs "/probe-dir")))))
 
 (deftest disk-fs-rejects-bad-mount-at
   (let [wrapper (mk-tmp-dir)]

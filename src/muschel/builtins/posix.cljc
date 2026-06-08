@@ -149,10 +149,10 @@
 (defn pwd
   "POSIX pwd. -L and -P are accepted but currently treat the env's
    logical cwd as both — the muschel session tracks logical cwd.
-   Output is sandbox-relativised (so a disk-backed FS doesn't leak the
-   host mount prefix)."
+   fs/cwd is sandbox-relative by protocol contract, so no display
+   translation is needed."
   [_argv fs _env]
-  (ok (str (fs/sandbox-relativize fs (fs/cwd fs)) "\n")))
+  (ok (str (fs/cwd fs) "\n")))
 
 ;; ============================================================================
 ;; echo
@@ -2363,17 +2363,18 @@
             sep      (if (:zero opts) "\0" "\n")
             lines
             (mapv (fn [p]
+                    ;; fs/resolve already returns the sandbox-relative
+                    ;; canonical path (or nil). No display translation.
                     (if-let [resolved (fs/resolve fs p)]
-                      (let [sandbox (fs/sandbox-relativize fs resolved)]
-                        (cond
-                          ;; -m: accept whatever resolves, even if missing.
-                          (:canonicalize-missing opts) sandbox
-                          ;; Default + -e: refuse if it doesn't exist.
-                          (fs/exists? fs p) sandbox
-                          :else
-                          (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
-                              (vreset! any-err? true)
-                              nil)))
+                      (cond
+                        ;; -m: accept whatever resolves, even if missing.
+                        (:canonicalize-missing opts) resolved
+                        ;; Default + -e: refuse if it doesn't exist.
+                        (fs/exists? fs p) resolved
+                        :else
+                        (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
+                            (vreset! any-err? true)
+                            nil))
                       (do (vswap! stderr str "realpath: " p ": No such file or directory\n")
                           (vreset! any-err? true)
                           nil)))

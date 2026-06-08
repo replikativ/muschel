@@ -314,9 +314,14 @@
         (contains? builtins cmd)
         (invoke-builtin! this fb (get builtins cmd) opts (:fs this))
 
-        ;; Explicitly allowlisted system tool: delegate.
+        ;; Explicitly allowlisted system tool: delegate to the
+        ;; fallback host. Thread `:fs` through so JvmHost (or any
+        ;; fallback that needs to chdir on real disk) can translate
+        ;; the sandbox-shaped :dir to a physical path. SandboxedHost
+        ;; ignores :fs (it consumes the sandbox path directly for
+        ;; bwrap's --chdir).
         (contains? allow cmd)
-        (host/-spawn fb opts)
+        (host/-spawn fb (assoc opts :fs (:fs this)))
 
         ;; Refuse anything else.
         :else

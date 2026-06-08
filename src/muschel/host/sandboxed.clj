@@ -103,29 +103,14 @@
     (str/replace bind-root #"/+$" "")
     (str (str/replace bind-root #"/+$" "") mount-at)))
 
-(defn- translate-cwd
-  "Map a spawn :dir into a sandbox-relative `--chdir` argument.
-
-   muschel's env :cwd is inconsistent — sometimes the canonical
-   real-disk path of the agent workspace (DiskFS syncs to it),
-   sometimes a sandbox-relative path the agent typed (after
-   `cd /home/agent/sub` the env stores `/home/agent/sub`). We
-   handle both:
-
-   - dir = bind-source             → `<mount-at>` (workspace root)
-   - dir starts with bind-source/  → strip prefix, prepend mount-at
-   - dir starts with `/`           → assume already sandbox-relative,
-                                     pass through unchanged
-   - anything else / nil           → `<mount-at>` (workspace root)"
-  [^String bind-source ^String mount-at ^String dir]
-  (cond
-    (or (nil? dir) (= "" dir))       mount-at
-    (= dir bind-source)              mount-at
-    (.startsWith dir (str bind-source "/"))
-    (let [tail (subs dir (count bind-source))]
-      (if (= "/" mount-at) tail (str mount-at tail)))
-    (.startsWith dir "/")            dir
-    :else                            mount-at))
+(defn- chdir-arg
+  "Map a spawn :dir into bwrap's `--chdir` value. With the sandbox-
+   space FS protocol, `:dir` is already a sandbox path; we pass it
+   through and default to the mount root when absent."
+  [^String mount-at dir]
+  (if (and (string? dir) (not (str/blank? dir)))
+    dir
+    mount-at))
 
 (defn- bwrap-argv
   "Construct the bwrap arg vector preceding `-- cmd args`."
@@ -143,7 +128,7 @@
       (extra-bind-args extra-binds)
       (when (= :off net) ["--unshare-net"])
       ["--unshare-pid" "--die-with-parent"
-       "--chdir" (translate-cwd src mount-at dir)]
+       "--chdir" (chdir-arg mount-at dir)]
       ["--"]))))
 
 (defn- cgroup-enabled? [{:keys [mem-max cpu-quota tasks-max]}]

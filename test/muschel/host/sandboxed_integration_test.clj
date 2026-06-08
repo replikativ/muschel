@@ -148,9 +148,11 @@
       (is (= "persisted\n" (slurp (io/file wrapper "home/agent/written.txt"))))
       (finally (bbfs/delete-tree wrapper)))))
 
-(deftest-bwrap chdir-translates-real-disk-path-to-sandbox
-  ;; muschel passes :dir = <wrapper>/home/agent/work (DiskFS-real
-  ;; path); bwrap must --chdir to /home/agent/work.
+(deftest-bwrap chdir-receives-sandbox-dir
+  ;; Under the sandbox-space FS contract, run-external passes
+  ;; sandbox-shaped :dir straight to bwrap's --chdir. The end-to-end
+  ;; result: `pwd` inside the spawned process reports the sandbox
+  ;; path the agent was at.
   (let [wrapper (mk-sandbox)
         _ (bbfs/create-dirs (io/file wrapper "home/agent/work"))
         sbox (sb/make {:wrapped (jvm/make) :bind-root wrapper})
@@ -158,7 +160,7 @@
         out (host/-string-sink inner)
         err (host/-string-sink inner)
         r (host/-spawn sbox {:cmd "pwd"
-                             :dir (str wrapper "/home/agent/work")
+                             :dir "/home/agent/work"
                              :out out :err err})
         _ ((:wait r))]
     (try

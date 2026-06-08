@@ -96,7 +96,10 @@
       r))
 
   (-sandbox-relativize [_ p]
-    (fs/-sandbox-relativize inner p)))
+    (fs/-sandbox-relativize inner p))
+
+  (-physical-path [_ sandbox-path]
+    (fs/-physical-path inner sandbox-path)))
 
 (defn wrap
   "Wrap `inner-fs` so every protocol call records an event into
