@@ -180,6 +180,107 @@
     (is (= :allow (:decision (check "docker run nginx:1.27" {:rulesets rs}))))
     (is (not= :allow (:decision (check "docker run nginx:latest-evil" {:rulesets rs}))))))
 
+;; Helper: matched? checks whether the user's rule actually fired (vs falling
+;; through to the prompter). When no rule matches, :matched-rule is nil; we
+;; use a permissive prompter so the final decision tells us nothing.
+(defn- matched-action
+  "Return the action of the rule that matched `src` under `rs`, or :ask
+   if none matched (decided by the prompter)."
+  [src rs]
+  (let [r (check src {:rulesets rs
+                      :prompter (fn [_] {:result :allow-once})})
+        rule (some-> r :prompted first :matched-rule)]
+    (cond
+      rule                  (:action rule)
+      (seq (:prompted r))   :ask
+      :else                 (:decision r))))
+
+(deftest argv-flags-any-of
+  ;; Deny `rm` if ANY of -r/-R/--recursive shows up anywhere in argv.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["rm"]
+                        :any-of #{"-r" "-R" "--recursive"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "rm -r /tmp/x" rs)))
+    (is (= :deny (matched-action "rm -R /tmp/x" rs)))
+    (is (= :deny (matched-action "rm --recursive /tmp/x" rs)))
+    (is (= :deny (matched-action "rm -rf /tmp/x" rs)))    ; cluster split
+    (is (= :deny (matched-action "rm -fR /tmp/x" rs)))
+    (is (= :deny (matched-action "rm /tmp/x -r" rs)))     ; flag AFTER positional
+    (is (= :ask  (matched-action "rm /tmp/x" rs)))
+    (is (= :ask  (matched-action "rm -f /tmp/x" rs)))))   ; -f alone, no -r
+
+(deftest argv-flags-all-of-plus-any-of
+  ;; git clean: dangerous only when -f is combined with -d or -x.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["git" "clean"]
+                        :all-of #{"-f"}
+                        :any-of #{"-d" "-x"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "git clean -fd"     rs)))
+    (is (= :deny (matched-action "git clean -df"     rs)))
+    (is (= :deny (matched-action "git clean -f -d"   rs))) ; split clusters
+    (is (= :deny (matched-action "git clean -d -f"   rs))) ; order-insensitive
+    (is (= :deny (matched-action "git clean -fdx"    rs)))
+    (is (= :ask  (matched-action "git clean -f"      rs))) ; missing :any-of
+    (is (= :ask  (matched-action "git clean -d"      rs))))) ; missing :all-of
+
+(deftest argv-flags-none-of
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["docker" "run"]
+                        :none-of #{"--privileged"}}
+              :action :allow}]]]
+    (is (= :allow (matched-action "docker run nginx"          rs)))
+    (is (= :allow (matched-action "docker run --rm -it nginx" rs)))
+    (is (= :ask   (matched-action "docker run --privileged nginx" rs)))))
+
+(deftest argv-flags-long-with-equals
+  ;; `--prefix=/x` strips =/x → contributes `"--prefix"` to the set.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["npm" "install"]
+                        :any-of #{"--prefix"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "npm install --prefix=/tmp" rs)))
+    (is (= :deny (matched-action "npm install --prefix /tmp" rs)))
+    (is (= :ask  (matched-action "npm install lodash"        rs)))))
+
+(deftest argv-flags-double-dash-terminates
+  ;; After `--`, tokens are positional, not flags.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["rm"]
+                        :any-of #{"-r"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "rm -r foo"     rs)))
+    (is (= :ask  (matched-action "rm -- -r"      rs)))    ; -r is a filename
+    (is (= :ask  (matched-action "rm -- foo -r"  rs)))))
+
+(deftest argv-flags-numeric-not-split
+  ;; `-9` (kill signal) etc. should NOT be split letter-by-letter. The
+  ;; cluster rule only splits letter clusters; non-letter content stays
+  ;; as a single opaque flag token.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["kill"]
+                        :any-of #{"-9"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "kill -9 1234"  rs)))
+    (is (= :ask  (matched-action "kill -15 1234" rs)))))
+
+(deftest argv-flags-dynamic-fails-closed
+  ;; If a tail token is dynamic ($cmd), the matcher can't decide. The
+  ;; deny rule must NOT fire silently — call falls through to ask.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["rm"]
+                        :any-of #{"-r"}}
+              :action :deny}]]]
+    (is (= :ask (matched-action "rm $FLAG file" rs)))))
+
 (deftest ast-pred-matcher
   ;; Allow any call whose first arg starts with "git" (a fake-prefix pred)
   (let [rs [[{:tool :bash

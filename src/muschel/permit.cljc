@@ -39,6 +39,23 @@
        regex (`re-find` must match). Length must match exactly unless
        the last element is `:**`.
 
+   - `{:kind :argv-flags :head [\"rm\"] :any-of #{\"-r\" \"--recursive\"}}`
+       Order-INSENSITIVE flag match. `:head` is an ordered prefix (same
+       semantics as `:argv-vec`); the tail is normalised into a *set* of
+       flag tokens, then tested against:
+         `:any-of`  — at least one element must appear in the tail
+         `:all-of`  — every element must appear in the tail
+         `:none-of` — no element may appear in the tail
+       At least one of those keys must be present. Tail normalisation:
+       `--foo=bar` → `\"--foo\"`; `-rf` → `\"-r\"` + `\"-f\"`
+       (POSIX short clusters of letters); `--` terminates option
+       parsing (everything after is positional, not added to the set);
+       bare `-` and non-`-` tokens are positional, ignored. Use this for
+       \"flag X anywhere in argv\" rules where `:argv-shape` would have
+       to enumerate every position. If any tail token is dynamic (e.g.
+       `$cmd`), the matcher fails closed → the call falls through to
+       the prompter, same as `:argv-vec` for dynamic args.
+
    - `{:kind :ast-pred :pred (fn [call-node] ...)}`
        Full predicate over the AST node. Escape hatch for anything the
        data forms can't express.
@@ -154,10 +171,84 @@
                  (every? true?
                          (map shape-elt-matches? head argv))))))
 
+;; ---- :argv-flags helpers ----------------------------------------------------
+
+(defn- letters-only? [^String s]
+  (and (pos? (count s))
+       #?(:clj  (every? #(Character/isLetter ^Character %) s)
+          :cljs (boolean (re-matches #"[A-Za-z]+" s)))))
+
+(defn- short-cluster->flags
+  "Split a POSIX short-flag cluster like `-rf` into `[\"-r\" \"-f\"]`.
+   If the cluster contains non-letters (e.g. `-2`, `-o=foo`), return
+   the token unchanged — we don't have an option spec, so don't guess."
+  [^String t]
+  (let [rest-chars (subs t 1)]
+    (if (letters-only? rest-chars)
+      (mapv #(str "-" %) rest-chars)
+      [t])))
+
+(defn- token->flag-tokens
+  "Normalise one argv token into the flag tokens it contributes to the
+   tail flag-set. nil for positional / non-flag tokens."
+  [^String t]
+  (cond
+    (or (= t "-") (not (str/starts-with? t "-"))) nil
+    (str/starts-with? t "--") [(first (str/split t #"=" 2))]
+    :else (short-cluster->flags t)))
+
+(defn argv->flag-set
+  "Normalise an argv tail into the set of flag tokens it carries.
+   Stops at `--` (POSIX option terminator). Returns nil if any token
+   is itself nil — caller treats that as 'can't decide, match fails'.
+
+   Examples (the tail does NOT include the command name):
+     [\"-rf\" \"/tmp\"]            => #{\"-r\" \"-f\"}
+     [\"--force\" \"--prefix=/x\"] => #{\"--force\" \"--prefix\"}
+     [\"--\" \"-r\"]               => #{}        ; -r is positional after --
+     [nil \"-r\"]                  => nil"
+  [tail]
+  (loop [in tail
+         acc #{}]
+    (if (empty? in)
+      acc
+      (let [t (first in)]
+        (cond
+          (nil? t)   nil
+          (= t "--") acc
+          :else      (recur (rest in) (into acc (token->flag-tokens t))))))))
+
+(defn- head-prefix-matches?
+  "Like argv-matches-vec? but used to check just the ordered head of
+   an `:argv-flags` rule."
+  [argv head]
+  (and (>= (count argv) (count head))
+       (every? true?
+               (map (fn [r a]
+                      (cond
+                        (nil? a) false
+                        (set? r) (contains? r a)
+                        :else    (= r a)))
+                    head argv))))
+
+(defn- argv-matches-flags?
+  "Flag-set match. `head` is an ordered prefix; the tail (everything
+   after) is normalised to a flag set and compared against any-of /
+   all-of / none-of. At least one constraint must be present."
+  [argv {:keys [head any-of all-of none-of]}]
+  (and (head-prefix-matches? argv head)
+       (or any-of all-of none-of)
+       (let [tail (drop (count head) argv)
+             flags (argv->flag-set tail)]
+         (and (some? flags)
+              (or (nil? any-of)  (boolean (some flags any-of)))
+              (or (nil? all-of)  (every? flags all-of))
+              (or (nil? none-of) (not-any? flags none-of))))))
+
 (defn rule-matches?
   "True if `rule`'s pattern matches `call`."
   [rule call]
-  (let [{:keys [kind name vec glob shape pred]} (:pattern rule)
+  (let [{:keys [kind name vec glob shape pred] :as pattern} (:pattern rule)
         cmd-name (call->cmd-name call)
         argv (call->argv call)]
     (case kind
@@ -165,6 +256,7 @@
       :argv-glob  (argv-matches-glob? argv glob)
       :argv-vec   (argv-matches-vec? argv vec)
       :argv-shape (argv-matches-shape? argv shape)
+      :argv-flags (argv-matches-flags? argv pattern)
       :ast-pred   (try (boolean (pred call)) (catch #?(:clj Throwable :cljs :default) _ false))
       false)))
 

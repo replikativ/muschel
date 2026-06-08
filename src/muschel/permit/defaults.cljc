@@ -41,8 +41,6 @@
   ["status" "log" "diff" "show" "branch" "describe" "rev-parse"
    "ls-files" "ls-tree"])
 
-(def ^:private deny-rm-flags
-  ["-rf" "-fr" "-Rf" "-r" "-R"])
 
 (def default-rules
   (vec
@@ -74,11 +72,14 @@
                  "exec"   "replaces shell"
                  "destructive command")})
 
-      ;; rm with destructive flags
-    (for [f deny-rm-flags]
-      {:tool :bash :pattern {:kind :argv-vec :vec ["rm" f]}
-       :action :deny :origin :default
-       :reason "recursive force delete"})
+      ;; rm with a recursive flag in ANY position (incl. trailing flags,
+      ;; long-form, or split clusters like `rm -r -f /tmp`).
+    [{:tool :bash
+      :pattern {:kind :argv-flags
+                :head ["rm"]
+                :any-of #{"-r" "-R" "--recursive"}}
+      :action :deny :origin :default
+      :reason "recursive delete"}]
 
       ;; Filesystem-format glob
     [{:tool :bash :pattern {:kind :argv-glob :glob "mkfs.*"}
@@ -92,27 +93,27 @@
       ;; tail open). Use it to allow a broad command BUT deny a
       ;; specific dangerous combination — last-match-wins layering.
 
-      ;; git push: allow, but force-flavours deny.
+      ;; git push: allow, but force-flavours deny — order-insensitive,
+      ;; so `git push origin --force main` is caught too.
      {:tool :bash :pattern {:kind :argv-shape
                             :shape ["git" "push" :**]}
       :action :allow :origin :default
       :reason "publish commits"}
-     {:tool :bash :pattern {:kind :argv-shape
-                            :shape ["git" "push" #{"-f" "--force" "--force-with-lease"} :**]}
-      :action :deny :origin :default
-      :reason "force-push rewrites remote history"}
-     {:tool :bash :pattern {:kind :argv-shape
-                            :shape ["git" "push" :* #{"-f" "--force" "--force-with-lease"} :**]}
+     {:tool :bash :pattern {:kind :argv-flags
+                            :head ["git" "push"]
+                            :any-of #{"-f" "--force" "--force-with-lease"}}
       :action :deny :origin :default
       :reason "force-push rewrites remote history"}
 
-      ;; git reset --hard / git clean -fd: history / working-tree wipes
+      ;; git reset --hard / git clean -f -d: history / working-tree wipes.
      {:tool :bash :pattern {:kind :argv-shape
                             :shape ["git" "reset" "--hard" :**]}
       :action :deny :origin :default
       :reason "discards uncommitted work"}
-     {:tool :bash :pattern {:kind :argv-shape
-                            :shape ["git" "clean" #{"-fd" "-fdx" "-fx" "-df"} :**]}
+     {:tool :bash :pattern {:kind :argv-flags
+                            :head ["git" "clean"]
+                            :all-of #{"-f"}
+                            :any-of #{"-d" "-x"}}
       :action :deny :origin :default
       :reason "deletes untracked files"}
 
