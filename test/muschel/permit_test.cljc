@@ -293,6 +293,23 @@
     (is (= :deny (:decision r))
         "heredoc body fed to bash must be re-checked against defaults")))
 
+(deftest heredoc-recursion-actually-fires
+  ;; The previous tests only check the *overall* decision, which can
+  ;; reach :deny via the outer bare-`bash` rule even when recursion
+  ;; silently no-ops. This test makes recursion the ONLY way to deny:
+  ;; outer bash is explicitly allowed; inner `rm -r` is only catchable
+  ;; if the heredoc body actually gets re-parsed and walked.
+  (let [src "bash <<EOF\nrm -rf /tmp/x\nEOF\n"
+        rs  [[{:tool :bash :pattern {:kind :cmd-name :name "bash"} :action :allow}
+              {:tool :bash :pattern {:kind :argv-flags :head ["rm"]
+                                     :any-of #{"-r" "-R"}}
+               :action :deny}]]
+        r (check src {:rulesets rs :prompter permit/allow-all-prompter})]
+    (is (= :deny (:decision r))
+        "without recursion, outer bash would allow and inner rm stays hidden")
+    (is (= 2 (count (:per-call r)))
+        "expected per-call entries for both outer bash and inner rm")))
+
 (deftest heredoc-quoted-tag-also-recurses
   ;; Quoted delimiter → expand? false at lex time, but the body is
   ;; still bash code on the receiving side.

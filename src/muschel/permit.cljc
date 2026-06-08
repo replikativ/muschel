@@ -332,27 +332,30 @@
          (not (some #{"-c"} (rest argv))))))
 
 (defn- stdin-heredoc-body
-  "If `stmt`'s :redirs contain a heredoc whose target is stdin (fd 0
-   or unspecified), return its body string; else nil."
-  [stmt]
+  "If `node`'s :redirs contain a heredoc whose target is stdin (fd 0
+   or unspecified), return its body string; else nil. The parser
+   attaches `:redirs` to the :call (not the wrapping :stmt) for
+   simple commands; this helper reads it from whatever node carries
+   it."
+  [node]
   (some (fn [r]
           (when (and (= :heredoc (:type r))
                      (or (nil? (:fd r)) (zero? (:fd r))))
             (:body r)))
-        (:redirs stmt)))
+        (:redirs node)))
 
 (defn- shell-heredoc-bodies
   "Walk `ast`. Return body strings of every heredoc that feeds a
    shell interpreter's stdin. The bodies are bash code; the caller
-   re-parses and recursively permit-checks them."
+   re-parses and recursively permit-checks them. For simple
+   commands the parser puts `:redirs` on the `:call` node itself."
   [ast]
   (let [out (volatile! [])]
     (ast/walk ast
               (fn [n]
                 (when (and (map? n)
-                           (= :stmt (:type n))
-                           (ast/call? (:cmd n))
-                           (shell-stdin-script? (:cmd n)))
+                           (ast/call? n)
+                           (shell-stdin-script? n))
                   (when-let [body (stdin-heredoc-body n)]
                     (vswap! out conj body)))))
     @out))
