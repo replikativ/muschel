@@ -79,6 +79,25 @@
    "--symlink" "usr/lib"   "/lib"
    "--symlink" "usr/lib64" "/lib64"])
 
+(defn- translate-cwd
+  "Map a spawn :dir into a sandbox-relative `--chdir` argument.
+
+   muschel's env :cwd is inconsistent — sometimes a real-disk path
+   (DiskFS syncs to its canonical root), sometimes a sandbox-relative
+   path (after `cd /work` the env stores the literal). We handle both:
+
+   - dir = bind-root             → `/`
+   - dir starts with bind-root/  → strip prefix, the rest IS the sandbox path
+   - dir starts with `/` but not bind-root → assume already sandbox-relative
+   - anything else / nil         → `/` (sandbox root)"
+  [^String bind-root ^String dir]
+  (cond
+    (or (nil? dir) (= "" dir)) "/"
+    (= dir bind-root) "/"
+    (.startsWith dir (str bind-root "/")) (subs dir (count bind-root))
+    (.startsWith dir "/") dir
+    :else "/"))
+
 (defn- bwrap-argv
   "Construct the bwrap arg vector preceding `-- cmd args`."
   [{:keys [bind-root ro-binds extra-binds net]} dir]
@@ -93,8 +112,8 @@
     fhs-symlinks
     (extra-bind-args extra-binds)
     (when (= :off net) ["--unshare-net"])
-    ["--unshare-pid" "--die-with-parent"]
-    (when dir ["--chdir" dir])
+    ["--unshare-pid" "--die-with-parent"
+     "--chdir" (translate-cwd bind-root dir)]
     ["--"])))
 
 (defn- cgroup-enabled? [{:keys [mem-max cpu-quota tasks-max]}]

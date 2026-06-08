@@ -58,19 +58,41 @@
       (is (= "git" (nth argv (inc (.indexOf ^java.util.List (vec argv) "--")))))
       (is (= "status" (last argv))))))
 
-(deftest spawn-passes-chdir-from-dir
+(deftest spawn-passes-chdir-from-sandbox-relative-dir
+  ;; :dir = "/work" (sandbox-relative, e.g. after `cd /work` in bash)
+  ;; passes through unchanged.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
     (spawn! h {:cmd "ls" :dir "/work"})
     (let [argv (vec (recorded-cmd+args recorded))]
       (is (= "/work" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
 
-(deftest spawn-no-chdir-when-dir-absent
+(deftest spawn-defaults-chdir-to-root
+  ;; No :dir → bwrap chdir to / (sandbox root) so the spawned command
+  ;; starts in a deterministic, sandbox-visible directory.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
     (spawn! h {:cmd "ls" :args []})
     (let [argv (vec (recorded-cmd+args recorded))]
-      (is (not (some #{"--chdir"} argv))))))
+      (is (= "/" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
+
+(deftest spawn-translates-real-cwd-to-sandbox-path
+  ;; muschel's env :cwd is often the canonical real-disk path (DiskFS
+  ;; syncs to its root). bwrap needs the SANDBOX-relative path; the
+  ;; decorator strips the bind-root prefix.
+  (let [[recorded inner] (stub-host)
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
+    (spawn! h {:cmd "ls" :dir "/tmp/sbx/work"})
+    (let [argv (vec (recorded-cmd+args recorded))]
+      (is (= "/work" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
+
+(deftest spawn-handles-bind-root-exactly
+  ;; :dir = bind-root → sandbox path "/"
+  (let [[recorded inner] (stub-host)
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
+    (spawn! h {:cmd "ls" :dir "/tmp/sbx"})
+    (let [argv (vec (recorded-cmd+args recorded))]
+      (is (= "/" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
 
 (deftest dir-is-consumed-not-passed-through
   ;; bwrap handles cwd via --chdir; the wrapped host should see no :dir.
