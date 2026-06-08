@@ -41,7 +41,6 @@
   ["status" "log" "diff" "show" "branch" "describe" "rev-parse"
    "ls-files" "ls-tree"])
 
-
 (def default-rules
   (vec
    (concat
