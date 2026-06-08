@@ -46,6 +46,18 @@ Things muschel does **not** try to do:
 - Hide the host's *existence*. The agent can tell muschel apart from
   bash by behavioural fingerprinting (some bash extensions throw a
   parse error).
+- **Gate cross-dialect actions** when you allowlist an interpreter.
+  The permit layer is syntactic: it gates `rm -rf /` because the
+  string `rm` appears in argv. It cannot reach into `python -c
+  "import os; os.remove('/etc/passwd')"`, `node -e "…"`,
+  `ruby -e "…"`, `python deploy.py`, etc. — that's a different
+  language whose semantics muschel doesn't parse. **Anything you
+  put in `:fallback-allowlist` is trusted with the same FS,
+  network, and exec authority muschel itself has.** To bound that
+  blast radius, layer an OS sandbox underneath
+  (`--os-sandbox=bwrap` on the CLI) so even a hostile script can't
+  reach outside the FS jail, exhaust memory, or open arbitrary
+  network sockets.
 
 ## Layer 1 — `fs.cljc` FS protocol
 

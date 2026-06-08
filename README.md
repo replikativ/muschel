@@ -140,7 +140,11 @@ clojure -M:cli --sandbox --root . script.sh
 # Sandboxed against an in-memory VFS (optionally seeded from edn):
 clojure -M:cli --sandbox --virtual ./fixtures/seed.edn -c 'cat /work/a.txt'
 
-# Let some real-world tools through to the fallback host:
+# Let some real-world tools through to the fallback host.
+# NOTE: allowlisting an interpreter (python, node, ruby, …) gives that
+# language full FS / network / exec authority — the permit layer can't
+# parse Python or JS. Pair with an OS sandbox if that's a concern.
+# See doc/sandbox.md "Threat model".
 clojure -M:cli --sandbox --root . --allow git,clojure -c 'git status'
 
 # Custom permit overlay on top of the default ruleset:

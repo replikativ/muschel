@@ -25,6 +25,27 @@
       its argv — pair with permit rules if you need finer control
       (e.g. allow `git status` but deny `git push --force`).
 
+      ### Cross-dialect risk
+
+      Allowlisting any *interpreter* — `python`, `python3`, `node`,
+      `ruby`, `perl`, `R`, `lua`, `Rscript`, `bb`, `clojure`,
+      `tclsh`, etc. — gives that interpreter the same FS, network,
+      and exec authority that muschel grants the host process.
+      Muschel's permit layer is syntactic: it gates `rm -rf /`
+      because the *string* `rm` appears in argv. It cannot gate
+      `python -c \"import os; os.remove('/etc/passwd')\"` because
+      that's Python, not bash. Same for `node -e`, `ruby -e`, etc.
+      Script-file invocations (`python deploy.py`) hide the same
+      blast radius behind a path muschel doesn't read.
+
+      We DON'T blacklist these by default — that's the user's call.
+      The honest model is: anything you allowlist is a semantic
+      escape hatch. To bound the blast radius of an allowlisted
+      interpreter, pair it with the OS-level sandbox layer
+      (`--os-sandbox=bwrap` on the CLI — bind-mounts the FS root,
+      caps memory/CPU, blocks the network) so even a hostile script
+      can't reach outside the jail or burn the host.
+
    3. Otherwise refuse with exit 126 and a clear stderr message.
       No silent fallthrough to the host's exec.
 
