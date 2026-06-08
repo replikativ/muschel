@@ -46,15 +46,27 @@ Things muschel does **not** try to do:
 - Hide the host's *existence*. The agent can tell muschel apart from
   bash by behavioural fingerprinting (some bash extensions throw a
   parse error).
+- **Gate cross-dialect actions** when you allowlist an interpreter.
+  The permit layer is syntactic: it gates `rm -rf /` because the
+  string `rm` appears in argv. It cannot reach into `python -c
+  "import os; os.remove('/etc/passwd')"`, `node -e "…"`,
+  `ruby -e "…"`, `python deploy.py`, etc. — that's a different
+  language whose semantics muschel doesn't parse. **Anything you
+  put in `:fallback-allowlist` is trusted with the same FS,
+  network, and exec authority muschel itself has.** To bound that
+  blast radius, layer an OS sandbox underneath
+  (`--os-sandbox=bwrap` on the CLI) so even a hostile script can't
+  reach outside the FS jail, exhaust memory, or open arbitrary
+  network sockets.
 
 ## Layer 1 — `fs.cljc` FS protocol
 
 ```
                     +----------------------------+
    bash source ───► |  exec.cljc / builtins      |
-                    |  cat /work/a.txt  -─-─-─┐  |
-                    +-------------------------|--+
-                                              ▼
+                    |  cat /home/agent/a.txt  ─┐ |
+                    +--------------------------|-+
+                                               ▼
                               +---------------------+
                               |  fs/FS protocol     |
                               |  -resolve  →  path  |
@@ -74,6 +86,43 @@ Every read/write/list/stat goes through one of `fs/-resolve`,
 safety hinge**: a path that lands outside the root returns nil, so
 the builtin sees "no such file" and exits cleanly.
 
+### Wrapper layout: `<root>/home/agent` is the agent's workspace
+
+`DiskFS` does NOT pin its containment at the directory you pass to
+`--root`. Instead, `--root WRAPPER` names a *wrapper directory*, and
+the agent's project files live at `<WRAPPER>/home/agent/` on real
+disk. Inside the sandbox the agent sees them at `/home/agent/`.
+
+```
+Host disk                                 Sandbox view
+-----------------------------             -----------------
+<WRAPPER>/home/agent/         ──────►     /home/agent/
+<WRAPPER>/home/agent/src/app.py           /home/agent/src/app.py
+```
+
+This buys two things:
+
+- **`git status` doesn't see system mounts.** When `--os-sandbox=bwrap`
+  also exposes `/usr`, `/etc`, `/proc`, `/dev`, `/tmp` to the agent
+  via FHS binds, none of those land under the project root — so
+  scanning tools rooted at `/home/agent` see only project files.
+- **`cd /` is a real path.** With bwrap on, `/` is the actual tmpfs
+  root with FHS mounts (no aliasing, no synthesis). Without bwrap,
+  paths above `/home/agent` resolve to nil at the FS layer and
+  builtins see "no such file" — the asymmetry is intentional:
+  builtins stay tightly jailed, externals get a usable Unix env.
+
+`DiskFS` auto-creates `<WRAPPER>/home/agent/` on construction
+(idempotent `Files/createDirectories`). Hand it an empty wrapper —
+or even a path that doesn't exist yet — and you get a working
+sandbox. Each FS impl is responsible for ensuring its own real-root
+exists using its platform's native API; embedders just call `make`.
+
+The mount path is configurable via `:mount-at` (default
+`/home/agent`). Pass `:mount-at "/"` for the legacy flat layout
+where `<WRAPPER>` itself is the workspace — useful for tests that
+target the generic FS protocol behaviour.
+
 ```clojure
 (require '[muschel.core :as m])
 (require '[muschel.fs :as fs])
@@ -83,6 +132,11 @@ the builtin sees "no such file" and exits cleanly.
 (fs/resolve vfs "a.txt")              ; → "/work/a.txt"
 (fs/resolve vfs "/etc/passwd")        ; → nil — outside root, defense in depth
 (fs/resolve vfs "../../etc/passwd")   ; → nil — traversal collapsed and refused
+
+(def disk (m/disk-fs "/tmp/myproj"))  ; auto-creates /tmp/myproj/home/agent/
+(fs/cwd disk)                          ; → "/tmp/myproj/home/agent"  (real-disk)
+(fs/sandbox-relativize disk (fs/cwd disk))   ; → "/home/agent"  (agent view)
+(fs/resolve disk "/etc/passwd")       ; → nil — above the mount, unreachable
 ```
 
 `DiskFS` adds **symlink-aware** containment: a path is canonicalised

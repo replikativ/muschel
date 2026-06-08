@@ -180,6 +180,181 @@
     (is (= :allow (:decision (check "docker run nginx:1.27" {:rulesets rs}))))
     (is (not= :allow (:decision (check "docker run nginx:latest-evil" {:rulesets rs}))))))
 
+;; Helper: matched? checks whether the user's rule actually fired (vs falling
+;; through to the prompter). When no rule matches, :matched-rule is nil; we
+;; use a permissive prompter so the final decision tells us nothing.
+(defn- matched-action
+  "Return the action of the rule that matched `src` under `rs`, or :ask
+   if none matched (decided by the prompter)."
+  [src rs]
+  (let [r (check src {:rulesets rs
+                      :prompter (fn [_] {:result :allow-once})})
+        rule (some-> r :prompted first :matched-rule)]
+    (cond
+      rule                  (:action rule)
+      (seq (:prompted r))   :ask
+      :else                 (:decision r))))
+
+(deftest argv-flags-any-of
+  ;; Deny `rm` if ANY of -r/-R/--recursive shows up anywhere in argv.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["rm"]
+                        :any-of #{"-r" "-R" "--recursive"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "rm -r /tmp/x" rs)))
+    (is (= :deny (matched-action "rm -R /tmp/x" rs)))
+    (is (= :deny (matched-action "rm --recursive /tmp/x" rs)))
+    (is (= :deny (matched-action "rm -rf /tmp/x" rs)))    ; cluster split
+    (is (= :deny (matched-action "rm -fR /tmp/x" rs)))
+    (is (= :deny (matched-action "rm /tmp/x -r" rs)))     ; flag AFTER positional
+    (is (= :ask  (matched-action "rm /tmp/x" rs)))
+    (is (= :ask  (matched-action "rm -f /tmp/x" rs)))))   ; -f alone, no -r
+
+(deftest argv-flags-all-of-plus-any-of
+  ;; git clean: dangerous only when -f is combined with -d or -x.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["git" "clean"]
+                        :all-of #{"-f"}
+                        :any-of #{"-d" "-x"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "git clean -fd"     rs)))
+    (is (= :deny (matched-action "git clean -df"     rs)))
+    (is (= :deny (matched-action "git clean -f -d"   rs))) ; split clusters
+    (is (= :deny (matched-action "git clean -d -f"   rs))) ; order-insensitive
+    (is (= :deny (matched-action "git clean -fdx"    rs)))
+    (is (= :ask  (matched-action "git clean -f"      rs))) ; missing :any-of
+    (is (= :ask  (matched-action "git clean -d"      rs))))) ; missing :all-of
+
+(deftest argv-flags-none-of
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["docker" "run"]
+                        :none-of #{"--privileged"}}
+              :action :allow}]]]
+    (is (= :allow (matched-action "docker run nginx"          rs)))
+    (is (= :allow (matched-action "docker run --rm -it nginx" rs)))
+    (is (= :ask   (matched-action "docker run --privileged nginx" rs)))))
+
+(deftest argv-flags-long-with-equals
+  ;; `--prefix=/x` strips =/x → contributes `"--prefix"` to the set.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["npm" "install"]
+                        :any-of #{"--prefix"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "npm install --prefix=/tmp" rs)))
+    (is (= :deny (matched-action "npm install --prefix /tmp" rs)))
+    (is (= :ask  (matched-action "npm install lodash"        rs)))))
+
+(deftest argv-flags-double-dash-terminates
+  ;; After `--`, tokens are positional, not flags.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["rm"]
+                        :any-of #{"-r"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "rm -r foo"     rs)))
+    (is (= :ask  (matched-action "rm -- -r"      rs)))    ; -r is a filename
+    (is (= :ask  (matched-action "rm -- foo -r"  rs)))))
+
+(deftest argv-flags-numeric-not-split
+  ;; `-9` (kill signal) etc. should NOT be split letter-by-letter. The
+  ;; cluster rule only splits letter clusters; non-letter content stays
+  ;; as a single opaque flag token.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["kill"]
+                        :any-of #{"-9"}}
+              :action :deny}]]]
+    (is (= :deny (matched-action "kill -9 1234"  rs)))
+    (is (= :ask  (matched-action "kill -15 1234" rs)))))
+
+(deftest argv-flags-dynamic-fails-closed
+  ;; If a tail token is dynamic ($cmd), the matcher can't decide. The
+  ;; deny rule must NOT fire silently — call falls through to ask.
+  (let [rs [[{:tool :bash
+              :pattern {:kind :argv-flags
+                        :head ["rm"]
+                        :any-of #{"-r"}}
+              :action :deny}]]]
+    (is (= :ask (matched-action "rm $FLAG file" rs)))))
+
+;; ============================================================================
+;; Heredoc recursion
+;; ============================================================================
+
+(deftest heredoc-into-shell-recurses
+  ;; `bash <<EOF rm -rf /tmp EOF` should be denied because the inner
+  ;; `rm -rf` matches the defaults, even though it's inside a heredoc.
+  (let [src "bash <<EOF\nrm -rf /tmp/x\nEOF\n"
+        r (check src)]
+    (is (= :deny (:decision r))
+        "heredoc body fed to bash must be re-checked against defaults")))
+
+(deftest heredoc-recursion-actually-fires
+  ;; The previous tests only check the *overall* decision, which can
+  ;; reach :deny via the outer bare-`bash` rule even when recursion
+  ;; silently no-ops. This test makes recursion the ONLY way to deny:
+  ;; outer bash is explicitly allowed; inner `rm -r` is only catchable
+  ;; if the heredoc body actually gets re-parsed and walked.
+  (let [src "bash <<EOF\nrm -rf /tmp/x\nEOF\n"
+        rs  [[{:tool :bash :pattern {:kind :cmd-name :name "bash"} :action :allow}
+              {:tool :bash :pattern {:kind :argv-flags :head ["rm"]
+                                     :any-of #{"-r" "-R"}}
+               :action :deny}]]
+        r (check src {:rulesets rs :prompter permit/allow-all-prompter})]
+    (is (= :deny (:decision r))
+        "without recursion, outer bash would allow and inner rm stays hidden")
+    (is (= 2 (count (:per-call r)))
+        "expected per-call entries for both outer bash and inner rm")))
+
+(deftest heredoc-quoted-tag-also-recurses
+  ;; Quoted delimiter → expand? false at lex time, but the body is
+  ;; still bash code on the receiving side.
+  (let [src "bash <<'EOF'\nrm -rf /tmp/x\nEOF\n"
+        r (check src)]
+    (is (= :deny (:decision r)))))
+
+(deftest heredoc-into-data-sink-is-opaque
+  ;; `cat <<EOF rm -rf / EOF` is just feeding text to cat. The body
+  ;; must NOT be parsed as shell — the rm should not fire any rule.
+  (let [src "cat <<EOF\nrm -rf /tmp/x\nEOF\n"
+        rs [[{:tool :bash :pattern {:kind :cmd-name :name "cat"}
+              :action :allow}]]
+        r (check src {:rulesets rs})]
+    (is (= :allow (:decision r))
+        "cat is a data sink; heredoc body is data, not code")))
+
+(deftest heredoc-into-bash-dash-c-not-recursed
+  ;; `bash -c "..." <<EOF data EOF` — the -c arg IS the script; the
+  ;; heredoc is stdin data for that script. We should NOT re-parse it.
+  (let [src "bash -c 'echo hi' <<EOF\nrm -rf /tmp/x\nEOF\n"
+        rs [[{:tool :bash :pattern {:kind :argv-shape
+                                    :shape [#{"bash" "sh"} "-c" :**]}
+              :action :allow}]]
+        r (check src {:rulesets rs
+                      :prompter permit/allow-all-prompter})]
+    (is (= :allow (:decision r))
+        "bash -c heredoc is data for the script, not the script itself")))
+
+(deftest heredoc-into-sh-also-recurses
+  ;; Same as bash: sh / dash / zsh.
+  (doseq [shell ["sh" "dash" "zsh"]]
+    (testing shell
+      (let [src (str shell " <<EOF\nrm -rf /tmp/x\nEOF\n")
+            r (check src)]
+        (is (= :deny (:decision r)))))))
+
+(deftest heredoc-malformed-body-doesnt-crash
+  ;; If the heredoc body fails to parse, we silently skip the
+  ;; recursion. The outer call still gets its rule.
+  (let [src "bash <<EOF\n((( unbalanced\nEOF\n"
+        r (check src {:prompter permit/allow-all-prompter})]
+    ;; No exception; some decision returned.
+    (is (#{:allow :deny :ask} (:decision r)))))
+
 (deftest ast-pred-matcher
   ;; Allow any call whose first arg starts with "git" (a fake-prefix pred)
   (let [rs [[{:tool :bash

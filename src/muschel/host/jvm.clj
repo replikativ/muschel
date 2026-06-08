@@ -7,9 +7,22 @@
 
    Sinks/sources here are bare `java.io.OutputStream`/`InputStream`.
    `-string-sink` returns a `ByteArrayOutputStream`; `-sink->string`
-   calls `.toString` on it."
+   calls `.toString` on it.
+
+   ## `:dir` translation at the spawn boundary
+
+   `spawn-opts :dir` arrives as a SANDBOX path when the call chain
+   went through a sandbox-aware host (BuiltinHost over DiskFS) —
+   that's where the agent's view lives. `babashka.process`, however,
+   expects a real-disk path it can hand to the OS. If `spawn-opts`
+   carries an `:fs` key (BuiltinHost passes one when delegating to
+   its fallback), we translate via `fs/physical-path` here — the one
+   explicit boundary where the sandbox-shaped value space meets the
+   OS-shaped one. Without `:fs`, `:dir` is assumed to already be
+   real-disk (un-sandboxed mode)."
   (:require [babashka.process :as bp]
             [clojure.java.io :as io]
+            [muschel.fs :as fs]
             [muschel.host :as host]))
 
 (deftype JvmHost []
@@ -70,8 +83,12 @@
           in  (java.io.PipedInputStream. out)]
       [in out]))
 
-  (-spawn [_ {:keys [cmd args dir extra-env in out err]}]
-    (let [proc-opts (cond-> {:dir dir
+  (-spawn [_ {:keys [cmd args dir extra-env in out err fs]}]
+    (let [physical-dir (cond
+                         (nil? dir) nil
+                         fs (fs/physical-path fs dir)
+                         :else dir)
+          proc-opts (cond-> {:dir physical-dir
                              :extra-env extra-env}
                       in  (assoc :in  in)
                       out (assoc :out out)

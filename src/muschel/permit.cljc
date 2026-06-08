@@ -7,6 +7,11 @@
    `prompter` function so the harness (e.g. dvergr) drives the user
    interaction.
 
+   Heredoc bodies fed to a shell interpreter on stdin (e.g.
+   `bash <<EOF rm -rf / EOF`) are re-parsed and recursively checked —
+   the inner `rm` is gated even though it's wrapped in a heredoc. Data
+   sinks (`cat <<EOF data EOF`) are left opaque.
+
    ## Rule shape
 
        {:tool    :bash
@@ -38,6 +43,23 @@
        arg), `:**` (zero-or-more args, only as the last element), or a
        regex (`re-find` must match). Length must match exactly unless
        the last element is `:**`.
+
+   - `{:kind :argv-flags :head [\"rm\"] :any-of #{\"-r\" \"--recursive\"}}`
+       Order-INSENSITIVE flag match. `:head` is an ordered prefix (same
+       semantics as `:argv-vec`); the tail is normalised into a *set* of
+       flag tokens, then tested against:
+         `:any-of`  — at least one element must appear in the tail
+         `:all-of`  — every element must appear in the tail
+         `:none-of` — no element may appear in the tail
+       At least one of those keys must be present. Tail normalisation:
+       `--foo=bar` → `\"--foo\"`; `-rf` → `\"-r\"` + `\"-f\"`
+       (POSIX short clusters of letters); `--` terminates option
+       parsing (everything after is positional, not added to the set);
+       bare `-` and non-`-` tokens are positional, ignored. Use this for
+       \"flag X anywhere in argv\" rules where `:argv-shape` would have
+       to enumerate every position. If any tail token is dynamic (e.g.
+       `$cmd`), the matcher fails closed → the call falls through to
+       the prompter, same as `:argv-vec` for dynamic args.
 
    - `{:kind :ast-pred :pred (fn [call-node] ...)}`
        Full predicate over the AST node. Escape hatch for anything the
@@ -71,6 +93,7 @@
   (:require [clojure.string :as str]
             [muschel.ast :as ast]
             [muschel.expand :as expand]
+            [muschel.parse :as parse]
             [muschel.permit.defaults :as defaults]))
 
 ;; ============================================================================
@@ -154,10 +177,84 @@
                  (every? true?
                          (map shape-elt-matches? head argv))))))
 
+;; ---- :argv-flags helpers ----------------------------------------------------
+
+(defn- letters-only? [^String s]
+  (and (pos? (count s))
+       #?(:clj  (every? #(Character/isLetter ^Character %) s)
+          :cljs (boolean (re-matches #"[A-Za-z]+" s)))))
+
+(defn- short-cluster->flags
+  "Split a POSIX short-flag cluster like `-rf` into `[\"-r\" \"-f\"]`.
+   If the cluster contains non-letters (e.g. `-2`, `-o=foo`), return
+   the token unchanged — we don't have an option spec, so don't guess."
+  [^String t]
+  (let [rest-chars (subs t 1)]
+    (if (letters-only? rest-chars)
+      (mapv #(str "-" %) rest-chars)
+      [t])))
+
+(defn- token->flag-tokens
+  "Normalise one argv token into the flag tokens it contributes to the
+   tail flag-set. nil for positional / non-flag tokens."
+  [^String t]
+  (cond
+    (or (= t "-") (not (str/starts-with? t "-"))) nil
+    (str/starts-with? t "--") [(first (str/split t #"=" 2))]
+    :else (short-cluster->flags t)))
+
+(defn argv->flag-set
+  "Normalise an argv tail into the set of flag tokens it carries.
+   Stops at `--` (POSIX option terminator). Returns nil if any token
+   is itself nil — caller treats that as 'can't decide, match fails'.
+
+   Examples (the tail does NOT include the command name):
+     [\"-rf\" \"/tmp\"]            => #{\"-r\" \"-f\"}
+     [\"--force\" \"--prefix=/x\"] => #{\"--force\" \"--prefix\"}
+     [\"--\" \"-r\"]               => #{}        ; -r is positional after --
+     [nil \"-r\"]                  => nil"
+  [tail]
+  (loop [in tail
+         acc #{}]
+    (if (empty? in)
+      acc
+      (let [t (first in)]
+        (cond
+          (nil? t)   nil
+          (= t "--") acc
+          :else      (recur (rest in) (into acc (token->flag-tokens t))))))))
+
+(defn- head-prefix-matches?
+  "Like argv-matches-vec? but used to check just the ordered head of
+   an `:argv-flags` rule."
+  [argv head]
+  (and (>= (count argv) (count head))
+       (every? true?
+               (map (fn [r a]
+                      (cond
+                        (nil? a) false
+                        (set? r) (contains? r a)
+                        :else    (= r a)))
+                    head argv))))
+
+(defn- argv-matches-flags?
+  "Flag-set match. `head` is an ordered prefix; the tail (everything
+   after) is normalised to a flag set and compared against any-of /
+   all-of / none-of. At least one constraint must be present."
+  [argv {:keys [head any-of all-of none-of]}]
+  (and (head-prefix-matches? argv head)
+       (or any-of all-of none-of)
+       (let [tail (drop (count head) argv)
+             flags (argv->flag-set tail)]
+         (and (some? flags)
+              (or (nil? any-of)  (boolean (some flags any-of)))
+              (or (nil? all-of)  (every? flags all-of))
+              (or (nil? none-of) (not-any? flags none-of))))))
+
 (defn rule-matches?
   "True if `rule`'s pattern matches `call`."
   [rule call]
-  (let [{:keys [kind name vec glob shape pred]} (:pattern rule)
+  (let [{:keys [kind name vec glob shape pred] :as pattern} (:pattern rule)
         cmd-name (call->cmd-name call)
         argv (call->argv call)]
     (case kind
@@ -165,6 +262,7 @@
       :argv-glob  (argv-matches-glob? argv glob)
       :argv-vec   (argv-matches-vec? argv vec)
       :argv-shape (argv-matches-shape? argv shape)
+      :argv-flags (argv-matches-flags? argv pattern)
       :ast-pred   (try (boolean (pred call)) (catch #?(:clj Throwable :cljs :default) _ false))
       false)))
 
@@ -212,19 +310,78 @@
      :rule nil
      :reason "no matching rule (default: ask)"}))
 
+;; ============================================================================
+;; Heredoc recursion into shell interpreters
+;; ============================================================================
+;;
+;; When `bash <<EOF … EOF` (or sh/dash/zsh) reads a heredoc as stdin, the
+;; body IS a shell script — so we re-parse it and check the inner calls,
+;; same idea as how exec.cljc re-runs cmd-subst bodies through the permit
+;; gate. Data sinks like `cat <<EOF … EOF` keep the body opaque.
+
+(def ^:private shell-cmd-names #{"sh" "bash" "dash" "zsh"})
+
+(defn- shell-stdin-script?
+  "True if `call`'s argv is a shell reading its script from stdin —
+   i.e. first arg is a known shell and there is no `-c` flag (which
+   would mean the script is the inline arg, and the heredoc is data
+   for that script's own stdin)."
+  [call]
+  (let [argv (call->argv call)]
+    (and (shell-cmd-names (first argv))
+         (not (some #{"-c"} (rest argv))))))
+
+(defn- stdin-heredoc-body
+  "If `node`'s :redirs contain a heredoc whose target is stdin (fd 0
+   or unspecified), return its body string; else nil. The parser
+   attaches `:redirs` to the :call (not the wrapping :stmt) for
+   simple commands; this helper reads it from whatever node carries
+   it."
+  [node]
+  (some (fn [r]
+          (when (and (= :heredoc (:type r))
+                     (or (nil? (:fd r)) (zero? (:fd r))))
+            (:body r)))
+        (:redirs node)))
+
+(defn- shell-heredoc-bodies
+  "Walk `ast`. Return body strings of every heredoc that feeds a
+   shell interpreter's stdin. The bodies are bash code; the caller
+   re-parses and recursively permit-checks them. For simple
+   commands the parser puts `:redirs` on the `:call` node itself."
+  [ast]
+  (let [out (volatile! [])]
+    (ast/walk ast
+              (fn [n]
+                (when (and (map? n)
+                           (ast/call? n)
+                           (shell-stdin-script? n))
+                  (when-let [body (stdin-heredoc-body n)]
+                    (vswap! out conj body)))))
+    @out))
+
 (defn check-pure
   "Pure check (no prompter). For each :call in the AST, return a
-   per-call decision. Overall :decision is the worst (deny > ask >
-   allow)."
+   per-call decision. Heredoc bodies fed to shell interpreters are
+   re-parsed and their inner calls are included. Overall :decision
+   is the worst (deny > ask > allow)."
   [rulesets ast]
   (let [calls (ast/leaf-calls ast)
         per-call (mapv #(per-call-decision rulesets %) calls)
+        inner-per-call
+        (vec (mapcat (fn [body]
+                       (let [inner (try (parse/parse body)
+                                        (catch #?(:clj Throwable :cljs :default) _ nil))]
+                         (when inner
+                           (:per-call (check-pure rulesets inner)))))
+                     (shell-heredoc-bodies ast)))
+        all-per-call (into per-call inner-per-call)
         worst (cond
-                (some #(= :deny (:decision %)) per-call) :deny
-                (some #(= :ask (:decision %)) per-call) :ask
+                (some #(= :deny (:decision %)) all-per-call) :deny
+                (some #(= :ask  (:decision %)) all-per-call) :ask
                 :else :allow)]
     {:decision worst
-     :per-call per-call}))
+     :per-call all-per-call}))
 
 ;; ============================================================================
 ;; Promoter: prompter-result → new rule
@@ -333,8 +490,8 @@
     (not (map? (:pattern rule)))
     "rule :pattern must be a map"
 
-    (not (#{:cmd-name :argv-glob :argv-vec :argv-shape :ast-pred}
+    (not (#{:cmd-name :argv-glob :argv-vec :argv-shape :argv-flags :ast-pred}
           (:kind (:pattern rule))))
-    "rule :pattern :kind must be :cmd-name :argv-glob :argv-vec :argv-shape or :ast-pred"
+    "rule :pattern :kind must be :cmd-name :argv-glob :argv-vec :argv-shape :argv-flags or :ast-pred"
 
     :else nil))

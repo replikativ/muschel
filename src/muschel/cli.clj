@@ -28,12 +28,22 @@
    ## Muschel extensions
 
      --sandbox       BuiltinHost + permit gate (requires --root or --virtual)
-     --root DIR      DiskFS pinned to DIR
+     --root DIR      Wrapper directory; agent files live at DIR/home/agent/
+                     on disk and surface as /home/agent/ in the sandbox view.
+                     DIR/home/agent/ is auto-created if it doesn't exist.
      --virtual [F]   in-memory VFS (empty, or seeded from edn file F)
      --permit FILE   append permit rules on top of the default ruleset
      --allow CMDS    comma-separated fallback-allowlist (git,clojure,...)
      --trace         emit a trace report to stderr on exit
      --budget N      cap to N executor steps
+
+   ## OS-level sandbox (Linux only; requires --sandbox --root)
+
+     --os-sandbox KIND   off (default) | bwrap
+     --net MODE          off (default) | on — sandbox network policy
+     --mem-max VAL       cgroup MemoryMax (e.g. 2G, 512M)
+     --cpu-quota VAL     cgroup CPUQuota (e.g. 100% = 1 core, 200% = 2)
+     --tasks-max N       cgroup TasksMax
 
    ## Bash-style positional semantics
 
@@ -54,6 +64,7 @@
             [muschel.exec :as exec]
             [muschel.fs.disk :as fs.disk]
             [muschel.fs.virtual :as fs.virtual]
+            [muschel.host.sandboxed :as host.sandboxed]
             [muschel.parse :as parse]
             [muschel.permit :as permit]
             [muschel.session :as session]))
@@ -84,7 +95,8 @@
 
 (def ^:private value-flags
   "Long/short flags that consume the next argv slot as their value."
-  #{"-o" "--root" "--permit" "--allow" "--budget" "--virtual"})
+  #{"-o" "--root" "--permit" "--allow" "--budget" "--virtual"
+    "--os-sandbox" "--net" "--mem-max" "--cpu-quota" "--tasks-max"})
 
 (def ^:private boolean-flags
   "Flags that DON'T consume the next slot."
@@ -204,13 +216,24 @@
    [nil  "--version"]
    ;; muschel extensions
    [nil "--sandbox"           "Enable BuiltinHost sandbox."]
-   [nil "--root DIR"          "DiskFS pinned to DIR (requires --sandbox)."]
+   [nil "--root DIR"          "Wrapper directory; the agent workspace lives at DIR/home/agent/ (auto-created). Requires --sandbox."]
    [nil "--virtual FILE"      "In-memory VFS, optionally seeded from FILE. Use --virtual '' for empty."
     :default :unset]
    [nil "--permit FILE"       "Append permit rules from FILE."]
    [nil "--allow CMDS"        "Comma-separated fallback-allowlist."]
    [nil "--trace"             "Emit a trace report to stderr on exit."]
    [nil "--budget N"          "Cap to N executor steps."
+    :parse-fn #(Long/parseLong %)]
+   ;; OS sandbox (Linux, requires --sandbox --root)
+   [nil "--os-sandbox KIND"   "OS-layer sandbox: off (default) | bwrap. Requires --sandbox --root."
+    :default "off"
+    :validate [#{"off" "bwrap"} "must be off or bwrap"]]
+   [nil "--net MODE"          "Sandbox network: off (default with --os-sandbox) | on."
+    :default "off"
+    :validate [#{"off" "on"} "must be off or on"]]
+   [nil "--mem-max VAL"       "cgroup MemoryMax (e.g. 2G, 512M). Implies systemd-run."]
+   [nil "--cpu-quota VAL"     "cgroup CPUQuota (e.g. 100%, 200%). Implies systemd-run."]
+   [nil "--tasks-max N"       "cgroup TasksMax."
     :parse-fn #(Long/parseLong %)]])
 
 (defn- print-help! []
@@ -240,12 +263,19 @@
               ""
               "MUSCHEL EXTENSIONS"
               "  --sandbox       enable BuiltinHost + permit gate (needs --root or --virtual)"
-              "  --root DIR      DiskFS pinned to DIR"
+              "  --root DIR      Wrapper dir; agent workspace at DIR/home/agent/ (auto-created)"
               "  --virtual [F]   in-memory VFS (empty, or seeded from edn file F)"
               "  --permit FILE   append permit rules on top of the default ruleset"
               "  --allow CMDS    comma-separated fallback-allowlist (e.g. git,clojure)"
               "  --trace         emit a trace report to stderr on exit"
               "  --budget N      cap to N executor steps"
+              ""
+              "OS SANDBOX (Linux only; requires --sandbox --root)"
+              "  --os-sandbox KIND   off (default) | bwrap"
+              "  --net MODE          off (default with --os-sandbox) | on"
+              "  --mem-max VAL       cgroup MemoryMax (e.g. 2G, 512M)"
+              "  --cpu-quota VAL     cgroup CPUQuota (e.g. 100%, 200%)"
+              "  --tasks-max N       cgroup TasksMax"
               ""
               "EXAMPLES"
               "  muschel                                          # interactive shell"
@@ -253,7 +283,9 @@
               "  muschel script.sh foo bar                        # script with $1=foo $2=bar"
               "  muschel -n script.sh                             # validate syntax only"
               "  muschel --sandbox --root . script.sh             # sandboxed run"
-              "  muschel --sandbox --virtual ./seed.edn -c 'ls'   # in-memory sandbox"])))
+              "  muschel --sandbox --virtual ./seed.edn -c 'ls'   # in-memory sandbox"
+              "  muschel --sandbox --root . --os-sandbox bwrap \\"
+              "          --mem-max 2G --cpu-quota 200% -c 'npm test'    # OS-jailed run"])))
 
 ;; ============================================================================
 ;; Sandbox / host construction
@@ -275,12 +307,41 @@
                  (seq extra) (conj extra))
      :prompter permit/deny-all-prompter}))
 
+(defn- maybe-wrap-os-sandbox
+  "If --os-sandbox=bwrap, decorate the fallback host with
+   SandboxedHost so allowlisted system commands run inside bwrap.
+
+   Wraps the FALLBACK, not the BuiltinHost: muschel's own builtins
+   (cat/ls/grep/…) execute in-process against the FS protocol and
+   are already FS-jailed; only allowlisted system tools (git, npm,
+   python, …) need OS-level isolation.
+
+   The DiskFS's mount table is threaded through so bwrap's binds
+   and the agent's FS view stay aligned (the same /home/agent,
+   /tmp, … on both sides)."
+  [fallback-host fs opts]
+  (if (not= "bwrap" (:os-sandbox opts))
+    fallback-host
+    (let [bind-root (.getCanonicalPath (java.io.File. ^String (:root opts)))]
+      (host.sandboxed/make
+       (cond-> {:wrapped   fallback-host
+                :bind-root bind-root
+                :mounts    (fs.disk/mounts fs)
+                :net       (keyword (or (:net opts) "off"))}
+         (:mem-max opts)    (assoc :mem-max    (:mem-max opts))
+         (:cpu-quota opts)  (assoc :cpu-quota  (:cpu-quota opts))
+         (:tasks-max opts)  (assoc :tasks-max  (:tasks-max opts)))))))
+
 (defn- build-host
   "Returns {:host h :permit cfg-or-nil}.
 
-   Without --sandbox → JvmHost, no permit.
-   With --sandbox    → BuiltinHost over DiskFS or VirtualFS. Permit
-                       built from default + --permit overlay."
+   Without --sandbox             → JvmHost, no permit.
+   With --sandbox                → BuiltinHost over DiskFS or VirtualFS.
+   With --sandbox --os-sandbox=… → BuiltinHost whose fallback-host is
+                                    wrapped in SandboxedHost (bwrap +
+                                    optional cgroup limits).
+
+   Permit cfg is built from defaults + --permit overlay."
   [opts]
   (if-not (:sandbox opts)
     {:host (m/jvm-host)}
@@ -294,9 +355,10 @@
                     (fs.virtual/make (or seed {}) {:cwd "/"})))
           allow (when-let [s (:allow opts)]
                   (set (map str/trim (str/split s #","))))
+          fallback (maybe-wrap-os-sandbox (m/jvm-host) fs opts)
           host  (m/builtin-host
                  {:fs fs
-                  :fallback-host (m/jvm-host)
+                  :fallback-host fallback
                   :fallback-allowlist (or allow #{})
                   :builtins posix/standard})]
       {:host host :permit (build-permit-cfg opts)})))
@@ -306,7 +368,10 @@
   [opts]
   (let [has-root?    (some? (:root opts))
         has-virtual? (not= :unset (:virtual opts))
-        has-sandbox? (:sandbox opts)]
+        has-sandbox? (:sandbox opts)
+        os-sandbox   (:os-sandbox opts)
+        cgroup-flag? (or (:mem-max opts) (:cpu-quota opts) (:tasks-max opts))
+        net-set?     (and (:net opts) (not= "off" (:net opts)))]
     (cond
       (and has-sandbox? (not (or has-root? has-virtual?)))
       "--sandbox requires --root DIR or --virtual [FILE]"
@@ -316,6 +381,16 @@
 
       (and (not has-sandbox?) (or has-root? has-virtual?))
       "--root / --virtual require --sandbox (otherwise the FS choice has no effect)"
+
+      ;; --os-sandbox composition rules
+      (and (= "bwrap" os-sandbox) (not has-sandbox?))
+      "--os-sandbox=bwrap requires --sandbox --root DIR"
+
+      (and (= "bwrap" os-sandbox) (not has-root?))
+      "--os-sandbox=bwrap requires --root DIR (VirtualFS has no real path to bind)"
+
+      (and (or cgroup-flag? net-set?) (not= "bwrap" os-sandbox))
+      "--net / --mem-max / --cpu-quota / --tasks-max require --os-sandbox=bwrap"
 
       :else nil)))
 

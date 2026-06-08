@@ -22,19 +22,25 @@
 ;; ============================================================================
 
 (defn- mk-sandbox
-  "Make a fresh temp root, return [root-path host outside-file]. The
-   outside file lives in a *separate* temp dir so paths from the
-   sandbox to it must escape."
+  "Make a fresh temp wrapper, return [wrapper agent-dir host outside-file].
+   The outside file lives in a *separate* temp dir so paths from the
+   sandbox to it must escape.
+
+   DiskFS uses the default `:mount-at` `/home/agent`, so the agent's
+   real-disk workspace is `<wrapper>/home/agent` (auto-created by
+   `disk/make`). Tests that inspect the filesystem state should use
+   `agent-dir`, not the bare wrapper path."
   []
-  (let [root (str (bfs/create-temp-dir))
+  (let [wrapper (str (bfs/create-temp-dir))
+        agent-dir (str wrapper "/home/agent")
         outside-dir (str (bfs/create-temp-dir))
         outside-file (str outside-dir "/SECRET")
         _ (spit outside-file "TOP-SECRET-DO-NOT-LEAK\n")
-        fs (disk/make root)
+        fs (disk/make wrapper)
         host (hb/make {:fs fs
                        :fallback-host (jvm/make)
                        :builtins posix/standard})]
-    [root host outside-file]))
+    [wrapper agent-dir host outside-file]))
 
 (defn- cleanup [root]
   (try (bfs/delete-tree root) (catch Throwable _ nil)))
@@ -55,7 +61,7 @@
 
 (deftest f1-symlink-parent-write-escape-rejected
   (testing "ln -s + write through link's parent cannot escape"
-    (let [[root host outside-file] (mk-sandbox)
+    (let [[wrapper _agent-dir host outside-file] (mk-sandbox)
           outside-dir (str/replace outside-file #"/SECRET$" "")]
       (try
         ;; Try the exploit: create a symlink whose target is the
@@ -70,11 +76,11 @@
                    "  ln exit: " (:exit r1) "\n"
                    "  write exit: " (:exit r2) "\n"
                    "  contents: " (pr-str (slurp outside-file)))))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 (deftest f1-symlink-parent-create-newfile-rejected
   (testing "writing a brand-new file through a sandbox-internal symlink whose target escapes is rejected"
-    (let [[root host outside-file] (mk-sandbox)
+    (let [[wrapper _agent-dir host outside-file] (mk-sandbox)
           outside-dir (str/replace outside-file #"/SECRET$" "")]
       (try
         (run host (str "ln -s " outside-dir " evil"))
@@ -83,7 +89,7 @@
         ;; nothing. Either way no new file should appear outside.
         (is (not (bfs/exists? (str outside-dir "/newfile.txt")))
             "wrote outside-root through symlink-parent — ESCAPE")
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 ;; ============================================================================
 ;; F2 — direct symlink-to-outside is refused at create time
@@ -91,15 +97,15 @@
 
 (deftest f2-symlink-to-outside-target-refused
   (testing "ln -s /etc evil refuses to create the link at all"
-    (let [[root host outside-file] (mk-sandbox)
+    (let [[wrapper agent-dir host outside-file] (mk-sandbox)
           outside-dir (str/replace outside-file #"/SECRET$" "")]
       (try
         (run host (str "ln -s " outside-dir " evil"))
-        ;; The link itself shouldn't exist inside the sandbox.
-        (is (not (bfs/exists? (str root "/evil")))
-            (str "symlink with outside-root target was CREATED at " root "/evil — "
+        ;; The link itself shouldn't exist inside the agent workspace.
+        (is (not (bfs/exists? (str agent-dir "/evil")))
+            (str "symlink with outside-root target was CREATED at " agent-dir "/evil — "
                  "this widens F1's attack surface"))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 ;; ============================================================================
 ;; .. traversal (covered by inside?-check + lex-normalize)
@@ -107,21 +113,21 @@
 
 (deftest dot-dot-traversal-cannot-read
   (testing "cat ../../etc/passwd cannot escape root"
-    (let [[root host _] (mk-sandbox)]
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         (let [r (run host "cat ../../../../../../../etc/passwd")]
           (is (not (str/includes? (:stdout r) "root:"))
               "passed real /etc/passwd content through ..-traversal"))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 (deftest absolute-path-cannot-read
   (testing "cat /etc/passwd cannot escape root"
-    (let [[root host _] (mk-sandbox)]
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         (let [r (run host "cat /etc/passwd")]
           (is (not (str/includes? (:stdout r) "root:"))
               "absolute outside-root path returned real /etc/passwd"))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 ;; ============================================================================
 ;; Redirect tricks
@@ -129,24 +135,30 @@
 
 (deftest redirect-to-outside-cannot-write
   (testing "echo X > /etc/passwd cannot write outside root"
-    (let [[root host _] (mk-sandbox)]
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
-        (let [r (run host "echo X > /etc/MUSCHEL_PROBE")]
+        (let [_r (run host "echo X > /etc/MUSCHEL_PROBE")]
           ;; The host shell may print an error or silently no-op,
           ;; but the file MUST NOT appear on real /etc.
           (is (not (bfs/exists? "/etc/MUSCHEL_PROBE"))
               "redirect created real /etc/MUSCHEL_PROBE"))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 (deftest redirect-via-dotdot-cannot-write
-  (testing "echo X > ../escape cannot land outside root"
-    (let [[root host _] (mk-sandbox)
-          parent-dir (.getParent (java.io.File. ^String root))]
+  (testing "echo X > ../escape cannot land outside the agent workspace"
+    (let [[wrapper agent-dir host _] (mk-sandbox)
+          ;; Real-disk parent of the agent workspace is <wrapper>/home;
+          ;; real-disk parent of the wrapper itself is /tmp (or similar).
+          ;; Neither must receive the file.
+          agent-parent (.getParent (java.io.File. ^String agent-dir))
+          wrapper-parent (.getParent (java.io.File. ^String wrapper))]
       (try
         (run host "echo X > ../escape")
-        (is (not (bfs/exists? (str parent-dir "/escape")))
-            "redirect via ..-traversal wrote outside root")
-        (finally (cleanup root))))))
+        (is (not (bfs/exists? (str agent-parent "/escape")))
+            "redirect via ..-traversal wrote into <wrapper>/home")
+        (is (not (bfs/exists? (str wrapper-parent "/escape")))
+            "redirect via ..-traversal wrote above the wrapper")
+        (finally (cleanup wrapper))))))
 
 ;; ============================================================================
 ;; $(< file) command-substitution short-circuit
@@ -154,47 +166,47 @@
 
 (deftest dollar-lt-cannot-read-outside
   (testing "$(< /etc/passwd) cannot leak real file via cmd-substitution"
-    (let [[root host _] (mk-sandbox)]
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         (let [r (run host "echo \"$(< /etc/passwd)\"")]
           (is (not (str/includes? (:stdout r) "root:"))
               "$(< /etc/passwd) leaked real file content"))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 ;; ============================================================================
-;; F6 — realpath should not leak host disk prefix
+;; F6 — pwd / realpath surface the sandbox-relative mount, not the host prefix
 ;; ============================================================================
 
 (deftest realpath-hides-host-prefix
-  (testing "realpath . returns / not /tmp/muschel-xyz"
-    (let [[root host _] (mk-sandbox)]
+  (testing "realpath . returns /home/agent (the mount), not /tmp/muschel-xyz/home/agent"
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         (let [r (run host "realpath .")]
           (is (zero? (:exit r)))
-          (is (= "/" (str/trim (:stdout r)))
+          (is (= "/home/agent" (str/trim (:stdout r)))
               (str "realpath leaked host mount path: " (pr-str (:stdout r)))))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 (deftest realpath-inside-hides-host-prefix
-  (testing "realpath sub returns /sub not /tmp/muschel-xyz/sub"
-    (let [[root host _] (mk-sandbox)]
+  (testing "realpath sub returns /home/agent/sub, not /tmp/muschel-xyz/home/agent/sub"
+    (let [[wrapper agent-dir host _] (mk-sandbox)]
       (try
-        (bfs/create-dirs (str root "/sub"))
+        (bfs/create-dirs (str agent-dir "/sub"))
         (let [r (run host "realpath sub")]
           (is (zero? (:exit r)))
-          (is (= "/sub" (str/trim (:stdout r)))
+          (is (= "/home/agent/sub" (str/trim (:stdout r)))
               (str "realpath leaked host mount path: " (pr-str (:stdout r)))))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 (deftest pwd-hides-host-prefix
-  (testing "pwd inside sandbox returns / not the host mount"
-    (let [[root host _] (mk-sandbox)]
+  (testing "pwd inside sandbox returns the mount path, not the host mount"
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         (let [r (run host "pwd")]
           (is (zero? (:exit r)))
-          (is (= "/" (str/trim (:stdout r)))
+          (is (= "/home/agent" (str/trim (:stdout r)))
               (str "pwd leaked host mount path: " (pr-str (:stdout r)))))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 ;; ============================================================================
 ;; Glob doesn't leak when used in a sandboxed run
@@ -202,22 +214,22 @@
 
 (deftest glob-stays-inside-sandbox
   (testing "echo * inside sandbox doesn't list outside-root files"
-    (let [[root host outside-file] (mk-sandbox)
+    (let [[wrapper agent-dir host outside-file] (mk-sandbox)
           outside-dir (str/replace outside-file #"/SECRET$" "")]
       (try
-        (spit (str root "/inside.txt") "")
+        (spit (str agent-dir "/inside.txt") "")
         (let [r (run host "echo *")]
           (is (= "inside.txt\n" (:stdout r))
-              "glob listed sandbox files only")
+              "glob listed agent workspace files only")
           (is (not (str/includes? (:stdout r) outside-dir))
               "glob mentioned outside path")
           (is (not (str/includes? (:stdout r) "SECRET"))
               "glob mentioned the secret file"))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 (deftest glob-with-dotdot-cannot-escape
   (testing "echo ../* doesn't list parent-of-root contents"
-    (let [[root host _] (mk-sandbox)]
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         (let [r (run host "echo ../*")]
           ;; The glob should expand to literal `../*` (no matches in
@@ -225,7 +237,7 @@
           ;; the host's /tmp listing.
           (is (not (str/includes? (:stdout r) "/tmp"))
               (str "glob ../* leaked host paths: " (pr-str (:stdout r)))))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 ;; ============================================================================
 ;; Host env leak — the re-audit critical finding. `new-env` must NOT
@@ -235,7 +247,7 @@
 
 (deftest host-env-not-leaked-by-default
   (testing "echo $PATH inside sandbox returns empty (host PATH must NOT leak)"
-    (let [[root host _] (mk-sandbox)]
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         ;; Set a known canary in the JVM process env via Java reflection
         ;; — alas can't really do that, so instead read a var we KNOW
@@ -245,11 +257,11 @@
           (is (some? host-path) "test prerequisite: host has $PATH")
           (is (not= (str host-path "\n") (:stdout r))
               (str "host $PATH leaked into sandbox: " (pr-str (:stdout r)))))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))
 
 (deftest env-builtin-does-not-dump-host-vars
   (testing "the `env` builtin inside sandbox returns only sandbox-set vars"
-    (let [[root host _] (mk-sandbox)]
+    (let [[wrapper _agent-dir host _] (mk-sandbox)]
       (try
         (let [r (run host "env")
               lines (str/split-lines (:stdout r))]
@@ -258,4 +270,4 @@
           ;; vars like SSH_AUTH_SOCK / DBUS_SESSION_BUS_ADDRESS / etc.
           (is (< (count lines) 10)
               (str "env dumped " (count lines) " vars — looks like host env leaked")))
-        (finally (cleanup root))))))
+        (finally (cleanup wrapper))))))

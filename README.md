@@ -111,16 +111,47 @@ With a permit (parse-time gate + runtime hook):
 ;; → :exit 126, :stderr explains the denial
 ```
 
-`disk-fs` pins the FS to a real directory, with symlink-aware
-containment so `cat ../etc/passwd` stays inside the root:
+`disk-fs` pins the FS to a real directory with symlink-aware
+containment, using the **wrapper layout**: `--root WRAPPER` is a
+wrapper directory holding one or more *mounts*. By default the
+agent gets two: the project workspace at `/home/agent` and a
+writable `/tmp`. Both are real subdirectories of the wrapper
+(`<WRAPPER>/home/agent/` and `<WRAPPER>/tmp/` respectively) — both
+auto-created on construction.
 
 ```clojure
+;; /tmp/proj is a fresh empty wrapper; /tmp/proj/home/agent/ and /tmp/proj/tmp/
+;; are auto-created. Put your project files in /tmp/proj/home/agent/.
 (let [host (m/builtin-host
-             {:fs (m/disk-fs "/home/me/project" {:cwd "/home/me/project"})
+             {:fs (m/disk-fs "/tmp/proj")
               :fallback-host (m/jvm-host)
-              :fallback-allowlist #{"git"}})]  ; allow git, refuse everything else
-  (m/run-and-capture (m/new-env) "git status" {:host host}))
+              :fallback-allowlist #{"git"}})]
+  (m/run-and-capture (m/new-env) "pwd" {:host host}))
+;; → :stdout "/home/agent\n"
 ```
+
+Both layers (builtin FS protocol AND `--os-sandbox bwrap` externals)
+see the same `/tmp` files — `/tmp` is no longer the bwrap-ephemeral
+tmpfs but a real bind that persists across spawns within the
+wrapper:
+
+```clojure
+(m/run-and-capture (m/new-env)
+                   "echo log > /tmp/run.log; cat /tmp/run.log"
+                   {:host host})
+;; → :stdout "log\n"   (file lands at /tmp/proj/tmp/run.log on disk)
+```
+
+The wrapper layout keeps system mounts (`/usr`, `/etc`, … exposed by
+the OS sandbox) out of the agent's project view — `git status`,
+`find .`, etc. rooted at `/home/agent` see only project files. The
+ancestor view also lets `cd /; ls /` work as expected (returns
+`[home tmp]` from builtins; bwrap-spawned externals see the full
+FHS at `/`).
+
+Customise with the `:mounts` option
+(`[[sandbox-path wrapper-subdir] …]`), or pass `:mount-at "/"` for
+the legacy flat layout where `<WRAPPER>` itself is the workspace.
 
 ## Quickstart — CLI
 
@@ -134,17 +165,30 @@ clojure -M:cli script.sh foo bar                # run a script ($1=foo $2=bar)
 clojure -M:cli -n script.sh                     # validate syntax only
 clojure -M:cli -o errexit -c 'false; echo no'   # -o sets shell options
 
-# Sandboxed against the current directory:
-clojure -M:cli --sandbox --root . script.sh
+# Sandboxed against a wrapper directory (./sbx).
+# The agent's workspace lives at ./sbx/home/agent/ on disk (auto-created)
+# and surfaces as /home/agent/ inside the sandbox; pwd reports /home/agent.
+clojure -M:cli --sandbox --root ./sbx -c 'pwd && ls'
 
 # Sandboxed against an in-memory VFS (optionally seeded from edn):
 clojure -M:cli --sandbox --virtual ./fixtures/seed.edn -c 'cat /work/a.txt'
 
-# Let some real-world tools through to the fallback host:
+# Let some real-world tools through to the fallback host.
+# NOTE: allowlisting an interpreter (python, node, ruby, …) gives that
+# language full FS / network / exec authority — the permit layer can't
+# parse Python or JS. Pair with an OS sandbox if that's a concern.
+# See doc/sandbox.md "Threat model".
 clojure -M:cli --sandbox --root . --allow git,clojure -c 'git status'
 
 # Custom permit overlay on top of the default ruleset:
 clojure -M:cli --sandbox --root . --permit ./tight.edn -c 'curl example.com'
+
+# OS-level sandbox (Linux + bubblewrap): externals run in their own
+# namespaces (no network by default), with cgroup limits via systemd-run.
+# /tmp is the same real-disk dir for builtins AND externals — writes
+# persist across spawns.
+clojure -M:cli --sandbox --root ./sbx --allow git --os-sandbox bwrap \
+        --net off --mem-max 2G --cpu-quota 200% -c 'git status'
 
 # Analysis subcommands:
 clojure -M:cli translate -f script.sh           # bash → Clojure form
@@ -258,20 +302,37 @@ locally with `npm run watch:playground` and open
 
 ## Sandbox model
 
-Three layers, composed:
+Three required layers + one optional, composed:
 
 1. **`fs/FS` protocol** — every read/write/list/stat goes through a
    single containment-aware handle (`VirtualFS`, `DiskFS`, or your own).
-   A path that resolves outside the root returns nil; no operation
-   reaches real disk unless you explicitly hand the host a `disk-fs`.
+   A path that resolves outside any configured mount returns nil; no
+   operation reaches real disk unless you explicitly hand the host a
+   `disk-fs`. Every value crossing the protocol is **sandbox-shaped**
+   (`/home/agent`, `/tmp`, `/`); real-disk paths are an
+   implementation detail private to each impl.
 2. **`BuiltinHost`** — wraps a fallback host (`jvm-host` /
    `node-host` / `browser-host`) and overrides `-spawn` so commands
    are dispatched to a builtin registry first. Anything not in the
    registry has to be in `:fallback-allowlist` or it gets refused
    with exit 126. The agent sees the builtins, never raw `bash`.
 3. **`permit/check`** — runs twice. Once at parse time over the
-   whole AST, once at every `run-external` site so dynamic dispatch
-   via `$cmd` and lazy command substitution `$(…)` are also caught.
+   whole AST (including recursing into shell-interpreter heredoc
+   bodies — `bash <<EOF rm -rf /tmp EOF` is still gated), once at
+   every `run-external` site so dynamic dispatch via `$cmd` and
+   lazy command substitution `$(…)` are also caught.
+4. **`SandboxedHost`** *(optional, JVM-only, Linux)* — decorates
+   the BuiltinHost's fallback so allowlisted system tools (`git`,
+   `npm`, `python`, …) run inside [bubblewrap]:
+   `--bind <wrapper>/{home/agent,tmp,…} → /home/agent,/tmp,…`
+   (the FS mount table is reused verbatim), `--unshare-net` /
+   `--unshare-pid` / FHS ro-binds at `/usr`, `/etc`. Optional cgroup
+   caps via `systemd-run --user --scope` (`MemoryMax`, `CPUQuota`,
+   `TasksMax`). The agent's view and bwrap's view of every shared
+   path (`/home/agent`, `/tmp`) line up; writes from either side are
+   visible to the other.
+
+[bubblewrap]: https://github.com/containers/bubblewrap
 
 On top of that, **resource budgets** (`budget/step-interrupt`,
 `budget/deadline-interrupt`, `budget/combine`) interrupt runaway loops
@@ -294,16 +355,39 @@ The permit layer runs **twice**:
 
 Default rules ship in `muschel.permit/default-rules` — POSIX-ish
 allowlist of read-only file tools plus a denylist of mutating /
-network commands. Compose your own:
+network commands. Rules are data (`:tool / :pattern / :action`),
+not regex pairs, and the pattern uses one of several matcher kinds:
 
 ```clojure
-{:rulesets [{:allow [#"^git (status|log|diff)\b"]
-             :deny  [#"^rm "]
-             :prompt [#".*"]}]   ; everything else asks
+{:rulesets
+ [[;; Order-insensitive flag set — fires whether the agent types
+   ;; `rm -r /tmp/x`, `rm /tmp/x -r`, `rm -rf /tmp`, or
+   ;; `rm --recursive /tmp`. POSIX short clusters auto-split.
+   {:tool :bash
+    :pattern {:kind :argv-flags
+              :head    ["rm"]
+              :any-of  #{"-r" "-R" "--recursive"}}
+    :action :deny
+    :reason "recursive delete"}
+   ;; Exact prefix: allow `git status [args…]`
+   {:tool :bash
+    :pattern {:kind :argv-vec :vec ["git" "status"]}
+    :action :allow}
+   ;; Everything else for git: ask via the prompter
+   {:tool :bash
+    :pattern {:kind :cmd-name :name "git"}
+    :action :ask}]]
  :prompter (fn [{:keys [argv]}]
-             ;; return :allow / :deny / :allow-once
-             :deny)}
+             ;; return {:result :allow-once | :allow-always
+             ;;                | :deny-once  | :deny-always}
+             {:result :deny-once})}
 ```
+
+Available matcher kinds: `:cmd-name`, `:argv-vec` (ordered prefix),
+`:argv-shape` (exact length, supports `:*` / `:**` wildcards),
+`:argv-flags` (order-insensitive flag-set match), `:argv-glob`
+(joined-argv bash glob), and `:ast-pred` (predicate over the call
+node) for anything the data forms can't express.
 
 ## Sessions
 

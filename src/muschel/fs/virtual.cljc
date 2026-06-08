@@ -273,7 +273,13 @@
 
   (-sandbox-relativize [_ path]
     ;; VFS paths are already sandbox-rooted (start at "/"). Pass through.
-    path))
+    path)
+
+  (-physical-path [_ sandbox-path]
+    ;; VFS has no real-disk path — identity for protocol conformance.
+    ;; Consumers that need a real cwd for OS spawn (run-external) only
+    ;; use this when the FS is disk-backed; for VFS the value is moot.
+    sandbox-path))
 
 (defn- coerce-content
   "Accept legacy `:bytes` keys as well as the canonical `:content`,

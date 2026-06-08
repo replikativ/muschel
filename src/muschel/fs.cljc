@@ -129,11 +129,19 @@
      truthy on success.")
 
   (-sandbox-relativize [this real-path-str]
-    "Translate a backend-internal absolute path (e.g. a real disk path
-     like `/tmp/muschel-xyz/foo`) into a sandbox-rooted display path
-     (e.g. `/foo`). Used by builtins like `pwd` and `realpath` to keep
-     the host's mount prefix out of the agent's view. For VFS this is
-     identity — VFS paths are already sandbox-rooted."))
+    "Legacy display translator: real-disk path → sandbox-relative
+     path. Vestigial under the sandbox-only protocol — every method
+     now returns sandbox-relative paths directly, so callers don't
+     need this. Kept as identity-on-sandbox-input for back-compat.")
+
+  (-physical-path [this sandbox-path]
+    "Translate a sandbox-relative path (`/home/agent/foo`) into the
+     impl's internal storage path. For DiskFS this is the real disk
+     path (`<wrapper>/home/agent/foo`). For VirtualFS this is the
+     identity. Used at exactly one boundary: the run-external →
+     OS-spawn dispatch, where babashka.process / child_process need
+     a real-disk cwd. Returns nil for paths that don't translate
+     (above the mount, traversal-out, etc.)."))
 
 ;; ============================================================================
 ;; Public wrappers
@@ -157,6 +165,7 @@
 (defn symlink     [fs target link-path] (-symlink fs target link-path))
 (defn chown       [fs path owner group] (-chown fs path owner group))
 (defn sandbox-relativize [fs real-path-str] (-sandbox-relativize fs real-path-str))
+(defn physical-path     [fs sandbox-path]  (-physical-path     fs sandbox-path))
 
 (defn write-string!
   "Portable write-string-to-path. Opens a sink via `-open-sink`,
