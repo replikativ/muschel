@@ -314,14 +314,19 @@
    Wraps the FALLBACK, not the BuiltinHost: muschel's own builtins
    (cat/ls/grep/…) execute in-process against the FS protocol and
    are already FS-jailed; only allowlisted system tools (git, npm,
-   python, …) need OS-level isolation."
-  [fallback-host opts]
+   python, …) need OS-level isolation.
+
+   The DiskFS's mount table is threaded through so bwrap's binds
+   and the agent's FS view stay aligned (the same /home/agent,
+   /tmp, … on both sides)."
+  [fallback-host fs opts]
   (if (not= "bwrap" (:os-sandbox opts))
     fallback-host
     (let [bind-root (.getCanonicalPath (java.io.File. ^String (:root opts)))]
       (host.sandboxed/make
        (cond-> {:wrapped   fallback-host
                 :bind-root bind-root
+                :mounts    (fs.disk/mounts fs)
                 :net       (keyword (or (:net opts) "off"))}
          (:mem-max opts)    (assoc :mem-max    (:mem-max opts))
          (:cpu-quota opts)  (assoc :cpu-quota  (:cpu-quota opts))
@@ -350,7 +355,7 @@
                     (fs.virtual/make (or seed {}) {:cwd "/"})))
           allow (when-let [s (:allow opts)]
                   (set (map str/trim (str/split s #","))))
-          fallback (maybe-wrap-os-sandbox (m/jvm-host) opts)
+          fallback (maybe-wrap-os-sandbox (m/jvm-host) fs opts)
           host  (m/builtin-host
                  {:fs fs
                   :fallback-host fallback

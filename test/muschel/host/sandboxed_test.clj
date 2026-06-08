@@ -115,33 +115,65 @@
     (is (nil? (:dir @recorded)))))
 
 ;; ============================================================================
-;; Custom mount-at
+;; Custom mounts
 ;; ============================================================================
 
-(deftest custom-mount-at
+(defn- bind-pairs
+  "Extract every [src dst] pair following a --bind flag from argv."
+  [argv]
+  (->> (partition 3 1 argv)
+       (keep (fn [[a src dst]]
+               (when (= "--bind" a) [src dst])))))
+
+(deftest each-mount-becomes-a-bind
+  ;; Default mounts: /home/agent + /tmp. Both should appear as --bind
+  ;; <bind-root>/<wrapper-subdir> <sandbox-path> pairs.
   (let [[recorded inner] (stub-host)
-        h (sb/make {:wrapped inner :bind-root "/tmp/sbx" :mount-at "/work"})]
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
     (spawn! h {:cmd "ls"})
-    (let [argv (vec (recorded-cmd+args recorded))]
-      (is (= "/tmp/sbx/work" (value-after argv "--bind"))
-          "bind source uses /work under bind-root")
-      (is (= "/work"
-             (nth argv (+ 2 (.indexOf ^java.util.List argv "--bind"))))
-          "bind target is the custom mount-at")
-      (is (= "/work" (value-after argv "--chdir"))))))
+    (let [pairs (set (bind-pairs (recorded-cmd+args recorded)))]
+      (is (contains? pairs ["/tmp/sbx/home/agent" "/home/agent"]))
+      (is (contains? pairs ["/tmp/sbx/tmp"        "/tmp"])))))
+
+(deftest tmp-mount-replaces-default-tmpfs
+  ;; When a mount targets /tmp, the default `--tmpfs /tmp` is dropped
+  ;; (the bind covers it). With no /tmp mount, the tmpfs comes back.
+  (let [[recorded-with inner] (stub-host)
+        with-tmp (sb/make {:wrapped inner :bind-root "/tmp/sbx"})
+        [recorded-without inner2] (stub-host)
+        without-tmp (sb/make {:wrapped inner2 :bind-root "/tmp/sbx"
+                              :mounts [["/home/agent" "home/agent"]]})]
+    (spawn! with-tmp {:cmd "ls"})
+    (spawn! without-tmp {:cmd "ls"})
+    (let [with-argv (recorded-cmd+args recorded-with)
+          without-argv (recorded-cmd+args recorded-without)]
+      (is (not (some #{"--tmpfs"} with-argv))
+          "/tmp mount replaces the ephemeral tmpfs")
+      (is (some #{"--tmpfs"} without-argv)
+          "without /tmp mount, fall back to ephemeral tmpfs"))))
+
+(deftest custom-mounts
+  (let [[recorded inner] (stub-host)
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx"
+                    :mounts [["/work" "work"]]})]
+    (spawn! h {:cmd "ls"})
+    (let [argv (vec (recorded-cmd+args recorded))
+          pairs (set (bind-pairs argv))]
+      (is (contains? pairs ["/tmp/sbx/work" "/work"]))
+      (is (= "/work" (value-after argv "--chdir"))
+          "first mount is the default chdir"))))
 
 (deftest mount-at-root-flat-layout
-  ;; mount-at "/" is the legacy / test-friendly layout: bind <root> at
-  ;; / (no nested home/agent subdir).
+  ;; Mount at / is the legacy single-mount flat layout. Bind source is
+  ;; the wrapper itself; default chdir is /.
   (let [[recorded inner] (stub-host)
-        h (sb/make {:wrapped inner :bind-root "/tmp/sbx" :mount-at "/"})]
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx"
+                    :mounts [["/" ""]]})]
     (spawn! h {:cmd "ls" :dir "/sub"})
-    (let [argv (vec (recorded-cmd+args recorded))]
-      (is (= "/tmp/sbx" (value-after argv "--bind"))
-          "bind source is bind-root itself when mount-at = /")
-      (is (= "/" (nth argv (+ 2 (.indexOf ^java.util.List argv "--bind")))))
-      (is (= "/sub" (value-after argv "--chdir"))
-          ":dir is sandbox-shaped and passes through to --chdir"))))
+    (let [argv (vec (recorded-cmd+args recorded))
+          pairs (set (bind-pairs argv))]
+      (is (contains? pairs ["/tmp/sbx" "/"]))
+      (is (= "/sub" (value-after argv "--chdir"))))))
 
 ;; ============================================================================
 ;; Networking + binds + cgroups

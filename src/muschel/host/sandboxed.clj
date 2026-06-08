@@ -95,41 +95,64 @@
    "--symlink" "usr/lib"   "/lib"
    "--symlink" "usr/lib64" "/lib64"])
 
-(defn- bind-source
-  "Real-disk path of the agent workspace. With default mount-at
-   `/home/agent` and bind-root `/tmp/proj`, returns `/tmp/proj/home/agent`."
-  [^String bind-root ^String mount-at]
-  (if (= "/" mount-at)
-    (str/replace bind-root #"/+$" "")
-    (str (str/replace bind-root #"/+$" "") mount-at)))
+(defn- mount-bind-source
+  "Real-disk path of a mount's wrapper-subdir under `bind-root`."
+  [^String bind-root ^String wrapper-subdir]
+  (let [trimmed (str/replace bind-root #"/+$" "")]
+    (if (or (= "" wrapper-subdir) (nil? wrapper-subdir))
+      trimmed
+      (str trimmed "/" wrapper-subdir))))
+
+(defn- mount-bind-args
+  "Emit --bind args for every mount entry in `mounts` (vec of
+   [sandbox-path wrapper-subdir])."
+  [^String bind-root mounts]
+  (mapcat (fn [[sandbox-path wrapper-subdir]]
+            ["--bind" (mount-bind-source bind-root wrapper-subdir) sandbox-path])
+          mounts))
+
+(defn- mount-occupies-tmp?
+  "True if any mount targets `/tmp` (exactly) — we drop the default
+   tmpfs /tmp when a real bind covers it."
+  [mounts]
+  (some (fn [[sp _]] (= sp "/tmp")) mounts))
+
+(defn- default-chdir
+  "When no :dir is provided, chdir to the first mount's sandbox-path
+   — the muschel convention is that the first mount IS the agent's
+   workspace (`/home/agent` by default)."
+  [mounts]
+  (or (ffirst mounts) "/"))
 
 (defn- chdir-arg
   "Map a spawn :dir into bwrap's `--chdir` value. With the sandbox-
    space FS protocol, `:dir` is already a sandbox path; we pass it
-   through and default to the mount root when absent."
-  [^String mount-at dir]
+   through and default to the first mount when absent."
+  [mounts dir]
   (if (and (string? dir) (not (str/blank? dir)))
     dir
-    mount-at))
+    (default-chdir mounts)))
 
 (defn- bwrap-argv
   "Construct the bwrap arg vector preceding `-- cmd args`."
-  [{:keys [bind-root mount-at ro-binds extra-binds net]} dir]
-  (let [src (bind-source bind-root mount-at)]
-    (vec
-     (concat
-      ["bwrap"
-       "--bind" src mount-at
-       "--proc" "/proc"
-       "--dev"  "/dev"
-       "--tmpfs" "/tmp"]
-      (ro-bind-args (or ro-binds ["/usr" "/etc"]))
-      fhs-symlinks
-      (extra-bind-args extra-binds)
-      (when (= :off net) ["--unshare-net"])
-      ["--unshare-pid" "--die-with-parent"
-       "--chdir" (chdir-arg mount-at dir)]
-      ["--"]))))
+  [{:keys [bind-root mounts ro-binds extra-binds net]} dir]
+  (vec
+   (concat
+    ["bwrap"]
+    (mount-bind-args bind-root mounts)
+    ["--proc" "/proc"
+     "--dev"  "/dev"]
+    ;; If no mount covers /tmp, keep the ephemeral bwrap tmpfs so
+    ;; the FHS still has something at /tmp. Otherwise the mount
+    ;; provides it.
+    (when-not (mount-occupies-tmp? mounts) ["--tmpfs" "/tmp"])
+    (ro-bind-args (or ro-binds ["/usr" "/etc"]))
+    fhs-symlinks
+    (extra-bind-args extra-binds)
+    (when (= :off net) ["--unshare-net"])
+    ["--unshare-pid" "--die-with-parent"
+     "--chdir" (chdir-arg mounts dir)]
+    ["--"])))
 
 (defn- cgroup-enabled? [{:keys [mem-max cpu-quota tasks-max]}]
   (boolean (or mem-max cpu-quota tasks-max)))
@@ -169,7 +192,7 @@
 ;; Host protocol — delegate everything except -spawn
 ;; ============================================================================
 
-(defrecord SandboxedHost [wrapped bind-root mount-at ro-binds extra-binds net
+(defrecord SandboxedHost [wrapped bind-root mounts ro-binds extra-binds net
                           mem-max cpu-quota tasks-max])
 
 (extend-type SandboxedHost
@@ -195,41 +218,52 @@
   (-async             [this thunk]    (host/-async            (:wrapped this) thunk))
   (-await             [this h]        (host/-await            (:wrapped this) h)))
 
+(def ^:private default-mounts
+  ;; Mirrors muschel.fs.disk/default-mounts; duplicated here to avoid
+  ;; a cyclic require (sandboxed.clj is a pure host decorator, doesn't
+  ;; depend on the FS impls). The CLI explicitly threads the FS's
+  ;; mounts through, so this default only fires when SandboxedHost is
+  ;; used standalone (tests, library callers).
+  [["/home/agent" "home/agent"]
+   ["/tmp"        "tmp"]])
+
 (defn make
   "Wrap `wrapped-host` so every spawn runs inside bwrap.
 
    Required:
      :wrapped     the underlying Host (typically a BuiltinHost over
                   JvmHost)
-     :bind-root   the wrapper directory DiskFS is pinned to. The
-                  agent's workspace lives at `<bind-root>/<mount-at>`
-                  on disk and is bind-mounted at `<mount-at>` inside
-                  the sandbox.
+     :bind-root   the wrapper directory DiskFS is pinned to. Each
+                  mount entry's wrapper-subdir is resolved against
+                  this root and bind-mounted at the mount's
+                  sandbox-path inside bwrap.
 
    Optional:
-     :mount-at     \"/home/agent\" (default) — where the workspace
-                                  appears in the sandbox view; must
-                                  match the corresponding DiskFS
-                                  :mount-at
-     :ro-binds     [\"/usr\" \"/etc\"]  read-only host dirs to expose
-     :extra-binds  [[host sbox] …]      additional read-write binds
-     :net          :off | :on           default :off (unshare network)
-     :mem-max      \"512M\" / \"2G\"    cgroup MemoryMax
-     :cpu-quota    \"200%\"             cgroup CPUQuota (200% = 2 cores)
-     :tasks-max    512                  cgroup TasksMax
+     :mounts      [[sandbox-path wrapper-subdir] …]
+                  Default `[[/home/agent home/agent] [/tmp tmp]]`.
+                  MUST match the FS layer's mount table so the
+                  agent's view and the spawned process's view align.
+                  If any mount targets /tmp, the default ephemeral
+                  bwrap tmpfs at /tmp is dropped.
+     :ro-binds    [\"/usr\" \"/etc\"]  read-only host dirs to expose
+     :extra-binds [[host sbox] …]      additional read-write binds
+     :net         :off | :on           default :off (unshare network)
+     :mem-max     \"512M\" / \"2G\"    cgroup MemoryMax
+     :cpu-quota   \"200%\"             cgroup CPUQuota (200% = 2 cores)
+     :tasks-max   512                  cgroup TasksMax
 
    Setting any of :mem-max / :cpu-quota / :tasks-max prepends
    `systemd-run --user --scope` to the spawn so the limits take
    effect in a transient cgroup."
-  [{:keys [wrapped bind-root mount-at ro-binds extra-binds net
+  [{:keys [wrapped bind-root mounts ro-binds extra-binds net
            mem-max cpu-quota tasks-max]
-    :or   {mount-at    "/home/agent"
+    :or   {mounts      default-mounts
            ro-binds    ["/usr" "/etc"]
            extra-binds []
            net         :off}}]
   {:pre [(some? wrapped)
          (string? bind-root)
-         (string? mount-at)
-         (.startsWith ^String mount-at "/")]}
-  (->SandboxedHost wrapped bind-root mount-at ro-binds extra-binds net
+         (sequential? mounts)
+         (seq mounts)]}
+  (->SandboxedHost wrapped bind-root mounts ro-binds extra-binds net
                    mem-max cpu-quota tasks-max))

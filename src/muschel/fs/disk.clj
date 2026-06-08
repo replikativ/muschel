@@ -1,79 +1,79 @@
 (ns muschel.fs.disk
-  "Real-disk FS implementation pinned to a wrapper directory, with the
-   project files at a known subpath inside.
+  "Real-disk FS implementation pinned to a wrapper directory, with one
+   or more sandbox-path → wrapper-subdir mounts inside.
 
    ## Wrapper layout
 
-   `(make wrapper opts)` takes a host directory `wrapper` and a
-   `:mount-at` sandbox path (default `/home/agent`). The agent's
-   project files live on disk at `<wrapper>/<mount-at>`; the agent
-   sees them at `<mount-at>` in the sandbox view:
+   `(make wrapper opts)` takes a host directory `wrapper` and a list
+   of `:mounts` (default `[[\"/home/agent\" \"home/agent\"]
+   [\"/tmp\" \"tmp\"]]`). Each mount maps a sandbox-relative path to
+   a real-disk subdirectory under `wrapper`. The default gives the
+   agent both a project workspace at `/home/agent` and a writable
+   `/tmp` whose contents persist across spawns inside the wrapper
+   — both layers (builtin FS protocol + bwrap externals) see the
+   same files.
 
-       Host                            Sandbox view
-       -------------------             -----------------
-       <wrapper>/home/agent/  ←──→     /home/agent/      (the project)
-       <wrapper>/home/agent/foo.txt    /home/agent/foo.txt
+       Host                              Sandbox view
+       -------------------               -----------------
+       <wrapper>/home/agent/      ←──→   /home/agent/      (project)
+       <wrapper>/tmp/             ←──→   /tmp/             (scratch)
 
    `<wrapper>` itself is *outside* the agent's reach via the FS
-   protocol (containment is pinned at `<wrapper>/<mount-at>`).
-   Sibling paths under the wrapper — `<wrapper>/var/cache/`,
-   `<wrapper>/.muschel/`, etc. — are a future-reserved slot for
-   muschel-managed project state surfaced under
+   protocol (containment is per-mount). Sibling paths under the
+   wrapper are not exposed by default — they're a future-reserved
+   slot for muschel-managed project state surfaced under
    `/system/muschel-project/<name>/` once that's implemented.
 
    ## Sandbox-space contract
 
    Every value crossing the `muschel.fs/FS` protocol is a
-   **sandbox-relative path** — `/home/agent`, `/home/agent/src`, `/`,
-   `/home`. Real-disk paths are an implementation detail private to
-   this namespace. `-resolve`, `-cwd`, `-cd!` all produce / consume
-   sandbox paths. `-physical-path` is the one explicit translator
-   (sandbox → real disk) and is only called at the
-   `run-external` → OS-spawn boundary by `JvmHost`.
+   **sandbox-relative path** — `/home/agent`, `/home/agent/src`,
+   `/tmp/x`, `/`, `/home`. Real-disk paths are an implementation
+   detail private to this namespace. `-resolve`, `-cwd`, `-cd!`
+   all produce / consume sandbox paths. `-physical-path` is the
+   one explicit translator (sandbox → real disk) and is only
+   called at the `run-external` → OS-spawn boundary by `JvmHost`.
 
    ## Synthetic ancestor view
 
-   The strict prefixes of `mount-at` (`/`, `/home` for the default
-   `/home/agent`) are virtual read-only directories. `cd /` works,
-   `ls /` returns `[\"home\"]`, `stat /home` reports a directory.
-   Writes anywhere above the mount return nil. This keeps the
+   The strict prefixes of every mount's sandbox-path are virtual
+   read-only directories. With the default `[/home/agent /tmp]`,
+   the union is `{/ /home}`. `ls /` returns `[home tmp]` (one
+   segment toward each mount); `ls /home` returns `[agent]`.
+   Writes anywhere above a mount return nil. This keeps the
    builtin shell environment bash-credible without aliasing or
-   syscall-tower trickery — bwrap-spawned externals see the real
-   FHS at `/`, builtins see just the path leading down to the
-   workspace. Different namespaces, neither lies about being the
-   other.
+   syscall-tower trickery.
 
    ## Auto-create on construction
 
-   `make` ensures `<wrapper>/<mount-at>` exists on disk
-   (`Files/createDirectories`, idempotent). The contract is: handing
-   muschel a wrapper dir, even an empty one, yields a working
-   sandbox without the caller having to pre-create the agent
-   workspace.
+   `make` ensures every mount's real-disk subdirectory exists
+   under `wrapper` (`Files/createDirectories`, idempotent). Hand
+   muschel a wrapper dir — even an empty one — and you get a
+   working sandbox with all configured mounts ready.
+
+   ## Back-compat: `:mount-at`
+
+   `:mount-at X` is the legacy single-mount API and creates
+   `:mounts [[X wrapper-subdir-of-X]]` with NO auto-`/tmp`. Used
+   by FS-protocol-level tests that want to exercise the generic
+   contract without the multi-mount default.
 
    ## Containment caveats
 
-   - **Symlinks pointing outside root** are caught: we always
+   - **Symlinks pointing outside any mount** are caught: we always
      toRealPath() before the prefix check. If the link target is
      outside, the resolve returns nil.
 
    - **TOCTOU**: between resolve() and a subsequent read, an attacker
-     with write access to the root could swap a regular file for
-     a symlink pointing outside. We re-resolve at every op so the
+     with write access to a mount could swap a regular file for a
+     symlink pointing outside. We re-resolve at every op so the
      window is per-call; it's NOT zero. For untrusted-attacker
      scenarios pair with OS-level isolation (bwrap/firejail).
-
-   - **`/proc/self/root` and other magic paths** are denied because
-     they don't normalize into the root. Same for hard links to
-     /etc/passwd inside the root — we can't detect those, so don't
-     mount writable file roots if hard-link attacks matter.
 
    - **JVM-only** (uses java.nio.file). For Node and browser, ship
      analogous impls in their own namespaces. Each impl is
      responsible for ensuring its real-root exists on construction
-     using its platform's native API (Files/createDirectories on
-     JVM, fs.mkdirSync on Node, etc.) — embedders just call
-     `make` and get a usable handle."
+     using its platform's native API."
   (:require [muschel.fs :as fs]
             [clojure.string :as str])
   (:import [java.nio.file Path Paths Files LinkOption NoSuchFileException]
@@ -89,63 +89,166 @@
   (Paths/get p (make-array String 0)))
 
 (defn- ^Path safe-real-path
-  "Canonicalise `^Path p` following symlinks. Returns nil if the path
-   doesn't exist or any step is unreadable."
   [^Path p]
   (try (.toRealPath p follow)
        (catch NoSuchFileException _ nil)
        (catch Throwable _ nil)))
 
-(defn- ^Path canonical-root [^String root]
-  (let [p (str->path root)
+(defn- ^Path canonical-or-abs [^String s]
+  (let [p (str->path s)
         real (safe-real-path p)]
-    (or real
-        (.toAbsolutePath (.normalize p)))))
+    (or real (.toAbsolutePath (.normalize p)))))
 
-(defn- inside?
-  "True if `^Path candidate` is the root itself or a descendant."
-  [^Path root ^Path candidate]
-  (or (= root candidate)
-      (.startsWith candidate root)))
+(defn- inside-any?
+  "True if `^Path candidate` is at or under any of the mount real-roots."
+  [mount-real-roots ^Path candidate]
+  (some (fn [^Path root]
+          (or (= root candidate)
+              (.startsWith candidate root)))
+        mount-real-roots))
 
 ;; ============================================================================
-;; Mount-at and sandbox-path helpers
+;; Mount + path validation
 ;; ============================================================================
 
-(def ^:private default-mount-at "/home/agent")
-
-(defn- normalize-mount-at
-  "Validate + normalise the `:mount-at` option. Must be an absolute
-   POSIX-style path with no `..`. Returns the normalised string
-   (`/`, `/home/agent`, `/work`, …) or throws."
+(defn- normalize-sandbox-prefix
+  "Validate + normalise an absolute sandbox path used as a mount
+   point. No `..`, no trailing slash (except for `/` itself)."
   [^String s]
   (when-not (and (string? s) (.startsWith s "/"))
-    (throw (ex-info "DiskFS :mount-at must be an absolute path"
-                    {:mount-at s})))
+    (throw (ex-info "mount sandbox-path must be absolute" {:path s})))
   (let [collapsed (str/replace s #"/+" "/")
-        stripped  (if (= "/" collapsed)
-                    "/"
-                    (str/replace collapsed #"/$" ""))]
-    (when (or (str/blank? stripped)
-              (some #{".."} (str/split stripped #"/")))
-      (throw (ex-info "DiskFS :mount-at must be a non-empty path with no `..`"
-                      {:mount-at s})))
+        stripped  (if (= "/" collapsed) "/" (str/replace collapsed #"/$" ""))]
+    (when (or (str/blank? stripped) (some #{".."} (str/split stripped #"/")))
+      (throw (ex-info "mount sandbox-path must be non-empty and not contain `..`"
+                      {:path s})))
     stripped))
+
+(defn- normalize-wrapper-subdir
+  "Validate the wrapper-subdir for a mount. A relative POSIX path,
+   no `..`. `\"\"` means the wrapper itself (used for the legacy
+   `:mount-at \"/\"` mode)."
+  [^String s]
+  (when-not (string? s)
+    (throw (ex-info "wrapper-subdir must be a string" {:value s})))
+  (let [collapsed (str/replace s #"^/+" "")
+        stripped  (str/replace collapsed #"/+$" "")]
+    (when (some #{".."} (str/split stripped #"/"))
+      (throw (ex-info "wrapper-subdir must not contain `..`" {:value s})))
+    stripped))
+
+(defn- normalize-mount [[sp ws]]
+  [(normalize-sandbox-prefix sp) (normalize-wrapper-subdir ws)])
+
+(defn- mount-for
+  "Return the mount entry [sandbox-prefix wrapper-subdir] whose
+   sandbox-prefix is at-or-above `path`. Longest match wins (so
+   nested mounts work, though we don't ship any by default)."
+  [mounts ^String path]
+  (->> mounts
+       (filter (fn [[sp _]]
+                 (or (= sp "/")
+                     (= path sp)
+                     (.startsWith path (str sp "/")))))
+       (sort-by (fn [[sp _]] (- (count sp))))
+       first))
+
+(defn- ^String sandbox->physical-str
+  "Translate `path` (sandbox-absolute, under some mount) to its
+   real-disk path. Returns nil if no mount contains it."
+  [^Path root mounts ^String path]
+  (when-let [[sp ws] (mount-for mounts path)]
+    (let [tail (cond
+                 (= path sp)        ""
+                 (= sp "/")         path        ; everything is tail under root-mount
+                 :else              (subs path (count sp)))
+          base (if (= ws "") (str root) (str root "/" ws))]
+      (str base tail))))
+
+(defn- ^String physical->sandbox
+  "Translate a real-disk path under one of the mount real-roots back
+   to its sandbox form. Returns nil if outside every mount."
+  [^Path root mounts ^String real-path-str]
+  (let [rs (str root)]
+    (when (or (= real-path-str rs) (.startsWith real-path-str (str rs "/")))
+      (let [under-root (if (= real-path-str rs) "" (subs real-path-str (count rs)))]
+        ;; under-root is "" or "/<rest>"; find the mount whose
+        ;; wrapper-subdir is the prefix of the rest.
+        (when-let [[sp ws]
+                   (->> mounts
+                        (filter (fn [[_ ws]]
+                                  (let [ws-prefix (if (= ws "") "" (str "/" ws))]
+                                    (or (= under-root ws-prefix)
+                                        (and (not= ws-prefix "")
+                                             (.startsWith under-root (str ws-prefix "/")))
+                                        (and (= ws-prefix "")
+                                             (or (= under-root "") (.startsWith under-root "/")))))))
+                        (sort-by (fn [[_ ws]] (- (count ws))))
+                        first)]
+          (let [ws-prefix (if (= ws "") "" (str "/" ws))
+                tail (if (= under-root ws-prefix) "" (subs under-root (count ws-prefix)))]
+            (cond
+              (and (= sp "/") (= tail "")) "/"
+              (= sp "/") tail
+              :else (str sp tail))))))))
+
+;; ============================================================================
+;; Ancestor view
+;; ============================================================================
+
+(defn- ancestors-of [^String sandbox-path]
+  ;; "/home/agent" → ("/" "/home"); "/tmp" → ("/"); "/" → ()
+  (when (not= sandbox-path "/")
+    (let [segs (rest (str/split sandbox-path #"/"))]
+      (for [n (range (count segs))
+            :let [taken (take n segs)]]
+        (if (empty? taken) "/" (str "/" (str/join "/" taken)))))))
+
+(defn- all-ancestors [mounts]
+  (->> mounts
+       (mapcat (fn [[sp _]] (ancestors-of sp)))
+       distinct
+       set))
+
+(defn- ancestor-of-mount?
+  "True if `path` is a strict prefix of any mount sandbox-path."
+  [mounts ^String path]
+  (contains? (all-ancestors mounts) path))
+
+(defn- ancestor-children
+  "For an ancestor `ancestor-path`, return the deduped next-segments
+   leading toward each mount below."
+  [mounts ^String ancestor-path]
+  (->> mounts
+       (keep (fn [[sp _]]
+               (when (and (not= sp ancestor-path)
+                          (or (= ancestor-path "/")
+                              (str/starts-with? sp (str ancestor-path "/"))))
+                 (let [start (if (= ancestor-path "/") 1 (inc (count ancestor-path)))
+                       remainder (subs sp start)]
+                   (first (str/split remainder #"/"))))))
+       distinct
+       vec))
+
+(defn- under-some-mount? [mounts ^String path]
+  (some? (mount-for mounts path)))
+
+;; ============================================================================
+;; Lex absolutize + resolution
+;; ============================================================================
 
 (defn- absolutize-sandbox
   "Pure-string absolute + normalize for sandbox-space paths. `cwd`
-   must be sandbox-absolute. Relative paths join with cwd; `.` and
-   `..` segments collapse; `..` past `/` returns nil. `~/` returns
-   nil (caller handles tilde). Always returns a string starting with
-   `/`, or nil for malformed input."
+   must be sandbox-absolute. Returns nil for ~/-prefixed paths and
+   for malformed input."
   [^String cwd ^String path]
   (when (and (string? path) (not (str/blank? path)))
     (cond
       (str/starts-with? path "~/") nil
       :else
-      (let [joined (cond
-                     (str/starts-with? path "/") path
-                     :else (str (str/replace cwd #"/$" "") "/" path))
+      (let [joined (if (str/starts-with? path "/")
+                     path
+                     (str (str/replace cwd #"/$" "") "/" path))
             segs   (str/split joined #"/")
             normalized (loop [in segs out []]
                          (if-let [s (first in)]
@@ -160,80 +263,28 @@
             "/"
             (str "/" (str/join "/" normalized))))))))
 
-(defn- under-mount?
-  "True if sandbox `path` is `mount-at` itself or below."
-  [^String mount-at ^String path]
-  (or (= path mount-at)
-      (str/starts-with? path (str mount-at "/"))
-      (= mount-at "/")))
-
-(defn- ancestor-of-mount?
-  "True if sandbox `path` is a strict prefix of `mount-at` — e.g.,
-   `/` or `/home` when mount-at is `/home/agent`. Always false when
-   mount-at is `/` (nothing above `/`)."
-  [^String mount-at ^String path]
-  (and (not= mount-at "/")
-       (not= path mount-at)
-       (or (= path "/")
-           (str/starts-with? (str mount-at "/") (str path "/")))))
-
-(defn- next-segment-toward-mount
-  "For an ancestor `path` of `mount-at`, return the segment leading
-   one level toward the mount. E.g. `/` → `\"home\"`, `/home` →
-   `\"agent\"` when mount-at is `/home/agent`."
-  [^String mount-at ^String path]
-  (let [start-idx (if (= path "/") 1 (inc (count path)))
-        tail (subs mount-at start-idx)]
-    (first (str/split tail #"/"))))
-
-(defn- ^String sandbox->physical-str
-  "Translate a sandbox path that's under-mount into its real-disk
-   path under `root`. Returns nil for ancestor or out-of-mount
-   paths."
-  [^Path root ^String mount-at ^String sandbox-path]
-  (when (under-mount? mount-at sandbox-path)
-    (let [root-str (str root)
-          tail (cond
-                 (= mount-at "/") sandbox-path
-                 (= sandbox-path mount-at) ""
-                 :else (subs sandbox-path (count mount-at)))]
-      (if (= "" tail) root-str (str root-str tail)))))
-
-(defn- ^String physical->sandbox
-  "Translate a canonical real-disk path under `root` back to its
-   sandbox representation. Returns nil for paths outside root."
-  [^Path root ^String mount-at ^String real-path-str]
-  (let [rs (str root)]
-    (cond
-      (= real-path-str rs) mount-at
-      (.startsWith real-path-str (str rs "/"))
-      (let [tail (subs real-path-str (count rs))]
-        (if (= mount-at "/") tail (str mount-at tail)))
-      :else nil)))
-
-;; ============================================================================
-;; Resolution
-;; ============================================================================
+(defn- mount-real-roots [^Path root mounts]
+  (mapv (fn [[_ ws]]
+          (let [s (if (= ws "") (str root) (str root "/" ws))]
+            (canonical-or-abs s)))
+        mounts))
 
 (defn- canonicalize-in-mount
-  "For a sandbox path known to be under-mount, translate to a real-
-   disk path, canonicalise via toRealPath (follow symlinks; check
-   containment), then translate back to sandbox. If the leaf doesn't
-   exist, walk up to the nearest existing ancestor on disk and re-
-   join the missing tail lexically — preserves the existing write-
-   target behaviour (open-sink can target a path whose parent exists)
-   but rejects any symlink-mediated escape.
-
-   Returns the canonical sandbox path on success, nil on escape."
-  [^Path root ^String mount-at ^String sandbox-path]
-  (let [physical-str (sandbox->physical-str root mount-at sandbox-path)]
+  "Translate a sandbox path that's under some mount into its
+   canonical sandbox form by going through real-disk symlink
+   resolution + containment check. If the leaf doesn't exist, walk
+   up to the nearest existing ancestor on disk and re-join the
+   missing tail lexically."
+  [^Path root mounts ^String sandbox-path]
+  (let [physical-str (sandbox->physical-str root mounts sandbox-path)]
     (when physical-str
       (let [normalized (.normalize (.toAbsolutePath (str->path physical-str)))
-            real (safe-real-path normalized)]
+            real (safe-real-path normalized)
+            real-roots (mount-real-roots root mounts)]
         (cond
           (some? real)
-          (when (inside? root real)
-            (physical->sandbox root mount-at (str real)))
+          (when (inside-any? real-roots real)
+            (physical->sandbox root mounts (str real)))
 
           :else
           (loop [p     (.getParent normalized)
@@ -242,30 +293,26 @@
               (nil? p) nil
               :else
               (if-let [real-anc (safe-real-path p)]
-                (when (inside? root real-anc)
-                  (let [rebuilt (reduce (fn [^Path acc ^Path seg]
-                                          (.resolve acc seg))
+                (when (inside-any? real-roots real-anc)
+                  (let [rebuilt (reduce (fn [^Path acc ^Path seg] (.resolve acc seg))
                                         real-anc
                                         tail)]
-                    (when (inside? root rebuilt)
-                      (physical->sandbox root mount-at (str rebuilt)))))
+                    (when (inside-any? real-roots rebuilt)
+                      (physical->sandbox root mounts (str rebuilt)))))
                 (recur (.getParent p)
                        (conj tail (.getFileName p)))))))))))
 
 (defn- resolve-sandbox
   "Sandbox-space resolution. Returns the canonical sandbox path of
-   `path` (resolved against `cwd`), or nil if the path is malformed
-   or escapes the sandbox. Ancestor paths above the mount return the
-   sandbox path itself; in-mount paths are real-disk canonicalised
-   then translated back to sandbox."
-  [^Path root ^String mount-at ^String cwd ^String path]
+   `path` (resolved against `cwd`), or nil on escape."
+  [^Path root mounts ^String cwd ^String path]
   (when-let [sandbox-abs (absolutize-sandbox cwd path)]
     (cond
-      (ancestor-of-mount? mount-at sandbox-abs)
+      (ancestor-of-mount? mounts sandbox-abs)
       sandbox-abs
 
-      (under-mount? mount-at sandbox-abs)
-      (canonicalize-in-mount root mount-at sandbox-abs)
+      (under-some-mount? mounts sandbox-abs)
+      (canonicalize-in-mount root mounts sandbox-abs)
 
       :else nil)))
 
@@ -283,41 +330,40 @@
 ;; Record
 ;; ============================================================================
 
-(defrecord DiskFS [^Path root ^String mount-at cwd-atom max-bytes]
+(defrecord DiskFS [^Path root mounts cwd-atom max-bytes]
   fs/FS
   (-resolve [_ path]
-    (resolve-sandbox root mount-at @cwd-atom path))
+    (resolve-sandbox root mounts @cwd-atom path))
 
   (-cwd [_] @cwd-atom)
 
   (-cd! [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
       (cond
-        ;; Ancestor: virtual dir, cd succeeds without real-disk check.
-        (ancestor-of-mount? mount-at sandbox)
+        (ancestor-of-mount? mounts sandbox)
         (do (reset! cwd-atom sandbox) sandbox)
 
         :else
-        (let [physical (sandbox->physical-str root mount-at sandbox)
+        (let [physical (sandbox->physical-str root mounts sandbox)
               p (str->path physical)]
           (when (Files/isDirectory p follow)
             (reset! cwd-atom sandbox)
             sandbox)))))
 
   (-exists? [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
       (cond
-        (ancestor-of-mount? mount-at sandbox) true
-        :else (Files/exists (str->path (sandbox->physical-str root mount-at sandbox)) follow))))
+        (ancestor-of-mount? mounts sandbox) true
+        :else (Files/exists (str->path (sandbox->physical-str root mounts sandbox)) follow))))
 
   (-stat [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
       (cond
-        (ancestor-of-mount? mount-at sandbox)
+        (ancestor-of-mount? mounts sandbox)
         {:type :dir :size 0 :mtime-ms 0 :perms nil}
 
         :else
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (when (Files/exists p no-follow)
             (let [attrs (Files/readAttributes p BasicFileAttributes follow)]
               {:type     (type-of p)
@@ -329,17 +375,15 @@
                            (catch Throwable _ nil))}))))))
 
   (-list-dir [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
       (cond
-        (ancestor-of-mount? mount-at sandbox)
-        ;; Virtual ancestor — return just the segment leading toward
-        ;; the mount. Reading deeper into ancestors gives no real
-        ;; entries.
-        (when-let [next-seg (next-segment-toward-mount mount-at sandbox)]
-          [{:name next-seg :type :dir :size 0 :mtime-ms 0}])
+        (ancestor-of-mount? mounts sandbox)
+        (mapv (fn [name]
+                {:name name :type :dir :size 0 :mtime-ms 0})
+              (ancestor-children mounts sandbox))
 
         :else
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (when (Files/isDirectory p follow)
             (with-open [stream (Files/newDirectoryStream p)]
               (vec
@@ -350,16 +394,16 @@
                                    :type     (type-of child)
                                    :size     (.size attrs)
                                    :mtime-ms (.toMillis (.lastModifiedTime attrs))}))
-                              stream))))))))) ; sort-by + mapv
+                              stream)))))))))
 
   (-read-file [this path]
     (when-let [bs (fs/-read-bytes this path)]
       (String. ^bytes bs "UTF-8")))
 
   (-read-bytes [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (when (Files/isRegularFile p follow)
             (let [size (Files/size p)
                   cap  max-bytes
@@ -370,16 +414,16 @@
               buf))))))
 
   (-open-source [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (when (Files/isRegularFile p follow)
             (Files/newInputStream p (make-array java.nio.file.OpenOption 0)))))))
 
   (-open-sink [_ path append?]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))
               base-opts (if append?
                           [java.nio.file.StandardOpenOption/CREATE
                            java.nio.file.StandardOpenOption/APPEND
@@ -390,37 +434,37 @@
           (Files/newOutputStream p (into-array java.nio.file.OpenOption base-opts))))))
 
   (-mkdir [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (when-not (Files/exists p follow)
             (try (Files/createDirectory p (make-array java.nio.file.attribute.FileAttribute 0))
                  true
                  (catch Throwable _ nil)))))))
 
   (-delete [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (try (Files/delete p) true
                (catch Throwable _ nil))))))
 
   (-rename [_ from to]
-    (when-let [from-sb (resolve-sandbox root mount-at @cwd-atom from)]
-      (when-not (ancestor-of-mount? mount-at from-sb)
-        (when-let [to-sb (resolve-sandbox root mount-at @cwd-atom to)]
-          (when-not (ancestor-of-mount? mount-at to-sb)
-            (try (Files/move (str->path (sandbox->physical-str root mount-at from-sb))
-                             (str->path (sandbox->physical-str root mount-at to-sb))
+    (when-let [from-sb (resolve-sandbox root mounts @cwd-atom from)]
+      (when-not (ancestor-of-mount? mounts from-sb)
+        (when-let [to-sb (resolve-sandbox root mounts @cwd-atom to)]
+          (when-not (ancestor-of-mount? mounts to-sb)
+            (try (Files/move (str->path (sandbox->physical-str root mounts from-sb))
+                             (str->path (sandbox->physical-str root mounts to-sb))
                              (into-array java.nio.file.CopyOption
                                          [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
                  true
                  (catch Throwable _ nil)))))))
 
   (-touch [_ path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (try
             (if (Files/exists p follow)
               (do (Files/setLastModifiedTime
@@ -431,9 +475,9 @@
             (catch Throwable _ nil))))))
 
   (-chmod [_ path mode]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))]
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))]
           (try
             (let [perms (java.nio.file.attribute.PosixFilePermissions/fromString
                          (let [m (long mode)
@@ -449,26 +493,27 @@
             (catch Throwable _ nil))))))
 
   (-symlink [_ target link-path]
-    (when-let [link-sb (resolve-sandbox root mount-at @cwd-atom link-path)]
-      (when-not (ancestor-of-mount? mount-at link-sb)
-        (let [link-physical (sandbox->physical-str root mount-at link-sb)
+    (when-let [link-sb (resolve-sandbox root mounts @cwd-atom link-path)]
+      (when-not (ancestor-of-mount? mounts link-sb)
+        (let [link-physical (sandbox->physical-str root mounts link-sb)
               link-p (str->path link-physical)
               link-parent (.getParent link-p)
               target-p (str->path target)
               target-abs (if (.isAbsolute target-p)
                            target-p
                            (.resolve link-parent target-p))
-              target-norm (.normalize target-abs)]
-          (when (inside? root target-norm)
+              target-norm (.normalize target-abs)
+              real-roots (mount-real-roots root mounts)]
+          (when (inside-any? real-roots target-norm)
             (try (Files/createSymbolicLink link-p target-p
                                            (make-array java.nio.file.attribute.FileAttribute 0))
                  true
                  (catch Throwable _ nil)))))))
 
   (-chown [_ path owner group]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (let [p (str->path (sandbox->physical-str root mount-at sandbox))
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (let [p (str->path (sandbox->physical-str root mounts sandbox))
               fs-svc (-> p .getFileSystem)
               lookup (-> fs-svc .getUserPrincipalLookupService)]
           (try
@@ -482,65 +527,97 @@
             (catch Throwable _ nil))))))
 
   (-sandbox-relativize [_ p]
-    ;; Vestigial — every method now returns sandbox paths directly.
-    ;; If callers feed a real-disk path under root (legacy), translate.
-    ;; Otherwise pass through (already sandbox).
-    (or (physical->sandbox root mount-at p) p))
+    (or (physical->sandbox root mounts p) p))
 
   (-physical-path [_ sandbox-path]
-    (when-let [sandbox (resolve-sandbox root mount-at @cwd-atom sandbox-path)]
-      (when-not (ancestor-of-mount? mount-at sandbox)
-        (sandbox->physical-str root mount-at sandbox)))))
+    (when-let [sandbox (resolve-sandbox root mounts @cwd-atom sandbox-path)]
+      (when-not (ancestor-of-mount? mounts sandbox)
+        (sandbox->physical-str root mounts sandbox)))))
 
 ;; ============================================================================
 ;; Constructor
 ;; ============================================================================
 
-(defn- ensure-real-root!
-  "Create the internal real-root directory if it doesn't yet exist.
-   Idempotent. JVM-side; future Node/browser FS impls do the
-   equivalent in their own constructors."
-  [^Path real-root]
-  (Files/createDirectories real-root (make-array java.nio.file.attribute.FileAttribute 0)))
+(def default-mounts
+  "Default mount table for the standard wrapper layout: the agent's
+   project workspace at `/home/agent` and a writable scratch dir at
+   `/tmp`, both backed by subdirectories of the wrapper. Both layers
+   (builtin FS protocol + bwrap externals) share these files."
+  [["/home/agent" "home/agent"]
+   ["/tmp" "tmp"]])
+
+(defn- mount-at->mounts [^String mount-at]
+  ;; Back-compat shim for the single-mount API.
+  (let [sp (normalize-sandbox-prefix mount-at)
+        ws (if (= sp "/") "" (subs sp 1))]
+    [[sp ws]]))
+
+(defn- validate-mounts [mounts]
+  (let [paths (map first mounts)]
+    (when (not= (count paths) (count (distinct paths)))
+      (throw (ex-info "Duplicate mount sandbox-paths" {:mounts mounts}))))
+  mounts)
 
 (defn make
   "Construct a disk-backed sandbox FS over `wrapper` — a host
-   directory that holds the agent's workspace at
-   `<wrapper>/<mount-at>` (default `<wrapper>/home/agent`).
+   directory that holds one or more agent-accessible mounts.
 
-   The agent sees their workspace at `<mount-at>` in the sandbox
-   view (e.g. `/home/agent/foo.txt` ↔ `<wrapper>/home/agent/foo.txt`).
-   The strict prefixes of `<mount-at>` (`/`, `/home` for the default)
-   are virtual read-only ancestor directories — `cd /` works, but
-   reading or writing anywhere above the mount returns nil.
+   Options (mutually exclusive, choose one or the other):
+     :mounts    explicit vec of [sandbox-path wrapper-subdir] pairs;
+                bypasses defaults. Use for custom layouts.
+     :mount-at  back-compat single-mount API; equivalent to
+                `:mounts [[mount-at <derived-subdir>]]`. No auto-/tmp.
 
-   Auto-creates `<wrapper>/<mount-at>` if it doesn't exist
-   (idempotent `Files/createDirectories`). The contract is that
-   handing muschel a wrapper dir — even an empty one — yields a
-   working sandbox.
+   With NEITHER, the default mount table is used:
+     [[\"/home/agent\" \"home/agent\"]
+      [\"/tmp\"        \"tmp\"]]
 
-   Options:
-     :mount-at   sandbox path of the workspace, default `/home/agent`
-                 (must be absolute, no `..`, no trailing slash; `/`
-                 is the legacy flat layout where `<wrapper>` itself
-                 is the workspace)
-     :cwd        initial sandbox cwd; defaults to `mount-at`
+   `make` auto-creates each mount's real-disk subdirectory under
+   `wrapper` (idempotent).
+
+   Other options:
+     :cwd        initial sandbox cwd; defaults to the first mount's
+                 sandbox path
      :max-bytes  read-file size cap, default 8 MiB"
   ([wrapper] (make wrapper {}))
-  ([wrapper {:keys [cwd max-bytes mount-at]
-             :or   {max-bytes default-read-cap
-                    mount-at  default-mount-at}}]
-   (let [mount-at  (normalize-mount-at mount-at)
+  ([wrapper {:keys [cwd max-bytes mounts mount-at]
+             :or   {max-bytes default-read-cap}}]
+   (when (and mounts mount-at)
+     (throw (ex-info "Pass :mounts OR :mount-at, not both"
+                     {:mounts mounts :mount-at mount-at})))
+   (let [mounts (cond
+                  mounts   (validate-mounts (mapv normalize-mount mounts))
+                  mount-at (mount-at->mounts mount-at)
+                  :else    default-mounts)
          wrapper-trimmed (str/replace wrapper #"/+$" "")
-         real-root-str   (if (= "/" mount-at)
-                           wrapper-trimmed
-                           (str wrapper-trimmed mount-at))
-         real-root-p     (str->path real-root-str)
-         _               (ensure-real-root! real-root-p)
-         canonical       (canonical-root real-root-str)
-         init-cwd        (or cwd mount-at)
-         sandbox-cwd     (resolve-sandbox canonical mount-at mount-at init-cwd)]
+         ;; Auto-create every mount's real-disk subdir under the wrapper.
+         _ (doseq [[_ ws] mounts]
+             (let [target (if (= ws "")
+                            wrapper-trimmed
+                            (str wrapper-trimmed "/" ws))]
+               (Files/createDirectories (str->path target)
+                                        (make-array java.nio.file.attribute.FileAttribute 0))))
+         canonical (canonical-or-abs wrapper-trimmed)
+         init-cwd  (or cwd (ffirst mounts))
+         sandbox-cwd (resolve-sandbox canonical mounts (ffirst mounts) init-cwd)]
      (when-not sandbox-cwd
        (throw (ex-info "Initial :cwd is outside the sandbox"
-                       {:cwd init-cwd :mount-at mount-at})))
-     (->DiskFS canonical mount-at (atom sandbox-cwd) max-bytes))))
+                       {:cwd init-cwd :mounts mounts})))
+     (->DiskFS canonical mounts (atom sandbox-cwd) max-bytes))))
+
+;; ============================================================================
+;; Introspection helpers (for SandboxedHost binds, debugging)
+;; ============================================================================
+
+(defn mounts
+  "Return the mount table of a DiskFS: a vector of [sandbox-path
+   wrapper-subdir] pairs, in the order the FS uses them."
+  [^DiskFS fs]
+  (:mounts fs))
+
+(defn wrapper-root
+  "Return the canonical real-disk path of the wrapper (the directory
+   `make` was given). Used by SandboxedHost to compute the bind
+   sources for each mount."
+  [^DiskFS fs]
+  (str (:root fs)))

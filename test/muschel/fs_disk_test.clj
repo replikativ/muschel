@@ -138,9 +138,10 @@
     (is (nil? (fs/read-file fs "/etc/passwd")))))
 
 (deftest disk-fs-ancestor-view
-  ;; Strict prefixes of mount-at are virtual read-only directories.
-  ;; `cd /` works, `stat /` reports a dir, `list-dir /` returns just
-  ;; the next segment toward the mount. Writes return nil.
+  ;; Strict prefixes of every mount's sandbox-path are virtual read-
+  ;; only directories. With the default mount table [/home/agent /tmp],
+  ;; ancestors are {/, /home}; ls / returns [home tmp] (one segment
+  ;; toward each mount).
   (let [wrapper (mk-tmp-dir)
         fs (disk/make wrapper)]
     (is (= "/" (fs/resolve fs "/")))
@@ -148,9 +149,9 @@
     (is (= :dir (:type (fs/stat fs "/"))))
     (is (= :dir (:type (fs/stat fs "/home"))))
     (is (true? (fs/exists? fs "/")))
-    (is (= [{:name "home" :type :dir :size 0 :mtime-ms 0}]
-           (fs/list-dir fs "/"))
-        "ls / shows only the path toward the mount")
+    (is (= #{"home" "tmp"}
+           (set (map :name (fs/list-dir fs "/"))))
+        "ls / shows one segment toward each mount")
     (is (= [{:name "agent" :type :dir :size 0 :mtime-ms 0}]
            (fs/list-dir fs "/home")))
     (is (some? (fs/cd! fs "/")))
@@ -161,6 +162,30 @@
     ;; Writes anywhere above the mount are silently refused.
     (is (nil? (fs/-open-sink fs "/probe.txt" false)))
     (is (nil? (fs/-mkdir fs "/probe-dir")))))
+
+(deftest disk-fs-tmp-mount-shared-with-home-agent
+  ;; Default mounts include /tmp → <wrapper>/tmp. Both writable,
+  ;; persistent across operations (no per-call tmpfs ephemerality).
+  (let [wrapper (mk-tmp-dir)
+        fs (disk/make wrapper)]
+    ;; Write through the FS, read it back.
+    (with-open [out (fs/open-sink fs "/tmp/scratch.txt" false)]
+      (.write out (.getBytes "scratch content\n" "UTF-8")))
+    (is (= "scratch content\n" (fs/read-file fs "/tmp/scratch.txt")))
+    ;; The same write is observable on disk under <wrapper>/tmp.
+    (is (= "scratch content\n"
+           (slurp (io/file wrapper "tmp" "scratch.txt"))))
+    ;; Physical path of /tmp/x maps to <wrapper>/tmp/x.
+    (is (= (str wrapper "/tmp/scratch.txt")
+           (fs/physical-path fs "/tmp/scratch.txt")))))
+
+(deftest disk-fs-custom-mounts-skip-defaults
+  ;; Explicit :mounts disables the auto /tmp default.
+  (let [wrapper (mk-tmp-dir)
+        fs (disk/make wrapper {:mounts [["/work" "work"]]})]
+    (is (= "/work" (fs/cwd fs)) "first mount is the default cwd")
+    (is (= #{"work"} (set (map :name (fs/list-dir fs "/")))))
+    (is (nil? (fs/resolve fs "/tmp/x")) "no /tmp without the default mounts")))
 
 (deftest disk-fs-rejects-bad-mount-at
   (let [wrapper (mk-tmp-dir)]
