@@ -111,16 +111,29 @@ With a permit (parse-time gate + runtime hook):
 ;; → :exit 126, :stderr explains the denial
 ```
 
-`disk-fs` pins the FS to a real directory, with symlink-aware
-containment so `cat ../etc/passwd` stays inside the root:
+`disk-fs` pins the FS to a real directory with symlink-aware
+containment, using the **wrapper layout**: `--root WRAPPER` is a
+wrapper directory; the agent's project files live at
+`<WRAPPER>/home/agent/` on disk and surface as `/home/agent/` in the
+sandbox view. `disk-fs` auto-creates the workspace if it doesn't
+exist:
 
 ```clojure
+;; /tmp/proj is a fresh empty wrapper; /tmp/proj/home/agent/ is auto-created.
+;; Put your project files in /tmp/proj/home/agent/ and they appear at /home/agent/.
 (let [host (m/builtin-host
-             {:fs (m/disk-fs "/home/me/project" {:cwd "/home/me/project"})
+             {:fs (m/disk-fs "/tmp/proj")
               :fallback-host (m/jvm-host)
-              :fallback-allowlist #{"git"}})]  ; allow git, refuse everything else
-  (m/run-and-capture (m/new-env) "git status" {:host host}))
+              :fallback-allowlist #{"git"}})]
+  (m/run-and-capture (m/new-env) "pwd" {:host host}))
+;; → :stdout "/home/agent\n"
 ```
+
+The wrapper layout keeps system mounts (`/usr`, `/etc`, … exposed by
+the OS sandbox) out of the agent's project view — `git status`,
+`find .`, etc. rooted at `/home/agent` see only project files. Pass
+`:mount-at "/"` for the legacy flat layout where `<WRAPPER>` itself
+is the workspace.
 
 ## Quickstart — CLI
 
@@ -134,8 +147,10 @@ clojure -M:cli script.sh foo bar                # run a script ($1=foo $2=bar)
 clojure -M:cli -n script.sh                     # validate syntax only
 clojure -M:cli -o errexit -c 'false; echo no'   # -o sets shell options
 
-# Sandboxed against the current directory:
-clojure -M:cli --sandbox --root . script.sh
+# Sandboxed against a wrapper directory (./sbx).
+# The agent's workspace lives at ./sbx/home/agent/ on disk (auto-created)
+# and surfaces as /home/agent/ inside the sandbox; pwd reports /home/agent.
+clojure -M:cli --sandbox --root ./sbx -c 'pwd && ls'
 
 # Sandboxed against an in-memory VFS (optionally seeded from edn):
 clojure -M:cli --sandbox --virtual ./fixtures/seed.edn -c 'cat /work/a.txt'

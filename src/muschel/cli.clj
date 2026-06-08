@@ -28,7 +28,9 @@
    ## Muschel extensions
 
      --sandbox       BuiltinHost + permit gate (requires --root or --virtual)
-     --root DIR      DiskFS pinned to DIR
+     --root DIR      Wrapper directory; agent files live at DIR/home/agent/
+                     on disk and surface as /home/agent/ in the sandbox view.
+                     DIR/home/agent/ is auto-created if it doesn't exist.
      --virtual [F]   in-memory VFS (empty, or seeded from edn file F)
      --permit FILE   append permit rules on top of the default ruleset
      --allow CMDS    comma-separated fallback-allowlist (git,clojure,...)
@@ -214,7 +216,7 @@
    [nil  "--version"]
    ;; muschel extensions
    [nil "--sandbox"           "Enable BuiltinHost sandbox."]
-   [nil "--root DIR"          "DiskFS pinned to DIR (requires --sandbox)."]
+   [nil "--root DIR"          "Wrapper directory; the agent workspace lives at DIR/home/agent/ (auto-created). Requires --sandbox."]
    [nil "--virtual FILE"      "In-memory VFS, optionally seeded from FILE. Use --virtual '' for empty."
     :default :unset]
    [nil "--permit FILE"       "Append permit rules from FILE."]
@@ -261,7 +263,7 @@
               ""
               "MUSCHEL EXTENSIONS"
               "  --sandbox       enable BuiltinHost + permit gate (needs --root or --virtual)"
-              "  --root DIR      DiskFS pinned to DIR"
+              "  --root DIR      Wrapper dir; agent workspace at DIR/home/agent/ (auto-created)"
               "  --virtual [F]   in-memory VFS (empty, or seeded from edn file F)"
               "  --permit FILE   append permit rules on top of the default ruleset"
               "  --allow CMDS    comma-separated fallback-allowlist (e.g. git,clojure)"

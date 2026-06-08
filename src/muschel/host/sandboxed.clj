@@ -2,49 +2,64 @@
   "OS-level sandbox decorator over an underlying `Host`.
 
    Rewrites `-spawn` to run the command inside `bubblewrap (bwrap)`
-   with the muschel FS root bind-mounted at `/` in the sandbox. All
+   so that allowlisted external tools (git, npm, python, …) execute
+   under namespace + resource isolation, with the agent's workspace
+   bind-mounted at the same path bwrap and DiskFS agree on. All
    other Host protocol methods delegate to the wrapped host
    unchanged.
 
    ## Why
 
-   muschel's existing `--sandbox --root DIR` mode constrains the
-   *agent's view of the filesystem* via the `muschel.fs` protocol —
-   paths outside DIR return nil at the FS layer and builtins see
-   \"no such file\". That's enough for builtin-only workloads, but
-   commands the user opts into via `:fallback-allowlist` (`git`,
-   `npm`, `python`, …) bypass the FS protocol entirely: they
-   execvp() against the host kernel and can reach any path the JVM
-   process can.
+   muschel's `--sandbox --root WRAPPER` mode constrains the agent's
+   view of the filesystem via the `muschel.fs` protocol — paths
+   outside `<WRAPPER>/home/agent` (the agent workspace) return nil
+   at the FS layer and builtins see \"no such file\". That's enough
+   for builtin-only workloads, but commands the user opts into via
+   `:fallback-allowlist` bypass the FS protocol entirely: they
+   `execvp()` against the host kernel and can reach any path the
+   JVM process can.
 
    `SandboxedHost` closes that gap by wrapping each spawn in a bwrap
-   invocation. The DiskFS real-root directory is bind-mounted at `/`
-   inside the sandbox, so paths align: muschel's view of `/work` is
-   the same file as the spawned process's view of `/work`. Network,
-   PID, and mount namespaces are unshared; resource limits go
-   through `systemd-run --user --scope` for cgroup enforcement.
+   invocation. The agent's workspace (`<WRAPPER>/<mount-at>` on
+   disk, default `<WRAPPER>/home/agent`) is bind-mounted at the
+   same `<mount-at>` (`/home/agent`) inside the sandbox. Paths
+   align: muschel's view of `/home/agent/foo` is the same file as
+   the spawned process's view of `/home/agent/foo`. Network, PID,
+   and mount namespaces are unshared; resource limits go through
+   `systemd-run --user --scope` for cgroup enforcement.
+
+   ## Layout
+
+   - **Host disk:** `<WRAPPER>/home/agent/…` holds the project.
+   - **Inside the sandbox:** the bwrap tmpfs root `/` carries
+     `/usr`, `/etc`, `/proc`, `/dev`, `/tmp` plus FHS symlinks
+     (`/bin → usr/bin`, …), and `/home/agent` is the bind-mounted
+     project. The agent starts at `--chdir /home/agent`.
+   - `cd /` inside the sandbox is *real* `/` (the bwrap tmpfs with
+     system mounts) — no aliasing, no synthesis. Builtins (which go
+     through the FS protocol, not bwrap) still can't see anything
+     above `/home/agent` — that asymmetry is intentional: builtins
+     stay tightly jailed, externals get a usable Unix env.
 
    This decorator is **JVM-only** (Linux + bwrap installed) and
    **DiskFS-only** (VirtualFS has no real path to bind). The CLI
-   wires it in only when `--os-sandbox=bwrap` is set, which requires
-   `--sandbox --root`.
+   wires it in only when `--os-sandbox=bwrap` is set, which
+   requires `--sandbox --root`.
 
    ## Composition
-
-   The expected stack from outer to inner:
 
        SandboxedHost   ; +bwrap argv, +cgroup limits
          └─ BuiltinHost ; +builtin dispatch, +FS containment
               └─ JvmHost ; raw spawn / files / async
 
-   `bind-root` must be the same real-disk path that DiskFS is
-   pinned to, otherwise the agent's view (`/work`) and the
-   sandboxed process's view (`/work`) would point at different
-   files. The CLI guarantees this by passing the same `--root`
-   value to both.
+   `bind-root` MUST be the wrapper directory DiskFS is pinned to
+   AND `mount-at` MUST match DiskFS's, otherwise the agent's view
+   and the sandboxed process's view would diverge. The CLI
+   guarantees this by passing the same values to both.
 
    ## Defaults
 
+   - `:mount-at`     `\"/home/agent\"`             — where the workspace lives
    - `:ro-binds`     `[\"/usr\" \"/etc\"]`         — host tools + system config
    - `:net`          `:off`                        — `--unshare-net`
    - `:mem-max`      `nil` (no cgroup memory cap)
@@ -56,7 +71,8 @@
    spawn is also wrapped in `systemd-run --user --scope` so the
    limits land in a transient cgroup. Without those, the bwrap call
    runs directly under the JVM's session cgroup."
-  (:require [muschel.host :as host]))
+  (:require [clojure.string :as str]
+            [muschel.host :as host]))
 
 ;; ============================================================================
 ;; bwrap argv construction
@@ -79,42 +95,56 @@
    "--symlink" "usr/lib"   "/lib"
    "--symlink" "usr/lib64" "/lib64"])
 
+(defn- bind-source
+  "Real-disk path of the agent workspace. With default mount-at
+   `/home/agent` and bind-root `/tmp/proj`, returns `/tmp/proj/home/agent`."
+  [^String bind-root ^String mount-at]
+  (if (= "/" mount-at)
+    (str/replace bind-root #"/+$" "")
+    (str (str/replace bind-root #"/+$" "") mount-at)))
+
 (defn- translate-cwd
   "Map a spawn :dir into a sandbox-relative `--chdir` argument.
 
-   muschel's env :cwd is inconsistent — sometimes a real-disk path
-   (DiskFS syncs to its canonical root), sometimes a sandbox-relative
-   path (after `cd /work` the env stores the literal). We handle both:
+   muschel's env :cwd is inconsistent — sometimes the canonical
+   real-disk path of the agent workspace (DiskFS syncs to it),
+   sometimes a sandbox-relative path the agent typed (after
+   `cd /home/agent/sub` the env stores `/home/agent/sub`). We
+   handle both:
 
-   - dir = bind-root             → `/`
-   - dir starts with bind-root/  → strip prefix, the rest IS the sandbox path
-   - dir starts with `/` but not bind-root → assume already sandbox-relative
-   - anything else / nil         → `/` (sandbox root)"
-  [^String bind-root ^String dir]
+   - dir = bind-source             → `<mount-at>` (workspace root)
+   - dir starts with bind-source/  → strip prefix, prepend mount-at
+   - dir starts with `/`           → assume already sandbox-relative,
+                                     pass through unchanged
+   - anything else / nil           → `<mount-at>` (workspace root)"
+  [^String bind-source ^String mount-at ^String dir]
   (cond
-    (or (nil? dir) (= "" dir)) "/"
-    (= dir bind-root) "/"
-    (.startsWith dir (str bind-root "/")) (subs dir (count bind-root))
-    (.startsWith dir "/") dir
-    :else "/"))
+    (or (nil? dir) (= "" dir))       mount-at
+    (= dir bind-source)              mount-at
+    (.startsWith dir (str bind-source "/"))
+    (let [tail (subs dir (count bind-source))]
+      (if (= "/" mount-at) tail (str mount-at tail)))
+    (.startsWith dir "/")            dir
+    :else                            mount-at))
 
 (defn- bwrap-argv
   "Construct the bwrap arg vector preceding `-- cmd args`."
-  [{:keys [bind-root ro-binds extra-binds net]} dir]
-  (vec
-   (concat
-    ["bwrap"
-     "--bind" bind-root "/"
-     "--proc" "/proc"
-     "--dev"  "/dev"
-     "--tmpfs" "/tmp"]
-    (ro-bind-args (or ro-binds ["/usr" "/etc"]))
-    fhs-symlinks
-    (extra-bind-args extra-binds)
-    (when (= :off net) ["--unshare-net"])
-    ["--unshare-pid" "--die-with-parent"
-     "--chdir" (translate-cwd bind-root dir)]
-    ["--"])))
+  [{:keys [bind-root mount-at ro-binds extra-binds net]} dir]
+  (let [src (bind-source bind-root mount-at)]
+    (vec
+     (concat
+      ["bwrap"
+       "--bind" src mount-at
+       "--proc" "/proc"
+       "--dev"  "/dev"
+       "--tmpfs" "/tmp"]
+      (ro-bind-args (or ro-binds ["/usr" "/etc"]))
+      fhs-symlinks
+      (extra-bind-args extra-binds)
+      (when (= :off net) ["--unshare-net"])
+      ["--unshare-pid" "--die-with-parent"
+       "--chdir" (translate-cwd src mount-at dir)]
+      ["--"]))))
 
 (defn- cgroup-enabled? [{:keys [mem-max cpu-quota tasks-max]}]
   (boolean (or mem-max cpu-quota tasks-max)))
@@ -154,7 +184,7 @@
 ;; Host protocol — delegate everything except -spawn
 ;; ============================================================================
 
-(defrecord SandboxedHost [wrapped bind-root ro-binds extra-binds net
+(defrecord SandboxedHost [wrapped bind-root mount-at ro-binds extra-binds net
                           mem-max cpu-quota tasks-max])
 
 (extend-type SandboxedHost
@@ -186,10 +216,16 @@
    Required:
      :wrapped     the underlying Host (typically a BuiltinHost over
                   JvmHost)
-     :bind-root   real-disk path that DiskFS is pinned to; bound at
-                  `/` inside the sandbox
+     :bind-root   the wrapper directory DiskFS is pinned to. The
+                  agent's workspace lives at `<bind-root>/<mount-at>`
+                  on disk and is bind-mounted at `<mount-at>` inside
+                  the sandbox.
 
    Optional:
+     :mount-at     \"/home/agent\" (default) — where the workspace
+                                  appears in the sandbox view; must
+                                  match the corresponding DiskFS
+                                  :mount-at
      :ro-binds     [\"/usr\" \"/etc\"]  read-only host dirs to expose
      :extra-binds  [[host sbox] …]      additional read-write binds
      :net          :off | :on           default :off (unshare network)
@@ -200,12 +236,15 @@
    Setting any of :mem-max / :cpu-quota / :tasks-max prepends
    `systemd-run --user --scope` to the spawn so the limits take
    effect in a transient cgroup."
-  [{:keys [wrapped bind-root ro-binds extra-binds net
+  [{:keys [wrapped bind-root mount-at ro-binds extra-binds net
            mem-max cpu-quota tasks-max]
-    :or   {ro-binds    ["/usr" "/etc"]
+    :or   {mount-at    "/home/agent"
+           ro-binds    ["/usr" "/etc"]
            extra-binds []
            net         :off}}]
   {:pre [(some? wrapped)
-         (string? bind-root)]}
-  (->SandboxedHost wrapped bind-root ro-binds extra-binds net
+         (string? bind-root)
+         (string? mount-at)
+         (.startsWith ^String mount-at "/")]}
+  (->SandboxedHost wrapped bind-root mount-at ro-binds extra-binds net
                    mem-max cpu-quota tasks-max))

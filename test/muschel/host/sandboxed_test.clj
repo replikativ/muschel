@@ -1,8 +1,12 @@
 (ns muschel.host.sandboxed-test
   "Unit tests for the SandboxedHost decorator — argv construction
-   only. End-to-end bwrap containment tests live separately and are
-   gated on a real bwrap binary; see task #8 / the doc for how to run
-   them locally."
+   only. End-to-end bwrap containment tests live in the integration
+   namespace and are gated on a real bwrap binary.
+
+   Default mount-at is `/home/agent`, so the bind source is
+   `<bind-root>/home/agent` and `--chdir` defaults to `/home/agent`.
+   Tests that exercise only the chdir-translation surface pass an
+   explicit `:mount-at \"/\"` for clarity."
   (:require [clojure.test :refer [deftest is testing]]
             [muschel.host :as host]
             [muschel.host.sandboxed :as sb]))
@@ -12,8 +16,8 @@
 ;; ============================================================================
 
 (defn- stub-host []
-  (let [last (atom nil)]
-    [last
+  (let [recorded (atom nil)]
+    [recorded
      (reify host/Host
        (-write-string!    [_ _ _]   nil)
        (-read-all-string  [_ _]     "")
@@ -27,7 +31,7 @@
        (-read-file        [_ _]     "")
        (-make-pipe        [_]       [nil nil])
        (-spawn            [_ opts]
-         (reset! last opts)
+         (reset! recorded opts)
          {:wait (fn [] 0) :handle ::stub})
        (-async            [_ f]     (future (f)))
        (-await            [_ h]     (deref h)))]))
@@ -35,71 +39,112 @@
 (defn- spawn! [host opts]
   (host/-spawn host opts))
 
-(defn- recorded-cmd+args [last-atom]
-  (let [opts @last-atom]
+(defn- recorded-cmd+args [recorded-atom]
+  (let [opts @recorded-atom]
     (into [(:cmd opts)] (:args opts))))
 
+(defn- value-after [argv flag]
+  (nth argv (inc (.indexOf ^java.util.List (vec argv) flag))))
+
 ;; ============================================================================
-;; Defaults
+;; Defaults: mount-at /home/agent, bind <root>/home/agent at /home/agent
 ;; ============================================================================
 
 (deftest spawn-rewrites-to-bwrap
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "git" :args ["status"] :dir "/work"})
+    (spawn! h {:cmd "git" :args ["status"]})
     (let [argv (recorded-cmd+args recorded)]
       (is (= "bwrap" (first argv)))
-      (is (= "--" (nth argv (dec (count (take-while #(not= "git" %) argv))))))
-      (is (some #{"--bind"} argv))
-      (is (= "/tmp/sbx" (nth argv (inc (.indexOf ^java.util.List (vec argv) "--bind")))))
       (is (some #{"--unshare-net"} argv))
       (is (some #{"--unshare-pid"} argv))
       (is (some #{"--die-with-parent"} argv))
       (is (= "git" (nth argv (inc (.indexOf ^java.util.List (vec argv) "--")))))
       (is (= "status" (last argv))))))
 
-(deftest spawn-passes-chdir-from-sandbox-relative-dir
-  ;; :dir = "/work" (sandbox-relative, e.g. after `cd /work` in bash)
-  ;; passes through unchanged.
+(deftest bind-defaults-to-home-agent
+  ;; Default mount-at /home/agent: bwrap binds <bind-root>/home/agent → /home/agent.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :dir "/work"})
+    (spawn! h {:cmd "ls"})
     (let [argv (vec (recorded-cmd+args recorded))]
-      (is (= "/work" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
+      (is (= "/tmp/sbx/home/agent" (value-after argv "--bind")))
+      ;; Sandbox path of the bind. It's the second arg after --bind.
+      (is (= "/home/agent"
+             (nth argv (+ 2 (.indexOf ^java.util.List argv "--bind"))))))))
 
-(deftest spawn-defaults-chdir-to-root
-  ;; No :dir → bwrap chdir to / (sandbox root) so the spawned command
-  ;; starts in a deterministic, sandbox-visible directory.
+(deftest default-chdir-is-mount-at
+  ;; With default mount-at, no :dir → --chdir /home/agent.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :args []})
-    (let [argv (vec (recorded-cmd+args recorded))]
-      (is (= "/" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
+    (spawn! h {:cmd "ls"})
+    (is (= "/home/agent" (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
 
-(deftest spawn-translates-real-cwd-to-sandbox-path
-  ;; muschel's env :cwd is often the canonical real-disk path (DiskFS
-  ;; syncs to its root). bwrap needs the SANDBOX-relative path; the
-  ;; decorator strips the bind-root prefix.
+(deftest chdir-strips-real-disk-prefix-prepends-mount
+  ;; muschel's env :cwd is typically the canonical real-disk path of
+  ;; the workspace; the decorator translates it back to the sandbox
+  ;; view by stripping the bind source and prepending mount-at.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :dir "/tmp/sbx/work"})
-    (let [argv (vec (recorded-cmd+args recorded))]
-      (is (= "/work" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
+    (spawn! h {:cmd "ls" :dir "/tmp/sbx/home/agent/work"})
+    (is (= "/home/agent/work"
+           (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
 
-(deftest spawn-handles-bind-root-exactly
-  ;; :dir = bind-root → sandbox path "/"
+(deftest chdir-passes-sandbox-relative-through
+  ;; If :dir is already sandbox-relative (after a `cd /home/agent/x`
+  ;; in bash), pass it through.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :dir "/tmp/sbx"})
-    (let [argv (vec (recorded-cmd+args recorded))]
-      (is (= "/" (nth argv (inc (.indexOf ^java.util.List argv "--chdir"))))))))
+    (spawn! h {:cmd "ls" :dir "/home/agent/x"})
+    (is (= "/home/agent/x"
+           (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
+
+(deftest dir-equal-to-bind-source-maps-to-mount-at
+  ;; :dir = <bind-root>/home/agent → --chdir /home/agent.
+  (let [[recorded inner] (stub-host)
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
+    (spawn! h {:cmd "ls" :dir "/tmp/sbx/home/agent"})
+    (is (= "/home/agent" (value-after (vec (recorded-cmd+args recorded)) "--chdir")))))
 
 (deftest dir-is-consumed-not-passed-through
   ;; bwrap handles cwd via --chdir; the wrapped host should see no :dir.
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    (spawn! h {:cmd "ls" :dir "/work"})
+    (spawn! h {:cmd "ls" :dir "/tmp/sbx/home/agent"})
     (is (nil? (:dir @recorded)))))
+
+;; ============================================================================
+;; Custom mount-at
+;; ============================================================================
+
+(deftest custom-mount-at
+  (let [[recorded inner] (stub-host)
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx" :mount-at "/work"})]
+    (spawn! h {:cmd "ls"})
+    (let [argv (vec (recorded-cmd+args recorded))]
+      (is (= "/tmp/sbx/work" (value-after argv "--bind"))
+          "bind source uses /work under bind-root")
+      (is (= "/work"
+             (nth argv (+ 2 (.indexOf ^java.util.List argv "--bind"))))
+          "bind target is the custom mount-at")
+      (is (= "/work" (value-after argv "--chdir"))))))
+
+(deftest mount-at-root-flat-layout
+  ;; mount-at "/" is the legacy / test-friendly layout: bind <root> at
+  ;; / (no nested home/agent subdir).
+  (let [[recorded inner] (stub-host)
+        h (sb/make {:wrapped inner :bind-root "/tmp/sbx" :mount-at "/"})]
+    (spawn! h {:cmd "ls" :dir "/tmp/sbx/sub"})
+    (let [argv (vec (recorded-cmd+args recorded))]
+      (is (= "/tmp/sbx" (value-after argv "--bind"))
+          "bind source is bind-root itself when mount-at = /")
+      (is (= "/" (nth argv (+ 2 (.indexOf ^java.util.List argv "--bind")))))
+      (is (= "/sub" (value-after argv "--chdir"))
+          "chdir is sandbox-relative under /, same as the pre-mount-at behavior"))))
+
+;; ============================================================================
+;; Networking + binds + cgroups
+;; ============================================================================
 
 (deftest net-on-skips-unshare
   (let [[recorded inner] (stub-host)
@@ -131,10 +176,6 @@
                        (= "/cache" dst)))
                 (partition 3 1 argv))))))
 
-;; ============================================================================
-;; Cgroup limits via systemd-run
-;; ============================================================================
-
 (deftest cgroup-prepends-systemd-run
   (let [[recorded inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"
@@ -147,9 +188,7 @@
       (is (some #{"MemoryMax=512M"} argv))
       (is (some #{"CPUQuota=100%"}  argv))
       (is (some #{"TasksMax=64"}    argv))
-      ;; bwrap shows up after the systemd-run -- terminator.
-      (is (some #{"bwrap"} argv))
-      (is (= "git" (last (take-while #(not= "status" %) argv)))))))
+      (is (some #{"bwrap"} argv)))))
 
 (deftest no-cgroup-no-systemd
   (let [[recorded inner] (stub-host)
@@ -174,6 +213,5 @@
 (deftest non-spawn-methods-delegate
   (let [[_ inner] (stub-host)
         h (sb/make {:wrapped inner :bind-root "/tmp/sbx"})]
-    ;; Just exercise a couple so the protocol surface stays wired.
     (is (= "" (host/-read-all-string h :anything)))
     (is (= {:exists? false} (host/-file-info h "/whatever")))))

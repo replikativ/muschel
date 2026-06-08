@@ -1,13 +1,43 @@
 (ns muschel.fs.disk
-  "Real-disk FS implementation pinned to a root.
+  "Real-disk FS implementation pinned to a wrapper directory, with the
+   project files at a known subpath inside.
 
-   Every operation resolves the requested path against a canonical
-   root (with symlinks followed via java.nio.file/Path.toRealPath).
-   If the resolved path doesn't start with the root prefix, the op
-   returns nil — caller sees \"no such file\" without any plumbing
-   to track the escape.
+   ## Wrapper layout
 
-   Containment caveats:
+   `(make wrapper opts)` takes a host directory `wrapper` and a
+   `:mount-at` sandbox path (default `/home/agent`). The agent's
+   project files live on disk at `<wrapper>/<mount-at>`; the agent
+   sees them at `<mount-at>` in the sandbox view:
+
+       Host                            Sandbox view
+       -------------------             -----------------
+       <wrapper>/home/agent/  ←──→     /home/agent/      (the project)
+       <wrapper>/home/agent/foo.txt    /home/agent/foo.txt
+
+   `<wrapper>` itself is *outside* the agent's reach via the FS
+   protocol (containment is pinned at `<wrapper>/<mount-at>`).
+   Sibling paths under the wrapper — `<wrapper>/var/cache/`,
+   `<wrapper>/.muschel/`, etc. — are a future-reserved slot for
+   muschel-managed project state surfaced under
+   `/system/muschel-project/<name>/` once that's implemented.
+
+   ## Auto-create on construction
+
+   `make` ensures `<wrapper>/<mount-at>` exists on disk
+   (`Files/createDirectories`, idempotent). The contract is: handing
+   muschel a wrapper dir, even an empty one, yields a working
+   sandbox without the caller having to pre-create the agent
+   workspace.
+
+   ## Resolution
+
+   Every operation resolves the requested path against the canonical
+   internal real-root (`<wrapper>/<mount-at>`, with symlinks followed
+   via `java.nio.file/Path.toRealPath`). Sandbox paths that don't
+   fall under `<mount-at>` (e.g., `/etc/passwd`, `/`) return nil at
+   `-resolve` and surface as \"no such file\" through the builtins.
+
+   ## Containment caveats
 
    - **Symlinks pointing outside root** are caught: we always
      toRealPath() before the prefix check. If the link target is
@@ -25,7 +55,11 @@
      mount writable file roots if hard-link attacks matter.
 
    - **JVM-only** (uses java.nio.file). For Node and browser, ship
-     analogous impls in their own namespaces."
+     analogous impls in their own namespaces. Each impl is
+     responsible for ensuring its real-root exists on construction
+     using its platform's native API (Files/createDirectories on
+     JVM, fs.mkdirSync on Node, etc.) — embedders just call
+     `make` and get a usable handle."
   (:require [muschel.fs :as fs]
             [clojure.string :as str])
   (:import [java.nio.file Path Paths Files LinkOption NoSuchFileException]
@@ -63,43 +97,70 @@
       (.startsWith candidate root)))
 
 (defn- sandbox-relative
-  "Strip the disk root prefix from `real-path-str` to produce a path
-   rooted at the sandbox `/`. So `/tmp/muschel-xyz/foo/bar` becomes
-   `/foo/bar`, and the sandbox root itself becomes `/`. Used by
-   `-resolve` so callers (and the `realpath` builtin) never see the
-   host mount prefix."
-  [^Path root ^String real-path-str]
+  "Translate `real-path-str` (a real-disk path) into the sandbox-
+   relative path the agent should see. Strips the internal real-root
+   prefix and prepends `mount-at`. So given internal real-root
+   `/tmp/proj/home/agent` and `mount-at` `/home/agent`:
+     `/tmp/proj/home/agent`        → `/home/agent`
+     `/tmp/proj/home/agent/foo`    → `/home/agent/foo`
+   With `mount-at` `/` (the legacy/test-friendly layout) it just
+   strips the root prefix and leaves the rest absolute. Paths
+   outside the internal real-root pass through unchanged."
+  [^Path root ^String mount-at ^String real-path-str]
   (let [rs (str root)]
     (cond
-      (= real-path-str rs) "/"
+      (= real-path-str rs) mount-at
       (.startsWith real-path-str (str rs "/"))
-      (subs real-path-str (count rs))
+      (let [tail (subs real-path-str (count rs))]   ;; tail starts with "/"
+        (if (= mount-at "/")
+          tail
+          (str mount-at tail)))
       :else real-path-str)))
 
 (defn- starts-with-str [^String s ^String prefix]
   (.startsWith s prefix))
 
-(defn- ^Path lex-normalize
-  "Lexical absolute + .. collapse, no real-disk lookup. Returns nil for
-   ~/-prefixed paths (muschel.expand handles those upstream).
+(defn- strip-mount-prefix
+  "If `path` is a sandbox-absolute path under `mount-at`, return the
+   remainder (always starts with `/`). Returns nil if the path
+   isn't under the mount. Special-case: `mount-at = \"/\"` passes
+   every absolute path through unchanged."
+  [^String mount-at ^String path]
+  (cond
+    (= mount-at "/")                            path
+    (= path mount-at)                           "/"
+    (.startsWith path (str mount-at "/"))       (subs path (count mount-at))
+    :else                                       nil))
 
-   The sandbox presents itself rooted at `/` (pwd/realpath report jail-relative
-   paths), so an ABSOLUTE path — `/`, `/src` — that the agent types is a
-   SANDBOX-absolute path and must be re-rooted under the disk `root`, NOT the
-   host filesystem root. But the exec/env layer ALSO feeds back host-absolute
-   cwd paths (`<root>/…`), which are already correct — re-rooting those would
-   double them. So re-root IDEMPOTENTLY: a path already at/under root is kept;
-   anything else absolute is treated as sandbox-absolute and joined under root.
-   Normalizing afterwards keeps `..` from escaping (any climb above root is
-   caught by the inside?-check in resolve*)."
-  [^Path root ^String cwd ^String path]
+(defn- ^Path lex-normalize
+  "Lexical absolute + .. collapse, no real-disk lookup. Returns nil
+   for ~/-prefixed paths (muschel.expand handles those upstream) and
+   for sandbox-absolute paths outside the mount.
+
+   The agent sees the project at `<mount-at>` (default `/home/agent`)
+   and operates on paths relative to it. An absolute path the agent
+   types is either:
+     - under `<mount-at>` (`/home/agent`, `/home/agent/src`) →
+       strip mount-at, re-root under disk `root`
+     - the host-absolute path under `root` (e.g., the env's :cwd
+       feedback `<root>/sub`) → keep as-is, already correct
+     - anything else absolute (`/etc/passwd`, `/`, `/system/...`) →
+       OUTSIDE the mount → nil (caller surfaces as 'no such file')
+
+   Relative paths join with cwd. `~/` returns nil — the expand
+   layer handles tilde upstream."
+  [^Path root ^String mount-at ^String cwd ^String path]
   (when (and (string? path) (not (str/blank? path)))
     (let [root-str (str root)
           base (cond
                  (or (= path root-str)
                      (starts-with-str path (str root-str "/")))
                  (str->path path)                       ;; host-absolute, under root — keep
-                 (starts-with-str path "/")  (str->path (str root-str path))  ;; sandbox-absolute — re-root
+
+                 (starts-with-str path "/")
+                 (when-let [stripped (strip-mount-prefix mount-at path)]
+                   (str->path (str root-str stripped)))
+
                  (starts-with-str path "~/") nil
                  :else                       (str->path (str cwd "/" path)))]
       (when base
@@ -116,8 +177,8 @@
    Returns a string of the resolved real path on success, nil if the
    path escapes the sandbox or is malformed. The returned path is
    guaranteed to be inside root."
-  [^Path root ^String cwd ^String path]
-  (when-let [normalized (lex-normalize root cwd path)]
+  [^Path root ^String mount-at ^String cwd ^String path]
+  (when-let [normalized (lex-normalize root mount-at cwd path)]
     (let [real (safe-real-path normalized)]
       (cond
         ;; Whole-path exists and is real — straightforward.
@@ -155,26 +216,26 @@
 
 (def ^:private default-read-cap (* 8 1024 1024))   ;; 8 MiB
 
-(defrecord DiskFS [^Path root cwd-atom max-bytes]
+(defrecord DiskFS [^Path root ^String mount-at cwd-atom max-bytes]
   fs/FS
   (-resolve [_ path]
-    (resolve* root @cwd-atom path))
+    (resolve* root mount-at @cwd-atom path))
 
   (-cwd [_] @cwd-atom)
 
   (-cd! [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (when (Files/isDirectory p follow)
           (reset! cwd-atom resolved)
           resolved))))
 
   (-exists? [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (Files/exists (str->path resolved) follow)))
 
   (-stat [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (when (Files/exists p no-follow)
           (let [attrs (Files/readAttributes p BasicFileAttributes follow)]
@@ -187,7 +248,7 @@
                          (catch Throwable _ nil))})))))
 
   (-list-dir [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (when (Files/isDirectory p follow)
           (with-open [stream (Files/newDirectoryStream p)]
@@ -206,7 +267,7 @@
       (String. ^bytes bs "UTF-8")))
 
   (-read-bytes [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (when (Files/isRegularFile p follow)
           (let [size (Files/size p)
@@ -218,13 +279,13 @@
             buf)))))
 
   (-open-source [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (when (Files/isRegularFile p follow)
           (Files/newInputStream p (make-array java.nio.file.OpenOption 0))))))
 
   (-open-sink [_ path append?]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)
             base-opts (if append?
                         [java.nio.file.StandardOpenOption/CREATE
@@ -239,7 +300,7 @@
         (Files/newOutputStream p (into-array java.nio.file.OpenOption base-opts)))))
 
   (-mkdir [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (when-not (Files/exists p follow)
           (try (Files/createDirectory p (make-array java.nio.file.attribute.FileAttribute 0))
@@ -247,17 +308,17 @@
                (catch Throwable _ nil))))))
 
   (-delete [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (try (Files/delete p) true
              (catch Throwable _ nil)))))
 
   (-rename [_ from to]
-    (when-let [from-resolved (resolve* root @cwd-atom from)]
+    (when-let [from-resolved (resolve* root mount-at @cwd-atom from)]
       ;; Resolve `to` relative to the same root + cwd. For `to`, the
       ;; resolved path is allowed to NOT exist yet — resolve* falls
       ;; back to abs+normalize and still inside?-checks.
-      (when-let [to-resolved (resolve* root @cwd-atom to)]
+      (when-let [to-resolved (resolve* root mount-at @cwd-atom to)]
         (try (Files/move (str->path from-resolved)
                          (str->path to-resolved)
                          (into-array java.nio.file.CopyOption
@@ -266,7 +327,7 @@
              (catch Throwable _ nil)))))
 
   (-touch [_ path]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (try
           (if (Files/exists p follow)
@@ -278,7 +339,7 @@
           (catch Throwable _ nil)))))
 
   (-chmod [_ path mode]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)]
         (try
           (let [perms (java.nio.file.attribute.PosixFilePermissions/fromString
@@ -295,7 +356,7 @@
           (catch Throwable _ nil)))))
 
   (-symlink [_ target link-path]
-    (when-let [resolved (resolve* root @cwd-atom link-path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom link-path)]
       ;; Refuse symlinks whose target lexically escapes the sandbox.
       ;; Absolute outside targets are obvious. For relative targets,
       ;; resolve against the link's parent dir lexically (before any
@@ -316,10 +377,10 @@
                (catch Throwable _ nil))))))
 
   (-sandbox-relativize [_ real-path-str]
-    (sandbox-relative root real-path-str))
+    (sandbox-relative root mount-at real-path-str))
 
   (-chown [_ path owner group]
-    (when-let [resolved (resolve* root @cwd-atom path)]
+    (when-let [resolved (resolve* root mount-at @cwd-atom path)]
       (let [p (str->path resolved)
             fs-svc (-> p .getFileSystem)
             lookup (-> fs-svc .getUserPrincipalLookupService)]
@@ -333,24 +394,77 @@
           true
           (catch Throwable _ nil))))))
 
+(def ^:private default-mount-at "/home/agent")
+
+(defn- normalize-mount-at
+  "Validate + normalise the `:mount-at` option. Must be an absolute
+   POSIX-style path with no `..`. Returns the normalised string
+   (`/`, `/home/agent`, `/work`, …) or throws."
+  [^String s]
+  (when-not (and (string? s) (.startsWith s "/"))
+    (throw (ex-info "DiskFS :mount-at must be an absolute path"
+                    {:mount-at s})))
+  (let [collapsed (str/replace s #"/+" "/")
+        stripped  (if (= "/" collapsed)
+                    "/"
+                    (str/replace collapsed #"/$" ""))]
+    (when (or (str/blank? stripped)
+              (some #{".."} (str/split stripped #"/")))
+      (throw (ex-info "DiskFS :mount-at must be a non-empty path with no `..`"
+                      {:mount-at s})))
+    stripped))
+
+(defn- ensure-real-root!
+  "Create the internal real-root directory if it doesn't yet exist.
+   Idempotent. JVM-side; future Node/browser FS impls do the
+   equivalent in their own constructors."
+  [^Path real-root]
+  (Files/createDirectories real-root (make-array java.nio.file.attribute.FileAttribute 0)))
+
 (defn make
-  "Construct a disk FS pinned to `root`. All paths resolve under root;
-   anything outside (after canonicalisation + symlink-follow) returns
-   nil.
+  "Construct a disk-backed sandbox FS over `wrapper` — a host
+   directory that holds the agent's workspace at
+   `<wrapper>/<mount-at>` (default `<wrapper>/home/agent`).
+
+   The agent sees their workspace at `<mount-at>` in the sandbox
+   view (e.g. `/home/agent/foo.txt` ↔ `<wrapper>/home/agent/foo.txt`).
+   Sandbox paths outside `<mount-at>` resolve to nil — they're not
+   reachable through this FS, only through an OS sandbox like bwrap.
+
+   Auto-creates `<wrapper>/<mount-at>` if it doesn't exist
+   (idempotent `Files/createDirectories`). The contract is that
+   handing muschel a wrapper dir — even an empty one — yields a
+   working sandbox without the caller having to pre-create the
+   agent workspace.
 
    Options:
-     :cwd        initial cwd (must be under root; defaults to root)
+     :mount-at   sandbox path of the workspace, default `/home/agent`
+                 (must be absolute, no `..`, no trailing slash)
+     :cwd        initial cwd inside the workspace; defaults to the
+                 workspace root (i.e. real-disk `<wrapper>/<mount-at>`)
      :max-bytes  read-file size cap, default 8 MiB"
-  ([root] (make root {}))
-  ([root {:keys [cwd max-bytes] :or {max-bytes default-read-cap}}]
-   (let [canonical (canonical-root root)
-         root-str  (str canonical)
-         init-cwd  (or cwd root-str)
-         ;; Resolve initial cwd against root to enforce containment. The cwd is
-         ;; a host-absolute path already under root, so resolve*'s re-rooting is
-         ;; idempotent on it (see lex-normalize).
-         resolved-cwd (resolve* canonical root-str init-cwd)]
+  ([wrapper] (make wrapper {}))
+  ([wrapper {:keys [cwd max-bytes mount-at]
+             :or   {max-bytes default-read-cap
+                    mount-at  default-mount-at}}]
+   (let [mount-at  (normalize-mount-at mount-at)
+         ;; Construct the internal real-root by appending the
+         ;; mount-at literal under the wrapper. We don't go through
+         ;; canonical-root on the wrapper first because the wrapper
+         ;; might not exist yet either; createDirectories handles
+         ;; the whole chain. Mount-at "/" makes the wrapper itself
+         ;; the real-root (legacy / generic-FS layout).
+         wrapper-trimmed (str/replace wrapper #"/+$" "")
+         real-root-str   (if (= "/" mount-at)
+                           wrapper-trimmed
+                           (str wrapper-trimmed mount-at))
+         real-root-p   (str->path real-root-str)
+         _             (ensure-real-root! real-root-p)
+         canonical     (canonical-root real-root-str)
+         root-str      (str canonical)
+         init-cwd      (or cwd root-str)
+         resolved-cwd  (resolve* canonical mount-at root-str init-cwd)]
      (when-not resolved-cwd
        (throw (ex-info "Initial :cwd is outside :root"
                        {:cwd init-cwd :root root-str})))
-     (->DiskFS canonical (atom resolved-cwd) max-bytes))))
+     (->DiskFS canonical mount-at (atom resolved-cwd) max-bytes))))
