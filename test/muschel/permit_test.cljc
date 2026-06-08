@@ -281,6 +281,63 @@
               :action :deny}]]]
     (is (= :ask (matched-action "rm $FLAG file" rs)))))
 
+;; ============================================================================
+;; Heredoc recursion
+;; ============================================================================
+
+(deftest heredoc-into-shell-recurses
+  ;; `bash <<EOF rm -rf /tmp EOF` should be denied because the inner
+  ;; `rm -rf` matches the defaults, even though it's inside a heredoc.
+  (let [src "bash <<EOF\nrm -rf /tmp/x\nEOF\n"
+        r (check src)]
+    (is (= :deny (:decision r))
+        "heredoc body fed to bash must be re-checked against defaults")))
+
+(deftest heredoc-quoted-tag-also-recurses
+  ;; Quoted delimiter → expand? false at lex time, but the body is
+  ;; still bash code on the receiving side.
+  (let [src "bash <<'EOF'\nrm -rf /tmp/x\nEOF\n"
+        r (check src)]
+    (is (= :deny (:decision r)))))
+
+(deftest heredoc-into-data-sink-is-opaque
+  ;; `cat <<EOF rm -rf / EOF` is just feeding text to cat. The body
+  ;; must NOT be parsed as shell — the rm should not fire any rule.
+  (let [src "cat <<EOF\nrm -rf /tmp/x\nEOF\n"
+        rs [[{:tool :bash :pattern {:kind :cmd-name :name "cat"}
+              :action :allow}]]
+        r (check src {:rulesets rs})]
+    (is (= :allow (:decision r))
+        "cat is a data sink; heredoc body is data, not code")))
+
+(deftest heredoc-into-bash-dash-c-not-recursed
+  ;; `bash -c "..." <<EOF data EOF` — the -c arg IS the script; the
+  ;; heredoc is stdin data for that script. We should NOT re-parse it.
+  (let [src "bash -c 'echo hi' <<EOF\nrm -rf /tmp/x\nEOF\n"
+        rs [[{:tool :bash :pattern {:kind :argv-shape
+                                    :shape [#{"bash" "sh"} "-c" :**]}
+              :action :allow}]]
+        r (check src {:rulesets rs
+                      :prompter permit/allow-all-prompter})]
+    (is (= :allow (:decision r))
+        "bash -c heredoc is data for the script, not the script itself")))
+
+(deftest heredoc-into-sh-also-recurses
+  ;; Same as bash: sh / dash / zsh.
+  (doseq [shell ["sh" "dash" "zsh"]]
+    (testing shell
+      (let [src (str shell " <<EOF\nrm -rf /tmp/x\nEOF\n")
+            r (check src)]
+        (is (= :deny (:decision r)))))))
+
+(deftest heredoc-malformed-body-doesnt-crash
+  ;; If the heredoc body fails to parse, we silently skip the
+  ;; recursion. The outer call still gets its rule.
+  (let [src "bash <<EOF\n((( unbalanced\nEOF\n"
+        r (check src {:prompter permit/allow-all-prompter})]
+    ;; No exception; some decision returned.
+    (is (#{:allow :deny :ask} (:decision r)))))
+
 (deftest ast-pred-matcher
   ;; Allow any call whose first arg starts with "git" (a fake-prefix pred)
   (let [rs [[{:tool :bash

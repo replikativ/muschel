@@ -7,6 +7,11 @@
    `prompter` function so the harness (e.g. dvergr) drives the user
    interaction.
 
+   Heredoc bodies fed to a shell interpreter on stdin (e.g.
+   `bash <<EOF rm -rf / EOF`) are re-parsed and recursively checked —
+   the inner `rm` is gated even though it's wrapped in a heredoc. Data
+   sinks (`cat <<EOF data EOF`) are left opaque.
+
    ## Rule shape
 
        {:tool    :bash
@@ -88,6 +93,7 @@
   (:require [clojure.string :as str]
             [muschel.ast :as ast]
             [muschel.expand :as expand]
+            [muschel.parse :as parse]
             [muschel.permit.defaults :as defaults]))
 
 ;; ============================================================================
@@ -304,19 +310,75 @@
      :rule nil
      :reason "no matching rule (default: ask)"}))
 
+;; ============================================================================
+;; Heredoc recursion into shell interpreters
+;; ============================================================================
+;;
+;; When `bash <<EOF … EOF` (or sh/dash/zsh) reads a heredoc as stdin, the
+;; body IS a shell script — so we re-parse it and check the inner calls,
+;; same idea as how exec.cljc re-runs cmd-subst bodies through the permit
+;; gate. Data sinks like `cat <<EOF … EOF` keep the body opaque.
+
+(def ^:private shell-cmd-names #{"sh" "bash" "dash" "zsh"})
+
+(defn- shell-stdin-script?
+  "True if `call`'s argv is a shell reading its script from stdin —
+   i.e. first arg is a known shell and there is no `-c` flag (which
+   would mean the script is the inline arg, and the heredoc is data
+   for that script's own stdin)."
+  [call]
+  (let [argv (call->argv call)]
+    (and (shell-cmd-names (first argv))
+         (not (some #{"-c"} (rest argv))))))
+
+(defn- stdin-heredoc-body
+  "If `stmt`'s :redirs contain a heredoc whose target is stdin (fd 0
+   or unspecified), return its body string; else nil."
+  [stmt]
+  (some (fn [r]
+          (when (and (= :heredoc (:type r))
+                     (or (nil? (:fd r)) (zero? (:fd r))))
+            (:body r)))
+        (:redirs stmt)))
+
+(defn- shell-heredoc-bodies
+  "Walk `ast`. Return body strings of every heredoc that feeds a
+   shell interpreter's stdin. The bodies are bash code; the caller
+   re-parses and recursively permit-checks them."
+  [ast]
+  (let [out (volatile! [])]
+    (ast/walk ast
+              (fn [n]
+                (when (and (map? n)
+                           (= :stmt (:type n))
+                           (ast/call? (:cmd n))
+                           (shell-stdin-script? (:cmd n)))
+                  (when-let [body (stdin-heredoc-body n)]
+                    (vswap! out conj body)))))
+    @out))
+
 (defn check-pure
   "Pure check (no prompter). For each :call in the AST, return a
-   per-call decision. Overall :decision is the worst (deny > ask >
-   allow)."
+   per-call decision. Heredoc bodies fed to shell interpreters are
+   re-parsed and their inner calls are included. Overall :decision
+   is the worst (deny > ask > allow)."
   [rulesets ast]
   (let [calls (ast/leaf-calls ast)
         per-call (mapv #(per-call-decision rulesets %) calls)
+        inner-per-call
+        (vec (mapcat (fn [body]
+                       (let [inner (try (parse/parse body)
+                                        (catch #?(:clj Throwable :cljs :default) _ nil))]
+                         (when inner
+                           (:per-call (check-pure rulesets inner)))))
+                     (shell-heredoc-bodies ast)))
+        all-per-call (into per-call inner-per-call)
         worst (cond
-                (some #(= :deny (:decision %)) per-call) :deny
-                (some #(= :ask (:decision %)) per-call) :ask
+                (some #(= :deny (:decision %)) all-per-call) :deny
+                (some #(= :ask  (:decision %)) all-per-call) :ask
                 :else :allow)]
     {:decision worst
-     :per-call per-call}))
+     :per-call all-per-call}))
 
 ;; ============================================================================
 ;; Promoter: prompter-result → new rule
@@ -425,8 +487,8 @@
     (not (map? (:pattern rule)))
     "rule :pattern must be a map"
 
-    (not (#{:cmd-name :argv-glob :argv-vec :argv-shape :ast-pred}
+    (not (#{:cmd-name :argv-glob :argv-vec :argv-shape :argv-flags :ast-pred}
           (:kind (:pattern rule))))
-    "rule :pattern :kind must be :cmd-name :argv-glob :argv-vec :argv-shape or :ast-pred"
+    "rule :pattern :kind must be :cmd-name :argv-glob :argv-vec :argv-shape :argv-flags or :ast-pred"
 
     :else nil))
