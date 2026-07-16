@@ -8,12 +8,12 @@
             [geschichte.bytes :as bytes]
             [geschichte.content :as content]
             [geschichte.diff :as diff]
+            [geschichte.ignore :as ignore]
             [geschichte.repo :as repo]
             [geschichte.query :as query]
             [muschel.fs :as fs]
             [muschel.fs.geschichte :as gfs]
-            [muschel.fs.mount :as mount]
-            [muschel.gitignore :as ignore])
+            [muschel.fs.mount :as mount])
   (:import [java.nio ByteBuffer]
            [java.nio.charset CharacterCodingException CodingErrorAction
             StandardCharsets]))
