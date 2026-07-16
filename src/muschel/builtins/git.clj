@@ -6,7 +6,6 @@
    engine as that surface is filled out."
   (:require [clojure.string :as str]
             [geschichte.bytes :as bytes]
-            [geschichte.content :as content]
             [geschichte.diff :as diff]
             [geschichte.ignore :as ignore]
             [geschichte.repo :as repo]
@@ -97,50 +96,40 @@
         (ok (if quiet? ""
               (str "Initialized empty Geschichte repository in " root "\n")))))))
 
-(declare present-stage)
+(defn- status-code [kind]
+  ({:added "A" :deleted "D" :modified "M"} kind " "))
 
-(defn- change-code [before after added-code]
-  (cond
-    (and (nil? before) after) added-code
-    (and before (nil? after)) "D"
-    (not= before after) "M"
-    :else " "))
-
-(defn- short-status [conn {:keys [staged unstaged untracked]}]
-  (let [head (repo/tree-at conn)
-        index (present-stage conn)
-        work (repo/worktree conn)
-        staged (set staged)
-        unstaged (set unstaged)
-        changed (sort (into staged unstaged))]
-    (str
-     (apply str
-            (map (fn [path]
-                   (str (if (staged path)
-                          (change-code (get head path) (get index path) "A")
-                          " ")
-                        (if (unstaged path)
-                          (change-code (get index path) (get work path) "M")
-                          " ")
-                        " " path "\n"))
-                 changed))
-     (apply str (map #(str "?? " % "\n") untracked)))))
+(defn- short-status [entries]
+  (apply str
+         (mapcat
+          (fn [{:keys [path index worktree]}]
+            (cond-> []
+              (or index (and worktree (not= :untracked worktree)))
+              (conj (str (status-code index) (status-code worktree)
+                         " " path "\n"))
+              (= :untracked worktree)
+              (conj (str "?? " path "\n"))))
+          entries)))
 
 (defn- git-status [conn args]
   (let [rules (ignore/rules conn)
-        status (update (repo/status conn) :untracked
-                       #(vec (ignore/filter-visible rules %)))
-        status (assoc status :clean?
-                      (every? empty? ((juxt :staged :unstaged :untracked)
-                                      status)))
+        entries (->> (repo/status-entries conn)
+                     (keep (fn [{:keys [path worktree] :as entry}]
+                             (let [entry (if (and (= :untracked worktree)
+                                                  (ignore/ignored? rules path))
+                                           (dissoc entry :worktree)
+                                           entry)]
+                               (when (or (:index entry) (:worktree entry))
+                                 entry))))
+                     vec)
         short? (some #{"-s" "--short" "--porcelain" "--porcelain=v1"} args)
-        branch (str/replace (:branch status) #"^refs/heads/" "")]
+        branch (str/replace (repo/current-ref conn) #"^refs/heads/" "")]
     (if short?
-      (ok (short-status conn status))
+      (ok (short-status entries))
       (ok (str "On branch " branch "\n"
-               (if (:clean? status)
+               (if (empty? entries)
                  "nothing to commit, working tree clean\n"
-                 (short-status conn status)))))))
+                 (short-status entries)))))))
 
 (defn- git-add [conn root cwd args]
   (let [all? (some #{"-A" "--all"} args)
@@ -213,17 +202,6 @@
     (ok (str "[" (str/replace (:geschichte.ref/name commit) #"^refs/heads/" "")
              " " (:geschichte.commit/id commit) "] " message "\n"))))
 
-(defn- present-stage [conn]
-  (into (sorted-map)
-        (keep (fn [[path entry]]
-                (when (= :present (:state entry))
-                  [path (dissoc entry :state)])))
-        (query/stage @conn)))
-
-(defn- read-tree-entry [conn entry]
-  (when-let [id (:content entry)]
-    (content/read-by-id conn id)))
-
 (defn- decode-text [value]
   (try
     (let [decoder (doto (.newDecoder StandardCharsets/UTF_8)
@@ -275,13 +253,11 @@
      :check? (contains? options "--check")
      :paths (vec (concat implicit-paths after))}))
 
-(defn- render-file-diff [conn left right path]
-  (let [left-entry (get left path)
-        right-entry (get right path)
-        left-bytes (read-tree-entry conn left-entry)
-        right-bytes (if (= ::work (:source right-entry))
-                      (repo/read conn path)
-                      (read-tree-entry conn right-entry))
+(defn- render-file-diff [conn {:keys [path before after]}]
+  (let [left-entry before
+        right-entry after
+        left-bytes (repo/read-entry conn left-entry)
+        right-bytes (repo/read-entry conn right-entry)
         left-bytes (or left-bytes (bytes/empty-bytes))
         right-bytes (or right-bytes (bytes/empty-bytes))
         left-text (decode-text left-bytes)
@@ -312,18 +288,12 @@
 (defn- git-diff [conn args]
   (let [{:keys [cached? head? quiet? name-only? stat? check? paths]}
         (diff-args args)
-        head (repo/tree-at conn)
-        index (present-stage conn)
-        work (into (sorted-map)
-                   (map (fn [[path entry]] [path (assoc entry :source ::work)]))
-                   (repo/worktree conn))
-        [left right] (cond cached? [head index] head? [head work] :else [index work])
-        changed (->> (concat (keys left) (keys right))
-                     distinct sort
-                     (filter #(and (path-selected? paths %)
-                                   (not= (dissoc (get left %) :source)
-                                         (dissoc (get right %) :source)))))
-        rendered (mapv #(render-file-diff conn left right %) changed)
+        [left right] (cond cached? [:head :index]
+                           head? [:head :worktree]
+                           :else [:index :worktree])
+        changed (->> (repo/changes conn left right)
+                     (filterv #(path-selected? paths (:path %))))
+        rendered (mapv #(render-file-diff conn %) changed)
         whitespace-errors
         (when check?
           (mapcat (fn [{:keys [path right-text]}]
