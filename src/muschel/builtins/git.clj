@@ -1,25 +1,13 @@
 (ns muschel.builtins.git
-  "Git-shaped builtin backed by Geschichte and a dynamic Muschel mount.
-
-   This is deliberately a thin shell adapter. Repository operations remain in
-   Geschichte; argv interpretation can move to Geschichte's shared command
-   engine as that surface is filled out."
+  "Muschel mount adapter for Geschichte's shared Git command engine."
   (:require [clojure.string :as str]
-            [geschichte.bytes :as bytes]
-            [geschichte.diff :as diff]
-            [geschichte.ignore :as ignore]
-            [geschichte.repo :as repo]
-            [geschichte.query :as query]
+            [geschichte.git.command :as command]
             [muschel.fs :as fs]
             [muschel.fs.geschichte :as gfs]
-            [muschel.fs.mount :as mount])
-  (:import [java.nio ByteBuffer]
-           [java.nio.charset CharacterCodingException CodingErrorAction
-            StandardCharsets]))
+            [muschel.fs.mount :as mount]))
 
-(defn- ok
-  ([] (ok ""))
-  ([stdout] {:stdout stdout :stderr "" :exit 0}))
+(defn- ok [stdout]
+  {:stdout stdout :stderr "" :exit 0})
 
 (defn- fail [message]
   {:stdout "" :stderr (str "fatal: " message "\n") :exit 128})
@@ -41,40 +29,12 @@
 
 (defn- repo-relative [root cwd path]
   (let [absolute (resolve-path cwd path)]
-    (when (or (= absolute root) (str/starts-with? absolute (str root "/")))
+    (when (or (= absolute root)
+              (str/starts-with? absolute (str root "/")))
       (str/replace (subs absolute (count root)) #"^/+" ""))))
 
-(defn- init-args [args]
-  (loop [args args, opts {}, operands []]
-    (if-let [arg (first args)]
-      (cond
-        (or (= arg "-q") (= arg "--quiet"))
-        (recur (next args) (assoc opts :quiet? true) operands)
-
-        (or (= arg "-b") (= arg "--initial-branch"))
-        (if-let [branch (second args)]
-          (recur (nnext args) (assoc opts :branch branch) operands)
-          (throw (ex-info (str "option requires an argument: " arg) {})))
-
-        (str/starts-with? arg "--initial-branch=")
-        (recur (next args)
-               (assoc opts :branch (subs arg (count "--initial-branch=")))
-               operands)
-
-        (= arg "--bare")
-        (throw (ex-info "bare repositories are not supported by the mounted worktree model" {}))
-
-        (str/starts-with? arg "-")
-        (throw (ex-info (str "unknown option `" arg "'") {}))
-
-        :else (recur (next args) opts (conj operands arg)))
-      (do
-        (when (> (count operands) 1)
-          (throw (ex-info "too many arguments" {})))
-        (assoc opts :path (or (first operands) "."))))))
-
 (defn- git-init [filesystem cwd create-repository! args]
-  (let [{:keys [path quiet? branch]} (init-args args)
+  (let [{:keys [path quiet? branch]} (command/parse-init args)
         root (resolve-path cwd path)]
     (when (and branch (not= branch "main"))
       (throw (ex-info "custom initial branches are not implemented yet"
@@ -89,530 +49,49 @@
             (if (fs/exists? filesystem path)
               (doseq [dir (reverse pending)]
                 (when-not (fs/mkdir filesystem dir)
-                  (throw (ex-info "could not create work tree directory" {:path dir}))))
+                  (throw (ex-info "could not create work tree directory"
+                                  {:path dir}))))
               (recur (conj pending path) (parent-path path)))))
         (gfs/init-and-mount! filesystem root
                              {:create-repository! create-repository!})
         (ok (if quiet? ""
               (str "Initialized empty Geschichte repository in " root "\n")))))))
 
-(defn- status-code [kind]
-  ({:added "A" :deleted "D" :modified "M"} kind " "))
-
-(defn- short-status [entries]
-  (apply str
-         (mapcat
-          (fn [{:keys [path index worktree]}]
-            (cond-> []
-              (or index (and worktree (not= :untracked worktree)))
-              (conj (str (status-code index) (status-code worktree)
-                         " " path "\n"))
-              (= :untracked worktree)
-              (conj (str "?? " path "\n"))))
-          entries)))
-
-(defn- git-status [conn args]
-  (let [rules (ignore/rules conn)
-        entries (->> (repo/status-entries conn)
-                     (keep (fn [{:keys [path worktree] :as entry}]
-                             (let [entry (if (and (= :untracked worktree)
-                                                  (ignore/ignored? rules path))
-                                           (dissoc entry :worktree)
-                                           entry)]
-                               (when (or (:index entry) (:worktree entry))
-                                 entry))))
-                     vec)
-        short? (some #{"-s" "--short" "--porcelain" "--porcelain=v1"} args)
-        branch (str/replace (repo/current-ref conn) #"^refs/heads/" "")]
-    (if short?
-      (ok (short-status entries))
-      (ok (str "On branch " branch "\n"
-               (if (empty? entries)
-                 "nothing to commit, working tree clean\n"
-                 (short-status entries)))))))
-
-(defn- git-add [conn root cwd args]
-  (let [all? (some #{"-A" "--all"} args)
-        dot? (some #{"."} args)
-        force? (boolean (some #{"-f" "--force"} args))
-        paths (remove #(or (= % "-A") (= % "--all") (= % "--")
-                           (= % "-f") (= % "--force")) args)
-        rules (ignore/rules conn)]
-    (let [tracked (keys (query/stage @conn))
-          worktree (repo/files conn)
-          candidates (vec (distinct (concat tracked worktree)))
-          cwd-relative (or (repo-relative root cwd ".") "")
-          under? (fn [prefix path]
-                   (or (= prefix path)
-                       (str/blank? prefix)
-                       (str/starts-with? path (str prefix "/"))))
-          selected
-          (cond
-            all? candidates
-            dot? (filterv #(under? cwd-relative %) candidates)
-            :else
-            (let [specs (mapv #(or (repo-relative root cwd %)
-                                   (throw (ex-info "pathspec is outside repository"
-                                                   {:path %})))
-                              paths)]
-              (when (empty? specs)
-                (throw (ex-info "Nothing specified, nothing added" {})))
-              (mapcat (fn [spec]
-                        (let [matches (filterv #(under? spec %) candidates)]
-                          (when (empty? matches)
-                            (throw (ex-info
-                                    (str "pathspec '" spec "' did not match any files")
-                                    {:pathspec spec})))
-                          matches))
-                      specs)))
-          selected (vec (distinct selected))]
-      (when (and (not all?) (not dot?) (empty? paths))
-          (throw (ex-info "Nothing specified, nothing added" {})))
-      (let [ignored (when-not force? (filter #(ignore/ignored? rules %) selected))]
-        (when (and (seq ignored) (not all?) (not dot?))
-          (throw (ex-info
-                  (str "The following paths are ignored by one of your .gitignore files:\n"
-                       (str/join "\n" ignored)
-                       "\nUse -f if you really want to add them.")
-                  {:paths ignored})))
-        (repo/stage! conn (if force?
-                            selected
-                            (vec (remove #(ignore/ignored? rules %) selected))))
-        (ok)))))
-
-(defn- option-value [args short long]
-  (or (some (fn [[a b]] (when (or (= a short) (= a long)) b))
-            (partition-all 2 1 args))
-      (some #(when (str/starts-with? % (str long "="))
-               (subs % (inc (count long)))) args)))
-
-(defn- configured-author [config]
-  (let [name (get config "user.name")
-        email (get config "user.email")]
-    (cond
-      (and name email) (str name " <" email ">")
-      name name
-      :else "unknown")))
-
-(defn- git-commit [conn config args]
-  (let [message (option-value args "-m" "--message")
-        author (or (option-value args nil "--author")
-                   (configured-author @config))
-        commit (repo/commit! conn {:message message :author author})]
-    (ok (str "[" (str/replace (:geschichte.ref/name commit) #"^refs/heads/" "")
-             " " (:geschichte.commit/id commit) "] " message "\n"))))
-
-(defn- decode-text [value]
-  (try
-    (let [decoder (doto (.newDecoder StandardCharsets/UTF_8)
-                    (.onMalformedInput CodingErrorAction/REPORT)
-                    (.onUnmappableCharacter CodingErrorAction/REPORT))
-          text (str (.decode decoder (ByteBuffer/wrap value)))]
-      (when-not (str/includes? text "\u0000") text))
-    (catch CharacterCodingException _ nil)))
-
-(defn- pathspec-regex [spec]
-  (let [expression
-        (apply str
-               (map (fn [character]
-                      (case character
-                        \* ".*"
-                        \? "."
-                        (java.util.regex.Pattern/quote (str character))))
-                    spec))]
-    (re-pattern (str "^" expression "$"))))
-
-(defn- path-selected? [specs path]
-  (or (empty? specs)
-      (some (fn [spec]
-              (if (re-find #"[*?]" spec)
-                (or (re-matches (pathspec-regex spec) path)
-                    ;; Git's basename pathspecs recurse through the tree.
-                    (and (not (str/includes? spec "/"))
-                         (re-matches (pathspec-regex spec)
-                                     (last (str/split path #"/")))))
-                (or (= spec path) (str/starts-with? path (str spec "/")))))
-            specs)))
-
-(defn- diff-args [args]
-  (let [separator (.indexOf args "--")
-        before (if (neg? separator) args (subvec args 0 separator))
-        after (if (neg? separator) [] (subvec args (inc separator)))
-        options (set (filter #(str/starts-with? % "-") before))
-        operands (vec (remove #(str/starts-with? % "-") before))
-        revisions (filter #{"HEAD"} operands)
-        implicit-paths (remove #{"HEAD"} operands)]
-    (when (some #(not (#{"HEAD"} %))
-                (take (count revisions) operands))
-      nil)
-    {:cached? (boolean (some #{"--cached" "--staged"} before))
-     :head? (boolean (some #{"HEAD"} before))
-     :quiet? (boolean (some #{"--quiet" "--exit-code"} before))
-     :name-only? (contains? options "--name-only")
-     :stat? (contains? options "--stat")
-     :check? (contains? options "--check")
-     :paths (vec (concat implicit-paths after))}))
-
-(defn- render-file-diff [conn {:keys [path before after]}]
-  (let [left-entry before
-        right-entry after
-        left-bytes (repo/read-entry conn left-entry)
-        right-bytes (repo/read-entry conn right-entry)
-        left-bytes (or left-bytes (bytes/empty-bytes))
-        right-bytes (or right-bytes (bytes/empty-bytes))
-        left-text (decode-text left-bytes)
-        right-text (decode-text right-bytes)
-        a-name (if left-entry (str "a/" path) "/dev/null")
-        b-name (if right-entry (str "b/" path) "/dev/null")]
-    (if (and left-text right-text)
-      (let [result (diff/diff-text left-text right-text)]
-        {:path path
-         :text (str "diff --git a/" path " b/" path "\n"
-                    (when-not left-entry
-                      (str "new file mode " (format "%o" (:mode right-entry)) "\n"))
-                    (when-not right-entry
-                      (str "deleted file mode " (format "%o" (:mode left-entry)) "\n"))
-                    (diff/unified result {:a-name a-name :b-name b-name}))
-         :added (reduce + 0 (map (fn [{:keys [op b-count]}]
-                                   (if (= :insert op) b-count 0))
-                                 (:edits result)))
-         :deleted (reduce + 0 (map (fn [{:keys [op a-count]}]
-                                     (if (= :delete op) a-count 0))
-                                   (:edits result)))
-         :right-text right-text})
-      {:path path
-       :text (str "diff --git a/" path " b/" path "\n"
-                  "Binary files " a-name " and " b-name " differ\n")
-       :added 0 :deleted 0})))
-
-(defn- git-diff [conn args]
-  (let [{:keys [cached? head? quiet? name-only? stat? check? paths]}
-        (diff-args args)
-        [left right] (cond cached? [:head :index]
-                           head? [:head :worktree]
-                           :else [:index :worktree])
-        changed (->> (repo/changes conn left right)
-                     (filterv #(path-selected? paths (:path %))))
-        rendered (mapv #(render-file-diff conn %) changed)
-        whitespace-errors
-        (when check?
-          (mapcat (fn [{:keys [path right-text]}]
-                    (keep-indexed
-                     (fn [index line]
-                       (when (re-find #"[ \t]+$" line)
-                         (str path ":" (inc index) ": trailing whitespace.\n")))
-                     (str/split-lines (or right-text ""))))
-                  rendered))
-        output
-        (cond
-          check? (apply str whitespace-errors)
-          name-only? (apply str (map #(str (:path %) "\n") rendered))
-          stat? (apply str
-                       (map (fn [{:keys [path added deleted]}]
-                              (str " " path " | " (+ added deleted) " "
-                                   (apply str (repeat added "+"))
-                                   (apply str (repeat deleted "-")) "\n"))
-                            rendered))
-          :else (apply str (map :text rendered)))]
-    {:stdout output
-     :stderr ""
-     :exit (cond
-             (and check? (seq whitespace-errors)) 2
-             (and quiet? (seq changed)) 1
-             :else 0)}))
-
-(defn- git-log [conn args]
-  (let [oneline? (some #{"--oneline"} args)
-        limit (some-> (or (option-value args "-n" "--max-count")
-                          (some #(second (re-matches #"-([0-9]+)" %)) args))
-                      parse-long)
-        commits (repo/log conn (cond-> {} limit (assoc :limit limit)))]
-    (ok
-     (apply str
-            (map (fn [commit]
-                   (if oneline?
-                     (str (subs (str (:geschichte.commit/id commit)) 0 8) " "
-                          (:geschichte.commit/message commit) "\n")
-                     (str "commit " (:geschichte.commit/id commit) "\n"
-                          "Author: " (:geschichte.commit/author commit) "\n\n    "
-                          (:geschichte.commit/message commit) "\n\n")))
-                 commits)))))
-
-(defn- git-ls-files [conn args]
-  (let [nul? (boolean (some #{"-z"} args))
-        others? (boolean (some #{"-o" "--others"} args))
-        ignored? (boolean (some #{"-i" "--ignored"} args))
-        rules (ignore/rules conn)
-        tracked (->> (query/stage @conn)
-                     (keep (fn [[path entry]]
-                             (when (= :present (:state entry)) path))))
-        tracked-set (set tracked)
-        untracked (remove tracked-set (repo/files conn))
-        selected (cond
-                   ignored? (filter #(ignore/ignored? rules %) untracked)
-                   others? (ignore/filter-visible rules untracked)
-                   :else tracked)
-        separator (if nul? "\u0000" "\n")]
-    (ok (str (str/join separator (sort selected))
-             (when (seq selected) separator)))))
-
-(defn- git-config [config args]
-  (let [args (vec (remove #{"--global" "--local"} args))
-        list? (some #{"-l" "--list"} args)
-        get? (some #{"--get"} args)
-        unset? (some #{"--unset"} args)
-        operands (vec (remove #(str/starts-with? % "-") args))
-        key (first operands)
-        value (second operands)]
-    (cond
-      list?
-      (ok (apply str (map (fn [[key value]] (str key "=" value "\n"))
-                          (sort @config))))
-
-      unset?
-      (do (swap! config dissoc key) (ok))
-
-      (or get? (and key (nil? value)))
-      (if-let [value (get @config key)]
-        (ok (str value "\n"))
-        {:stdout "" :stderr "" :exit 1})
-
-      (and key value)
-      (do (swap! config assoc key value) (ok))
-
-      :else
-      (fail "invalid config invocation"))))
-
-(defn- resolve-commit [conn revision]
-  (cond
-    (or (nil? revision) (= revision "HEAD"))
-    (some->> (repo/head-commit conn)
-             :geschichte.commit/id
-             (repo/commit-by-id conn))
-    :else
-    (some (fn [commit]
-            (when (str/starts-with? (str (:geschichte.commit/id commit)) revision)
-              commit))
-          (repo/log conn))))
-
-(defn- expand-repository-paths [conn root cwd specs extra-paths]
-  (let [known (->> (concat (keys (repo/tree-at conn))
-                           (keys (query/stage @conn))
-                           (repo/files conn)
-                           extra-paths)
-                   distinct sort vec)
-        specs (mapv #(or (repo-relative root cwd %)
-                         (throw (ex-info "pathspec is outside repository"
-                                         {:path %})))
-                    specs)]
-    (when (empty? specs)
-      (throw (ex-info "you must specify path(s) to restore" {})))
-    (vec
-     (distinct
-      (mapcat (fn [spec]
-                (let [matches (filterv #(or (= spec %)
-                                            (str/blank? spec)
-                                            (str/starts-with? % (str spec "/")))
-                                       known)]
-                  (when (empty? matches)
-                    (throw (ex-info
-                            (str "pathspec '" spec "' did not match any files")
-                            {:pathspec spec})))
-                  matches))
-              specs)))))
-
-(defn- git-restore [conn root cwd args]
-  (let [staged? (boolean (some #{"-S" "--staged"} args))
-        explicit-worktree? (boolean (some #{"-W" "--worktree"} args))
-        source-name (or (option-value args "-s" "--source")
-                        (some #(when (str/starts-with? % "--source=")
-                                 (subs % (count "--source="))) args))
-        source (when source-name
-                 (or (resolve-commit conn source-name)
-                     (throw (ex-info (str "could not resolve " source-name) {}))))
-        separator (.indexOf args "--")
-        paths (if (neg? separator)
-                (remove #(or (str/starts-with? % "-")
-                             (= % source-name)) args)
-                (subvec args (inc separator)))
-        source-tree (when source (repo/tree-at conn source))
-        paths (expand-repository-paths conn root cwd paths (keys source-tree))]
-    (repo/restore-paths! conn paths
-                         {:source source
-                          :staged? staged?
-                          :worktree? (or explicit-worktree? (not staged?))})
-    (ok)))
-
-(defn- git-reset [conn root cwd args]
-  (let [mode (cond
-               (some #{"--soft"} args) :soft
-               (some #{"--hard"} args) :hard
-               :else :mixed)
-        separator (.indexOf args "--")
-        before (if (neg? separator) args (subvec args 0 separator))
-        operands (vec (remove #(str/starts-with? % "-") before))
-        revision-name (or (first operands) "HEAD")
-        revision (or (resolve-commit conn revision-name)
-                     (throw (ex-info (str "ambiguous argument '" revision-name "'") {})))
-        path-args (if (neg? separator)
-                    (subvec operands (min 1 (count operands)))
-                    (subvec args (inc separator)))]
-    (if (seq path-args)
-      (let [tree (repo/tree-at conn revision)
-            paths (expand-repository-paths conn root cwd path-args (keys tree))]
-        (repo/restore-paths! conn paths {:source revision
-                                         :staged? true
-                                         :worktree? false})
-        (ok))
-      (do (repo/reset! conn revision {:mode mode})
-          (ok (str "HEAD is now at "
-                   (subs (str (:geschichte.commit/id revision)) 0 8) " "
-                   (:geschichte.commit/message revision) "\n"))))))
-
-(defn- git-rm [conn root cwd args]
-  (let [cached? (boolean (some #{"--cached"} args))
-        paths (remove #(str/starts-with? % "-") args)
-        paths (expand-repository-paths conn root cwd paths [])]
-    (repo/restore-paths! conn paths {:source :empty
-                                     :staged? true
-                                     :worktree? (not cached?)})
-    (ok (apply str (map #(str "rm '" % "'\n") paths)))))
-
-(defn- git-show [conn args]
-  (let [options (filter #(str/starts-with? % "-") args)
-        operand (first (remove #(str/starts-with? % "-") args))
-        [revision path] (when operand (str/split operand #":" 2))
-        commit (resolve-commit conn revision)]
-    (when-not commit
-      (throw (ex-info (str "bad object " (or revision "HEAD")) {})))
-    (if path
-      (if-let [value (repo/read-at conn commit path)]
-        (ok (or (decode-text value)
-                (throw (ex-info "binary object cannot be written to text stdout"
-                                {:path path}))))
-        (throw (ex-info (str "path '" path "' does not exist in '" revision "'") {})))
-      (let [format-option (some #(when (str/starts-with? % "--format=")
-                                   (subs % (count "--format="))) options)
-            message (:geschichte.commit/message commit)
-            header (cond
-                     (= format-option "%H") (str (:geschichte.commit/id commit) "\n")
-                     (= format-option "%s") (str message "\n")
-                     (some #{"--oneline"} options)
-                     (str (subs (str (:geschichte.commit/id commit)) 0 8)
-                          " " message "\n")
-                     :else
-                     (str "commit " (:geschichte.commit/id commit) "\n"
-                          "Author: " (:geschichte.commit/author commit) "\n\n    "
-                          message "\n"))]
-        (ok header)))))
-
-(defn- git-branch [conn args]
-  (cond
-    (some #{"--show-current"} args)
-    (ok (str (str/replace (repo/current-ref conn) #"^refs/heads/" "") "\n"))
-
-    (some #{"-d" "-D" "--delete"} args)
-    (let [name (first (remove #(str/starts-with? % "-") args))
-          force? (boolean (some #{"-D"} args))]
-      (repo/delete-branch! conn name {:force? force?})
-      (ok (str "Deleted branch " name ".\n")))
-
-    :else
-    (if-let [name (first (remove #(str/starts-with? % "-") args))]
-      (do (repo/branch! conn name) (ok))
-    (let [current (repo/current-ref conn)]
-      (ok (apply str
-                 (map (fn [[ref _]]
-                        (str (if (= ref current) "* " "  ")
-                             (str/replace ref #"^refs/heads/" "") "\n"))
-                      (repo/refs conn))))))))
-
-(defn- git-checkout [conn root cwd args]
-  (let [separator (.indexOf args "--")]
-    (if (not (neg? separator))
-      (let [revision-name (when (pos? separator)
-                            (first (remove #(str/starts-with? % "-")
-                                           (subvec args 0 separator))))
-            source (when revision-name
-                     (or (resolve-commit conn revision-name)
-                         (throw (ex-info (str "invalid reference: " revision-name) {}))))
-            paths (expand-repository-paths
-                   conn root cwd (subvec args (inc separator))
-                   (keys (when source (repo/tree-at conn source))))]
-        (repo/restore-paths! conn paths
-                             {:source source
-                              :staged? (boolean source)
-                              :worktree? true})
-        (ok))
-      (let [force? (boolean (some #{"-f" "--force"} args))
-            create? (boolean (some #{"-b" "-B" "-c" "-C"} args))
-            name (last args)]
-        (when (or (nil? name) (str/starts-with? name "-"))
-          (throw (ex-info "you must specify a branch" {})))
-        (when create? (repo/branch! conn name))
-        (repo/checkout! conn name {:force? force?})
-        (ok (str "Switched to branch '" name "'\n"))))))
-
-(defn- git-rev-parse [conn root args]
-  (cond
-    (some #{"--show-toplevel"} args) (ok (str root "\n"))
-    (some #{"--is-inside-work-tree"} args) (ok "true\n")
-    (and (some #{"--abbrev-ref"} args) (some #{"HEAD"} args))
-    (ok (str (str/replace (repo/current-ref conn) #"^refs/heads/" "") "\n"))
-    (some #{"HEAD"} args)
-    (if-let [head (repo/head-commit conn)]
-      (ok (str (:geschichte.commit/id head) "\n"))
-      (fail "ambiguous argument 'HEAD': unknown revision or path not in the working tree"))
-    :else (fail "unsupported rev-parse invocation")))
-
 (defn make
-  "Create a Muschel builtin function. `create-repository!` is injectable so
-   harnesses choose memory, file, IndexedDB/projection, and lifecycle policy."
+  "Create the Git builtin. Geschichte owns command semantics; this adapter owns
+   dynamic mount discovery and the filesystem transition performed by init."
   ([] (make {}))
   ([{:keys [create-repository! global-config]
      :or {create-repository! gfs/memory-repository!}}]
    (let [global-config (or global-config (atom {}))]
-    (fn [argv filesystem env]
-     (try
-       (when-not (instance? muschel.fs.mount.MountFS filesystem)
-         (throw (ex-info "Git integration requires a dynamic mount filesystem" {})))
-       (let [args (vec (rest argv))
-             command (first args)
-             args (subvec args (min 1 (count args)))
-             cwd (:cwd env)
-             context (repository-context filesystem cwd)]
-         (cond
-           (= command "init")
-           (git-init filesystem cwd create-repository! args)
+     (fn [argv filesystem env]
+       (try
+         (when-not (instance? muschel.fs.mount.MountFS filesystem)
+           (throw (ex-info "Git integration requires a dynamic mount filesystem"
+                           {})))
+         (let [args (vec (remove #{"--no-pager" "--paginate"} (rest argv)))
+               command-name (first args)
+               command-args (subvec args (min 1 (count args)))
+               cwd (:cwd env)
+               context (repository-context filesystem cwd)]
+           (cond
+             (= command-name "init")
+             (git-init filesystem cwd create-repository! command-args)
 
-           (= command "config")
-           (if (or (some #{"--global"} args) context)
-             (git-config (if (some #{"--global"} args)
-                           global-config
-                           (-> context :fs :config-atom))
-                         args)
-             (fail "not in a git directory"))
+             (and (= command-name "config")
+                  (some #{"--global"} command-args))
+             (command/execute {:config global-config} args)
 
-           context
-           (let [{:keys [root conn fs]} context]
-             (case command
-               "status" (git-status conn args)
-               "add" (git-add conn root cwd args)
-               "commit" (git-commit conn (:config-atom fs) args)
-               "diff" (git-diff conn args)
-               "log" (git-log conn args)
-               "show" (git-show conn args)
-               "ls-files" (git-ls-files conn args)
-               "branch" (git-branch conn args)
-               "checkout" (git-checkout conn root cwd args)
-               "switch" (git-checkout conn root cwd args)
-               "restore" (git-restore conn root cwd args)
-               "reset" (git-reset conn root cwd args)
-               "rm" (git-rm conn root cwd args)
-               "rev-parse" (git-rev-parse conn root args)
-               (fail (str "'" command "' is not yet implemented by Geschichte"))))
+             context
+             (let [{:keys [root conn fs]} context]
+               (command/execute
+                {:root root
+                 :conn conn
+                 :config (:config-atom fs)
+                 :repo-relative #(repo-relative root cwd %)}
+                args))
 
-           :else
-           (fail "not a Geschichte repository (or any parent)")))
-       (catch Throwable error
-         (fail (or (ex-message error) (str error)))))))))
+             :else
+             (fail "not a Geschichte repository (or any parent)")))
+         (catch Throwable error
+           (fail (or (ex-message error) (str error)))))))))
