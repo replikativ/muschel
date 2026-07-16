@@ -167,6 +167,20 @@
 (defn sandbox-relativize [fs real-path-str] (-sandbox-relativize fs real-path-str))
 (defn physical-path     [fs sandbox-path]  (-physical-path     fs sandbox-path))
 
+(defn commit-sink!
+  "Commit a map-backed sink once, if it carries a `:commit!` callback.
+
+   Map sinks are Muschel's portable JVM/CLJS substitute for an OutputStream
+   with a close hook. Plain VirtualFS sinks have no callback and remain eager;
+   versioned/persistent adapters can defer their one logical write until close."
+  [sink]
+  (when (and (map? sink) (fn? (:commit! sink)))
+    (let [closed? (:closed? sink)]
+      (when (or (nil? closed?)
+                (compare-and-set! closed? false true))
+        ((:commit! sink) @(:acc sink))
+        true))))
+
 (defn write-string!
   "Portable write-string-to-path. Opens a sink via `-open-sink`,
    writes `content` (UTF-8), and closes. Returns truthy on success,
@@ -192,6 +206,7 @@
       (do (if append?
             (swap!  (:acc sink) str content)
             (reset! (:acc sink) content))
+          (commit-sink! sink)
           true)
 
       #?(:cljs (instance? cljs.core/Atom sink) :clj false)

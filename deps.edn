@@ -56,6 +56,13 @@
          :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
                       thheller/shadow-cljs      {:mvn/version "2.28.23"}}}
 
+  ;; Cross-runtime diff kernel smoke benchmark + native Git count oracle.
+  :diff-lab {:extra-paths ["dev"]
+             :main-opts ["-m" "muschel.diff-lab"]}
+
+  :version-lab {:extra-paths ["dev"]
+                :main-opts ["-m" "muschel.version-store-lab"]}
+
   ;; Build + deploy (jar, clojars, gh release, npm publish).
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
                  slipset/deps-deploy           {:mvn/version "0.2.2"}

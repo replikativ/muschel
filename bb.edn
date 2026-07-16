@@ -93,10 +93,12 @@
                      muschel.awk-test
                      muschel.budget-test
                      muschel.builtins-test
+                     muschel.diff-test
                      muschel.env-test
                      muschel.errors-test
                      muschel.exec-test
                      muschel.fs-test
+                     muschel.fs-versioned-test
                      muschel.host-builtin-test
                      muschel.lex-test
                      muschel.parse-test
@@ -105,6 +107,7 @@
                      muschel.session-test
                      muschel.text-path-builtins-test
                      muschel.trace-test
+                     muschel.version-store-test
                      muschel.write-builtins-test]]
      (doseq [n test-nses] (require n))
      (let [{:keys [fail error] :as summary} (apply t/run-tests test-nses)]
