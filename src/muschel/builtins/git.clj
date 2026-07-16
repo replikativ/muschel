@@ -336,19 +336,79 @@
                           (:geschichte.commit/message commit) "\n\n")))
                  commits)))))
 
+(defn- git-ls-files [conn args]
+  (let [nul? (boolean (some #{"-z"} args))
+        others? (boolean (some #{"-o" "--others"} args))
+        ignored? (boolean (some #{"-i" "--ignored"} args))
+        rules (ignore/rules conn)
+        tracked (->> (query/stage @conn)
+                     (keep (fn [[path entry]]
+                             (when (= :present (:state entry)) path))))
+        tracked-set (set tracked)
+        untracked (remove tracked-set (repo/files conn))
+        selected (cond
+                   ignored? (filter #(ignore/ignored? rules %) untracked)
+                   others? (ignore/filter-visible rules untracked)
+                   :else tracked)
+        separator (if nul? "\u0000" "\n")]
+    (ok (str (str/join separator (sort selected))
+             (when (seq selected) separator)))))
+
+(defn- resolve-commit [conn revision]
+  (cond
+    (or (nil? revision) (= revision "HEAD"))
+    (some->> (repo/head-commit conn)
+             :geschichte.commit/id
+             (repo/commit-by-id conn))
+    :else
+    (some (fn [commit]
+            (when (str/starts-with? (str (:geschichte.commit/id commit)) revision)
+              commit))
+          (repo/log conn))))
+
+(defn- git-show [conn args]
+  (let [options (filter #(str/starts-with? % "-") args)
+        operand (first (remove #(str/starts-with? % "-") args))
+        [revision path] (when operand (str/split operand #":" 2))
+        commit (resolve-commit conn revision)]
+    (when-not commit
+      (throw (ex-info (str "bad object " (or revision "HEAD")) {})))
+    (if path
+      (if-let [value (repo/read-at conn commit path)]
+        (ok (or (decode-text value)
+                (throw (ex-info "binary object cannot be written to text stdout"
+                                {:path path}))))
+        (throw (ex-info (str "path '" path "' does not exist in '" revision "'") {})))
+      (let [format-option (some #(when (str/starts-with? % "--format=")
+                                   (subs % (count "--format="))) options)
+            message (:geschichte.commit/message commit)
+            header (cond
+                     (= format-option "%H") (str (:geschichte.commit/id commit) "\n")
+                     (= format-option "%s") (str message "\n")
+                     (some #{"--oneline"} options)
+                     (str (subs (str (:geschichte.commit/id commit)) 0 8)
+                          " " message "\n")
+                     :else
+                     (str "commit " (:geschichte.commit/id commit) "\n"
+                          "Author: " (:geschichte.commit/author commit) "\n\n    "
+                          message "\n"))]
+        (ok header)))))
+
 (defn- git-branch [conn args]
-  (if-let [name (first (remove #(str/starts-with? % "-") args))]
+  (if (some #{"--show-current"} args)
+    (ok (str (str/replace (repo/current-ref conn) #"^refs/heads/" "") "\n"))
+    (if-let [name (first (remove #(str/starts-with? % "-") args))]
     (do (repo/branch! conn name) (ok))
     (let [current (repo/current-ref conn)]
       (ok (apply str
                  (map (fn [[ref _]]
                         (str (if (= ref current) "* " "  ")
                              (str/replace ref #"^refs/heads/" "") "\n"))
-                      (repo/refs conn)))))))
+                      (repo/refs conn))))))))
 
 (defn- git-checkout [conn args]
   (let [force? (boolean (some #{"-f" "--force"} args))
-        create? (boolean (some #{"-b" "-B"} args))
+        create? (boolean (some #{"-b" "-B" "-c" "-C"} args))
         name (last args)]
     (when (or (nil? name) (str/starts-with? name "-"))
       (throw (ex-info "you must specify a branch" {})))
@@ -390,6 +450,8 @@
                "commit" (git-commit conn args)
                "diff" (git-diff conn args)
                "log" (git-log conn args)
+               "show" (git-show conn args)
+               "ls-files" (git-ls-files conn args)
                "branch" (git-branch conn args)
                "checkout" (git-checkout conn args)
                "switch" (git-checkout conn args)
