@@ -31,6 +31,9 @@
       (is (str/includes? (:stdout (run host "git init")) "Reinitialized"))
       (is (= ["/project"] (mount/mount-points filesystem))))
     (testing "the familiar agent lifecycle stays Git-shaped"
+      (is (= 0 (:exit (run host "git config user.name 'Coding Agent'"))))
+      (is (= 0 (:exit (run host "git config user.email agent@example.test"))))
+      (is (= "Coding Agent\n" (:stdout (run host "git config --get user.name"))))
       (is (= "?? .gitignore\n?? README.md\n"
              (:stdout (run host "git status --short"))))
       (is (= 0 (:exit (run host "git add ."))))
@@ -52,6 +55,8 @@
       (is (= 0 (:exit (run host "git commit -m update"))))
       (is (= "changed\n" (:stdout (run host "git show HEAD:README.md"))))
       (is (= "update\n" (:stdout (run host "git show --format=%s --no-patch HEAD"))))
+      (is (str/includes? (:stdout (run host "git show HEAD"))
+                         "Coding Agent <agent@example.test>"))
       (is (str/includes? (:stdout (run host "git ls-files")) "README.md"))
       (is (= "main\n" (:stdout (run host "git branch --show-current"))))
       (is (= 0 (:exit (run host "git switch -c feature"))))

@@ -174,9 +174,18 @@
       (some #(when (str/starts-with? % (str long "="))
                (subs % (inc (count long)))) args)))
 
-(defn- git-commit [conn args]
+(defn- configured-author [config]
+  (let [name (get config "user.name")
+        email (get config "user.email")]
+    (cond
+      (and name email) (str name " <" email ">")
+      name name
+      :else "unknown")))
+
+(defn- git-commit [conn config args]
   (let [message (option-value args "-m" "--message")
-        author (or (option-value args nil "--author") "unknown")
+        author (or (option-value args nil "--author")
+                   (configured-author @config))
         commit (repo/commit! conn {:message message :author author})]
     (ok (str "[" (str/replace (:geschichte.ref/name commit) #"^refs/heads/" "")
              " " (:geschichte.commit/id commit) "] " message "\n"))))
@@ -354,6 +363,33 @@
     (ok (str (str/join separator (sort selected))
              (when (seq selected) separator)))))
 
+(defn- git-config [config args]
+  (let [args (vec (remove #{"--global" "--local"} args))
+        list? (some #{"-l" "--list"} args)
+        get? (some #{"--get"} args)
+        unset? (some #{"--unset"} args)
+        operands (vec (remove #(str/starts-with? % "-") args))
+        key (first operands)
+        value (second operands)]
+    (cond
+      list?
+      (ok (apply str (map (fn [[key value]] (str key "=" value "\n"))
+                          (sort @config))))
+
+      unset?
+      (do (swap! config dissoc key) (ok))
+
+      (or get? (and key (nil? value)))
+      (if-let [value (get @config key)]
+        (ok (str value "\n"))
+        {:stdout "" :stderr "" :exit 1})
+
+      (and key value)
+      (do (swap! config assoc key value) (ok))
+
+      :else
+      (fail "invalid config invocation"))))
+
 (defn- resolve-commit [conn revision]
   (cond
     (or (nil? revision) (= revision "HEAD"))
@@ -432,22 +468,36 @@
   "Create a Muschel builtin function. `create-repository!` is injectable so
    harnesses choose memory, file, IndexedDB/projection, and lifecycle policy."
   ([] (make {}))
-  ([{:keys [create-repository!] :or {create-repository! gfs/memory-repository!}}]
-   (fn [argv filesystem env]
+  ([{:keys [create-repository! global-config]
+     :or {create-repository! gfs/memory-repository!}}]
+   (let [global-config (or global-config (atom {}))]
+    (fn [argv filesystem env]
      (try
        (when-not (instance? muschel.fs.mount.MountFS filesystem)
          (throw (ex-info "Git integration requires a dynamic mount filesystem" {})))
        (let [args (vec (rest argv))
              command (first args)
              args (subvec args (min 1 (count args)))
-             cwd (:cwd env)]
-         (if (= command "init")
+             cwd (:cwd env)
+             context (repository-context filesystem cwd)]
+         (cond
+           (= command "init")
            (git-init filesystem cwd create-repository! args)
-           (if-let [{:keys [root conn]} (repository-context filesystem cwd)]
+
+           (= command "config")
+           (if (or (some #{"--global"} args) context)
+             (git-config (if (some #{"--global"} args)
+                           global-config
+                           (-> context :fs :config-atom))
+                         args)
+             (fail "not in a git directory"))
+
+           context
+           (let [{:keys [root conn fs]} context]
              (case command
                "status" (git-status conn args)
                "add" (git-add conn root cwd args)
-               "commit" (git-commit conn args)
+               "commit" (git-commit conn (:config-atom fs) args)
                "diff" (git-diff conn args)
                "log" (git-log conn args)
                "show" (git-show conn args)
@@ -456,7 +506,9 @@
                "checkout" (git-checkout conn args)
                "switch" (git-checkout conn args)
                "rev-parse" (git-rev-parse conn root args)
-               (fail (str "'" command "' is not yet implemented by Geschichte")))
-             (fail "not a Geschichte repository (or any parent)"))))
+               (fail (str "'" command "' is not yet implemented by Geschichte"))))
+
+           :else
+           (fail "not a Geschichte repository (or any parent)")))
        (catch Throwable error
-         (fail (or (ex-message error) (str error))))))))
+         (fail (or (ex-message error) (str error)))))))))

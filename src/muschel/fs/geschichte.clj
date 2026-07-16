@@ -64,7 +64,7 @@
           (when next-path (recur next-path (dec remaining))))
         (when (pos? remaining) path)))))
 
-(defrecord GeschichteFS [conn cwd-atom repository]
+(defrecord GeschichteFS [conn cwd-atom repository config-atom]
   fs/FS
   (-resolve [_ path] (canonicalize @cwd-atom path))
   (-cwd [_] @cwd-atom)
@@ -147,8 +147,8 @@
 (defn make
   "Adapt an initialized Geschichte connection to Muschel's synchronous JVM FS."
   ([conn] (make conn {}))
-  ([conn {:keys [cwd repository] :or {cwd "/"}}]
-   (->GeschichteFS conn (atom cwd) repository)))
+  ([conn {:keys [cwd repository config] :or {cwd "/" config {}}}]
+   (->GeschichteFS conn (atom cwd) repository (atom config))))
 
 (defn close!
   "Release resources owned by an adapter's repository factory. Persistent
