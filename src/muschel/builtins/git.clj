@@ -97,11 +97,34 @@
         (ok (if quiet? ""
               (str "Initialized empty Geschichte repository in " root "\n")))))))
 
-(defn- short-status [{:keys [staged unstaged untracked]}]
-  (str
-   (apply str (map #(str "A  " % "\n") staged))
-   (apply str (map #(str " M " % "\n") unstaged))
-   (apply str (map #(str "?? " % "\n") untracked))))
+(declare present-stage)
+
+(defn- change-code [before after added-code]
+  (cond
+    (and (nil? before) after) added-code
+    (and before (nil? after)) "D"
+    (not= before after) "M"
+    :else " "))
+
+(defn- short-status [conn {:keys [staged unstaged untracked]}]
+  (let [head (repo/tree-at conn)
+        index (present-stage conn)
+        work (repo/worktree conn)
+        staged (set staged)
+        unstaged (set unstaged)
+        changed (sort (into staged unstaged))]
+    (str
+     (apply str
+            (map (fn [path]
+                   (str (if (staged path)
+                          (change-code (get head path) (get index path) "A")
+                          " ")
+                        (if (unstaged path)
+                          (change-code (get index path) (get work path) "M")
+                          " ")
+                        " " path "\n"))
+                 changed))
+     (apply str (map #(str "?? " % "\n") untracked)))))
 
 (defn- git-status [conn args]
   (let [rules (ignore/rules conn)
@@ -113,11 +136,11 @@
         short? (some #{"-s" "--short" "--porcelain" "--porcelain=v1"} args)
         branch (str/replace (:branch status) #"^refs/heads/" "")]
     (if short?
-      (ok (short-status status))
+      (ok (short-status conn status))
       (ok (str "On branch " branch "\n"
                (if (:clean? status)
                  "nothing to commit, working tree clean\n"
-                 (short-status status)))))))
+                 (short-status conn status)))))))
 
 (defn- git-add [conn root cwd args]
   (let [all? (some #{"-A" "--all"} args)
