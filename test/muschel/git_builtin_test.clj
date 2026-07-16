@@ -13,7 +13,11 @@
 
 (deftest agent-git-init-takes-over-the-worktree
   (let [base (vfs/make {"/project" {:type :dir}
-                        "/project/README.md" "hello\n"})
+                        "/project/README.md" "hello\n"
+                        "/project/.gitignore" "target/\n*.log\n"
+                        "/project/target" {:type :dir}
+                        "/project/target/output.js" "generated\n"
+                        "/project/debug.log" "ignored\n"})
         filesystem (mount/make base {} {:cwd "/project"})
         host (builtin/make {:fs filesystem
                             :fallback-host (th/fallback-host)
@@ -27,11 +31,28 @@
       (is (str/includes? (:stdout (run host "git init")) "Reinitialized"))
       (is (= ["/project"] (mount/mount-points filesystem))))
     (testing "the familiar agent lifecycle stays Git-shaped"
-      (is (= "?? README.md\n" (:stdout (run host "git status --short"))))
+      (is (= "?? .gitignore\n?? README.md\n"
+             (:stdout (run host "git status --short"))))
       (is (= 0 (:exit (run host "git add ."))))
-      (is (= "A  README.md\n" (:stdout (run host "git status --short"))))
+      (is (= "A  .gitignore\nA  README.md\n"
+             (:stdout (run host "git status --short"))))
       (is (= 0 (:exit (run host "git commit -m initial"))))
-      (is (str/includes? (:stdout (run host "git log --oneline")) "initial")))
+      (is (str/includes? (:stdout (run host "git log --oneline")) "initial"))
+      (is (str/includes? (:stdout (run host "git status"))
+                         "working tree clean"))
+      (is (= 0 (:exit (run host "echo changed > README.md"))))
+      (is (str/includes? (:stdout (run host "git diff -- README.md"))
+                         "+changed"))
+      (is (str/includes? (:stdout (run host "git diff -- '*.md'"))
+                         "+changed"))
+      (is (= 1 (:exit (run host "git diff --quiet"))))
+      (is (= 0 (:exit (run host "git add README.md"))))
+      (is (str/includes? (:stdout (run host "git diff --cached -- README.md"))
+                         "+changed"))
+      (is (= 0 (:exit (run host "git commit -m update"))))
+      (is (= 128 (:exit (run host "git add debug.log"))))
+      (is (= 0 (:exit (run host "git add -f debug.log"))))
+      (is (= 0 (:exit (run host "git commit -m ignored-file")))))
     (testing "writes made after init are Geschichte worktree mutations"
       (is (= 0 (:exit (run host "echo more > more.txt"))))
       (is (= "?? more.txt\n" (:stdout (run host "git status --short")))))))

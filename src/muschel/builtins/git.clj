@@ -5,10 +5,18 @@
    Geschichte; argv interpretation can move to Geschichte's shared command
    engine as that surface is filled out."
   (:require [clojure.string :as str]
+            [geschichte.bytes :as bytes]
+            [geschichte.content :as content]
+            [geschichte.diff :as diff]
             [geschichte.repo :as repo]
+            [geschichte.query :as query]
             [muschel.fs :as fs]
             [muschel.fs.geschichte :as gfs]
-            [muschel.fs.mount :as mount]))
+            [muschel.fs.mount :as mount]
+            [muschel.gitignore :as ignore])
+  (:import [java.nio ByteBuffer]
+           [java.nio.charset CharacterCodingException CodingErrorAction
+            StandardCharsets]))
 
 (defn- ok
   ([] (ok ""))
@@ -96,7 +104,12 @@
    (apply str (map #(str "?? " % "\n") untracked))))
 
 (defn- git-status [conn args]
-  (let [status (repo/status conn)
+  (let [rules (ignore/rules conn)
+        status (update (repo/status conn) :untracked
+                       #(vec (ignore/filter-visible rules %)))
+        status (assoc status :clean?
+                      (every? empty? ((juxt :staged :unstaged :untracked)
+                                      status)))
         short? (some #{"-s" "--short" "--porcelain" "--porcelain=v1"} args)
         branch (str/replace (:branch status) #"^refs/heads/" "")]
     (if short?
@@ -107,17 +120,52 @@
                  (short-status status)))))))
 
 (defn- git-add [conn root cwd args]
-  (let [all? (some #{"-A" "--all" "."} args)
-        paths (remove #(or (= % "-A") (= % "--all") (= % "--")) args)]
-    (if all?
-      (do (repo/stage-all! conn) (ok))
-      (let [paths (mapv #(or (repo-relative root cwd %)
-                             (throw (ex-info "pathspec is outside repository"
-                                             {:path %})))
-                        paths)]
-        (when (empty? paths)
+  (let [all? (some #{"-A" "--all"} args)
+        dot? (some #{"."} args)
+        force? (boolean (some #{"-f" "--force"} args))
+        paths (remove #(or (= % "-A") (= % "--all") (= % "--")
+                           (= % "-f") (= % "--force")) args)
+        rules (ignore/rules conn)]
+    (let [tracked (keys (query/stage @conn))
+          worktree (repo/files conn)
+          candidates (vec (distinct (concat tracked worktree)))
+          cwd-relative (or (repo-relative root cwd ".") "")
+          under? (fn [prefix path]
+                   (or (= prefix path)
+                       (str/blank? prefix)
+                       (str/starts-with? path (str prefix "/"))))
+          selected
+          (cond
+            all? candidates
+            dot? (filterv #(under? cwd-relative %) candidates)
+            :else
+            (let [specs (mapv #(or (repo-relative root cwd %)
+                                   (throw (ex-info "pathspec is outside repository"
+                                                   {:path %})))
+                              paths)]
+              (when (empty? specs)
+                (throw (ex-info "Nothing specified, nothing added" {})))
+              (mapcat (fn [spec]
+                        (let [matches (filterv #(under? spec %) candidates)]
+                          (when (empty? matches)
+                            (throw (ex-info
+                                    (str "pathspec '" spec "' did not match any files")
+                                    {:pathspec spec})))
+                          matches))
+                      specs)))
+          selected (vec (distinct selected))]
+      (when (and (not all?) (not dot?) (empty? paths))
           (throw (ex-info "Nothing specified, nothing added" {})))
-        (repo/stage! conn paths)
+      (let [ignored (when-not force? (filter #(ignore/ignored? rules %) selected))]
+        (when (and (seq ignored) (not all?) (not dot?))
+          (throw (ex-info
+                  (str "The following paths are ignored by one of your .gitignore files:\n"
+                       (str/join "\n" ignored)
+                       "\nUse -f if you really want to add them.")
+                  {:paths ignored})))
+        (repo/stage! conn (if force?
+                            selected
+                            (vec (remove #(ignore/ignored? rules %) selected))))
         (ok)))))
 
 (defn- option-value [args short long]
@@ -132,6 +180,144 @@
         commit (repo/commit! conn {:message message :author author})]
     (ok (str "[" (str/replace (:geschichte.ref/name commit) #"^refs/heads/" "")
              " " (:geschichte.commit/id commit) "] " message "\n"))))
+
+(defn- present-stage [conn]
+  (into (sorted-map)
+        (keep (fn [[path entry]]
+                (when (= :present (:state entry))
+                  [path (dissoc entry :state)])))
+        (query/stage @conn)))
+
+(defn- read-tree-entry [conn entry]
+  (when-let [id (:content entry)]
+    (content/read-by-id conn id)))
+
+(defn- decode-text [value]
+  (try
+    (let [decoder (doto (.newDecoder StandardCharsets/UTF_8)
+                    (.onMalformedInput CodingErrorAction/REPORT)
+                    (.onUnmappableCharacter CodingErrorAction/REPORT))
+          text (str (.decode decoder (ByteBuffer/wrap value)))]
+      (when-not (str/includes? text "\u0000") text))
+    (catch CharacterCodingException _ nil)))
+
+(defn- pathspec-regex [spec]
+  (let [expression
+        (apply str
+               (map (fn [character]
+                      (case character
+                        \* ".*"
+                        \? "."
+                        (java.util.regex.Pattern/quote (str character))))
+                    spec))]
+    (re-pattern (str "^" expression "$"))))
+
+(defn- path-selected? [specs path]
+  (or (empty? specs)
+      (some (fn [spec]
+              (if (re-find #"[*?]" spec)
+                (or (re-matches (pathspec-regex spec) path)
+                    ;; Git's basename pathspecs recurse through the tree.
+                    (and (not (str/includes? spec "/"))
+                         (re-matches (pathspec-regex spec)
+                                     (last (str/split path #"/")))))
+                (or (= spec path) (str/starts-with? path (str spec "/")))))
+            specs)))
+
+(defn- diff-args [args]
+  (let [separator (.indexOf args "--")
+        before (if (neg? separator) args (subvec args 0 separator))
+        after (if (neg? separator) [] (subvec args (inc separator)))
+        options (set (filter #(str/starts-with? % "-") before))
+        operands (vec (remove #(str/starts-with? % "-") before))
+        revisions (filter #{"HEAD"} operands)
+        implicit-paths (remove #{"HEAD"} operands)]
+    (when (some #(not (#{"HEAD"} %))
+                (take (count revisions) operands))
+      nil)
+    {:cached? (boolean (some #{"--cached" "--staged"} before))
+     :head? (boolean (some #{"HEAD"} before))
+     :quiet? (boolean (some #{"--quiet" "--exit-code"} before))
+     :name-only? (contains? options "--name-only")
+     :stat? (contains? options "--stat")
+     :check? (contains? options "--check")
+     :paths (vec (concat implicit-paths after))}))
+
+(defn- render-file-diff [conn left right path]
+  (let [left-entry (get left path)
+        right-entry (get right path)
+        left-bytes (read-tree-entry conn left-entry)
+        right-bytes (if (= ::work (:source right-entry))
+                      (repo/read conn path)
+                      (read-tree-entry conn right-entry))
+        left-bytes (or left-bytes (bytes/empty-bytes))
+        right-bytes (or right-bytes (bytes/empty-bytes))
+        left-text (decode-text left-bytes)
+        right-text (decode-text right-bytes)
+        a-name (if left-entry (str "a/" path) "/dev/null")
+        b-name (if right-entry (str "b/" path) "/dev/null")]
+    (if (and left-text right-text)
+      (let [result (diff/diff-text left-text right-text)]
+        {:path path
+         :text (str "diff --git a/" path " b/" path "\n"
+                    (when-not left-entry
+                      (str "new file mode " (format "%o" (:mode right-entry)) "\n"))
+                    (when-not right-entry
+                      (str "deleted file mode " (format "%o" (:mode left-entry)) "\n"))
+                    (diff/unified result {:a-name a-name :b-name b-name}))
+         :added (reduce + 0 (map (fn [{:keys [op b-count]}]
+                                   (if (= :insert op) b-count 0))
+                                 (:edits result)))
+         :deleted (reduce + 0 (map (fn [{:keys [op a-count]}]
+                                     (if (= :delete op) a-count 0))
+                                   (:edits result)))
+         :right-text right-text})
+      {:path path
+       :text (str "diff --git a/" path " b/" path "\n"
+                  "Binary files " a-name " and " b-name " differ\n")
+       :added 0 :deleted 0})))
+
+(defn- git-diff [conn args]
+  (let [{:keys [cached? head? quiet? name-only? stat? check? paths]}
+        (diff-args args)
+        head (repo/tree-at conn)
+        index (present-stage conn)
+        work (into (sorted-map)
+                   (map (fn [[path entry]] [path (assoc entry :source ::work)]))
+                   (repo/worktree conn))
+        [left right] (cond cached? [head index] head? [head work] :else [index work])
+        changed (->> (concat (keys left) (keys right))
+                     distinct sort
+                     (filter #(and (path-selected? paths %)
+                                   (not= (dissoc (get left %) :source)
+                                         (dissoc (get right %) :source)))))
+        rendered (mapv #(render-file-diff conn left right %) changed)
+        whitespace-errors
+        (when check?
+          (mapcat (fn [{:keys [path right-text]}]
+                    (keep-indexed
+                     (fn [index line]
+                       (when (re-find #"[ \t]+$" line)
+                         (str path ":" (inc index) ": trailing whitespace.\n")))
+                     (str/split-lines (or right-text ""))))
+                  rendered))
+        output
+        (cond
+          check? (apply str whitespace-errors)
+          name-only? (apply str (map #(str (:path %) "\n") rendered))
+          stat? (apply str
+                       (map (fn [{:keys [path added deleted]}]
+                              (str " " path " | " (+ added deleted) " "
+                                   (apply str (repeat added "+"))
+                                   (apply str (repeat deleted "-")) "\n"))
+                            rendered))
+          :else (apply str (map :text rendered)))]
+    {:stdout output
+     :stderr ""
+     :exit (cond
+             (and check? (seq whitespace-errors)) 2
+             (and quiet? (seq changed)) 1
+             :else 0)}))
 
 (defn- git-log [conn args]
   (let [oneline? (some #{"--oneline"} args)
@@ -202,6 +388,7 @@
                "status" (git-status conn args)
                "add" (git-add conn root cwd args)
                "commit" (git-commit conn args)
+               "diff" (git-diff conn args)
                "log" (git-log conn args)
                "branch" (git-branch conn args)
                "checkout" (git-checkout conn args)
