@@ -425,6 +425,89 @@
               commit))
           (repo/log conn))))
 
+(defn- expand-repository-paths [conn root cwd specs extra-paths]
+  (let [known (->> (concat (keys (repo/tree-at conn))
+                           (keys (query/stage @conn))
+                           (repo/files conn)
+                           extra-paths)
+                   distinct sort vec)
+        specs (mapv #(or (repo-relative root cwd %)
+                         (throw (ex-info "pathspec is outside repository"
+                                         {:path %})))
+                    specs)]
+    (when (empty? specs)
+      (throw (ex-info "you must specify path(s) to restore" {})))
+    (vec
+     (distinct
+      (mapcat (fn [spec]
+                (let [matches (filterv #(or (= spec %)
+                                            (str/blank? spec)
+                                            (str/starts-with? % (str spec "/")))
+                                       known)]
+                  (when (empty? matches)
+                    (throw (ex-info
+                            (str "pathspec '" spec "' did not match any files")
+                            {:pathspec spec})))
+                  matches))
+              specs)))))
+
+(defn- git-restore [conn root cwd args]
+  (let [staged? (boolean (some #{"-S" "--staged"} args))
+        explicit-worktree? (boolean (some #{"-W" "--worktree"} args))
+        source-name (or (option-value args "-s" "--source")
+                        (some #(when (str/starts-with? % "--source=")
+                                 (subs % (count "--source="))) args))
+        source (when source-name
+                 (or (resolve-commit conn source-name)
+                     (throw (ex-info (str "could not resolve " source-name) {}))))
+        separator (.indexOf args "--")
+        paths (if (neg? separator)
+                (remove #(or (str/starts-with? % "-")
+                             (= % source-name)) args)
+                (subvec args (inc separator)))
+        source-tree (when source (repo/tree-at conn source))
+        paths (expand-repository-paths conn root cwd paths (keys source-tree))]
+    (repo/restore-paths! conn paths
+                         {:source source
+                          :staged? staged?
+                          :worktree? (or explicit-worktree? (not staged?))})
+    (ok)))
+
+(defn- git-reset [conn root cwd args]
+  (let [mode (cond
+               (some #{"--soft"} args) :soft
+               (some #{"--hard"} args) :hard
+               :else :mixed)
+        separator (.indexOf args "--")
+        before (if (neg? separator) args (subvec args 0 separator))
+        operands (vec (remove #(str/starts-with? % "-") before))
+        revision-name (or (first operands) "HEAD")
+        revision (or (resolve-commit conn revision-name)
+                     (throw (ex-info (str "ambiguous argument '" revision-name "'") {})))
+        path-args (if (neg? separator)
+                    (subvec operands (min 1 (count operands)))
+                    (subvec args (inc separator)))]
+    (if (seq path-args)
+      (let [tree (repo/tree-at conn revision)
+            paths (expand-repository-paths conn root cwd path-args (keys tree))]
+        (repo/restore-paths! conn paths {:source revision
+                                         :staged? true
+                                         :worktree? false})
+        (ok))
+      (do (repo/reset! conn revision {:mode mode})
+          (ok (str "HEAD is now at "
+                   (subs (str (:geschichte.commit/id revision)) 0 8) " "
+                   (:geschichte.commit/message revision) "\n"))))))
+
+(defn- git-rm [conn root cwd args]
+  (let [cached? (boolean (some #{"--cached"} args))
+        paths (remove #(str/starts-with? % "-") args)
+        paths (expand-repository-paths conn root cwd paths [])]
+    (repo/restore-paths! conn paths {:source :empty
+                                     :staged? true
+                                     :worktree? (not cached?)})
+    (ok (apply str (map #(str "rm '" % "'\n") paths)))))
+
 (defn- git-show [conn args]
   (let [options (filter #(str/starts-with? % "-") args)
         operand (first (remove #(str/starts-with? % "-") args))
@@ -454,10 +537,19 @@
         (ok header)))))
 
 (defn- git-branch [conn args]
-  (if (some #{"--show-current"} args)
+  (cond
+    (some #{"--show-current"} args)
     (ok (str (str/replace (repo/current-ref conn) #"^refs/heads/" "") "\n"))
+
+    (some #{"-d" "-D" "--delete"} args)
+    (let [name (first (remove #(str/starts-with? % "-") args))
+          force? (boolean (some #{"-D"} args))]
+      (repo/delete-branch! conn name {:force? force?})
+      (ok (str "Deleted branch " name ".\n")))
+
+    :else
     (if-let [name (first (remove #(str/starts-with? % "-") args))]
-    (do (repo/branch! conn name) (ok))
+      (do (repo/branch! conn name) (ok))
     (let [current (repo/current-ref conn)]
       (ok (apply str
                  (map (fn [[ref _]]
@@ -465,15 +557,31 @@
                              (str/replace ref #"^refs/heads/" "") "\n"))
                       (repo/refs conn))))))))
 
-(defn- git-checkout [conn args]
-  (let [force? (boolean (some #{"-f" "--force"} args))
-        create? (boolean (some #{"-b" "-B" "-c" "-C"} args))
-        name (last args)]
-    (when (or (nil? name) (str/starts-with? name "-"))
-      (throw (ex-info "you must specify a branch" {})))
-    (when create? (repo/branch! conn name))
-    (repo/checkout! conn name {:force? force?})
-    (ok (str "Switched to branch '" name "'\n"))))
+(defn- git-checkout [conn root cwd args]
+  (let [separator (.indexOf args "--")]
+    (if (not (neg? separator))
+      (let [revision-name (when (pos? separator)
+                            (first (remove #(str/starts-with? % "-")
+                                           (subvec args 0 separator))))
+            source (when revision-name
+                     (or (resolve-commit conn revision-name)
+                         (throw (ex-info (str "invalid reference: " revision-name) {}))))
+            paths (expand-repository-paths
+                   conn root cwd (subvec args (inc separator))
+                   (keys (when source (repo/tree-at conn source))))]
+        (repo/restore-paths! conn paths
+                             {:source source
+                              :staged? (boolean source)
+                              :worktree? true})
+        (ok))
+      (let [force? (boolean (some #{"-f" "--force"} args))
+            create? (boolean (some #{"-b" "-B" "-c" "-C"} args))
+            name (last args)]
+        (when (or (nil? name) (str/starts-with? name "-"))
+          (throw (ex-info "you must specify a branch" {})))
+        (when create? (repo/branch! conn name))
+        (repo/checkout! conn name {:force? force?})
+        (ok (str "Switched to branch '" name "'\n"))))))
 
 (defn- git-rev-parse [conn root args]
   (cond
@@ -526,8 +634,11 @@
                "show" (git-show conn args)
                "ls-files" (git-ls-files conn args)
                "branch" (git-branch conn args)
-               "checkout" (git-checkout conn args)
-               "switch" (git-checkout conn args)
+               "checkout" (git-checkout conn root cwd args)
+               "switch" (git-checkout conn root cwd args)
+               "restore" (git-restore conn root cwd args)
+               "reset" (git-reset conn root cwd args)
+               "rm" (git-rm conn root cwd args)
                "rev-parse" (git-rev-parse conn root args)
                (fail (str "'" command "' is not yet implemented by Geschichte"))))
 
