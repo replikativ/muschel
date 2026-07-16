@@ -83,3 +83,20 @@
       (is (= "s" (fs/read-file m "/drive/../secret.txt"))))
     (testing "escape past root refused"
       (is (nil? (fs/resolve m "/../../etc/passwd"))))))
+
+(deftest dynamic-mount-lifecycle
+  (let [base  (vfs-with {"/project" {:type :dir :mtime-ms 1}
+                         "/project/base.txt" {:type :file :content "base"}})
+        child (vfs-with {"/owned.txt" {:type :file :content "owned"}})
+        m     (mount/make base {})]
+    (is (= [] (mount/mount-points m)))
+    (mount/mount! m "/project" child)
+    (is (= ["/project"] (mount/mount-points m)))
+    (is (= child (mount/mounted-at m "/project")))
+    (is (= ["/project" child] (mount/owning-mount m "/project/owned.txt")))
+    (is (= "owned" (fs/read-file m "/project/owned.txt")))
+    (is (nil? (fs/read-file m "/project/base.txt")) "mount shadows base")
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (mount/mount! m "/project/nested" (vfs-with {}))))
+    (is (= child (mount/unmount! m "/project")))
+    (is (= "base" (fs/read-file m "/project/base.txt")))))

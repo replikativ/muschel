@@ -18,6 +18,7 @@
             [muschel.env :as env]
             [muschel.exec :as exec]
             [muschel.fs :as fs]
+            [muschel.fs.mount :as fs.mount]
             [muschel.fs.virtual :as fs.virtual]
             [muschel.parse :as parse]
             [muschel.permit :as permit]
@@ -130,6 +131,11 @@
   "Construct a VirtualFS from `{path → content}`. Options: `:cwd`
    (default \"/\"). Pure in-memory; structurally contained."
   fs.virtual/make)
+
+(def mount-fs
+  "Compose a base filesystem with dynamically managed Geschichte or generic
+   child mounts. `git init` requires this router so takeover is atomic."
+  fs.mount/make)
 
 ;; bb has no PosixFileAttributeView etc., so muschel.fs.disk doesn't
 ;; load there — only define `disk-fs` on real JVM.
