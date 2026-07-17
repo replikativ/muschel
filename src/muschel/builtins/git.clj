@@ -69,10 +69,14 @@
          (when-not (instance? muschel.fs.mount.MountFS filesystem)
            (throw (ex-info "Git integration requires a dynamic mount filesystem"
                            {})))
-         (let [args (vec (remove #{"--no-pager" "--paginate"} (rest argv)))
+         (let [{:keys [args directories]} (command/parse-global (rest argv))
+               cwd (reduce (fn [cwd directory]
+                             (or (resolve-path cwd directory)
+                                 (throw (ex-info "invalid -C path"
+                                                 {:path directory}))))
+                           (:cwd env) directories)
                command-name (first args)
                command-args (subvec args (min 1 (count args)))
-               cwd (:cwd env)
                context (repository-context filesystem cwd)]
            (cond
              (= command-name "init")

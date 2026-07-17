@@ -6,6 +6,7 @@ target/
 out/
 *.log
 .nrepl-port
+.internal/
 
 # shadow-cljs / npm
 .shadow-cljs/

@@ -40,6 +40,8 @@
       (is (= "A  .gitignore\nA  README.md\n"
              (:stdout (run host "git status --short"))))
       (is (= 0 (:exit (run host "git commit -m initial"))))
+      (is (= "main\n"
+             (:stdout (run host "git -C /project branch --show-current"))))
       (is (str/includes? (:stdout (run host "git log --oneline")) "initial"))
       (is (str/includes? (:stdout (run host "git status"))
                          "working tree clean"))
