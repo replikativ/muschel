@@ -95,16 +95,20 @@
 (deftest agent-git-clone-creates-an-atomic-geschichte-mount
   (let [calls (atom [])
         clone! (fn [{:keys [conn] :as request}]
-                 (swap! calls conj (dissoc request :conn))
+                 (swap! calls conj [:clone (dissoc request :conn)])
                  (repo/write! conn "README.md" (.getBytes "from remote\n" "UTF-8"))
                  (repo/stage-all! conn)
                  (repo/commit! conn {:message "remote head" :author "Remote"}))
+        fetch! (fn [request]
+                 (swap! calls conj [:fetch (dissoc request :conn)])
+                 {:persisted 0})
         base (vfs/make {"/project" {:type :dir}})
         filesystem (mount/make base {} {:cwd "/project"})
         host (builtin/make {:fs filesystem
                             :fallback-host (th/fallback-host)
                             :builtins posix/standard
-                            :geschichte {:clone-repository! clone!}})
+                            :geschichte {:remote-ops {:clone clone!
+                                                      :fetch fetch!}}})
         result (run host "git clone -b main https://example.test/demo.git")]
     (is (= 0 (:exit result)) (:stderr result))
     (is (= "Cloning into 'demo'...\n" (:stderr result)))
@@ -116,8 +120,10 @@
          "remote head"))
     (is (= "https://example.test/demo.git\n"
            (:stdout (run host "git -C /project/demo remote get-url origin"))))
-    (is (= [{:remote "origin" :url "https://example.test/demo.git"
-             :options {:branch "main"}}]
+    (is (= 0 (:exit (run host "git -C /project/demo fetch origin"))))
+    (is (= [[:clone {:remote "origin" :url "https://example.test/demo.git"
+                     :options {:branch "main"}}]
+            [:fetch {:remote "origin" :url "https://example.test/demo.git"}]]
            @calls))
     (let [failed-fs (mount/make (vfs/make {"/project" {:type :dir}}) {}
                                 {:cwd "/project"})

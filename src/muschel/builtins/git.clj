@@ -97,9 +97,10 @@
    `clone-repository!` is an injected transport capability and is absent by
    default, preserving the sandbox's network policy."
   ([] (make {}))
-  ([{:keys [create-repository! clone-repository! global-config]
+  ([{:keys [create-repository! clone-repository! remote-ops global-config]
      :or {create-repository! gfs/memory-repository!}}]
-   (let [global-config (or global-config (atom {}))]
+   (let [global-config (or global-config (atom {}))
+         clone-repository! (or clone-repository! (:clone remote-ops))]
      (fn [argv filesystem env]
        (try
          (when-not (instance? muschel.fs.mount.MountFS filesystem)
@@ -132,6 +133,7 @@
                 {:root root
                  :conn conn
                  :config (:config-atom fs)
+                 :remote-ops remote-ops
                  :repo-relative #(repo-relative root cwd %)}
                 args))
 
