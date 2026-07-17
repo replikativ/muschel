@@ -63,40 +63,6 @@
                       :branch (repo/current-ref (:conn child))}))))
          vec)))
 
-(defn- prepare-worktree! [conn {:keys [target new-branch reset-branch?
-                                       detach?]}]
-  (when detach?
-    (throw (ex-info
-            "detached Geschichte workspaces are not implemented; use a named branch"
-            {:requires :detached-head})))
-  (let [target-commit (revision/require conn (or target "HEAD"))]
-    (if new-branch
-      (let [ref (str "refs/heads/" new-branch)
-            existing (get (repo/refs conn) ref)]
-        (cond
-          (and existing (not reset-branch?))
-          (throw (ex-info (str "a branch named '" new-branch
-                               "' already exists") {:branch new-branch}))
-
-          (= ref (repo/current-ref conn))
-          (repo/reset! conn target-commit {:mode :hard})
-
-          existing
-          (do (repo/set-ref! conn ref target-commit)
-              (repo/checkout! conn ref {:force? true}))
-
-          :else
-          (do (repo/create-ref! conn ref target-commit)
-              (repo/checkout! conn ref {:force? true}))))
-      (when target
-        (let [ref (if (str/starts-with? target "refs/")
-                    target (str "refs/heads/" target))]
-          (when-not (contains? (repo/refs conn) ref)
-            (throw (ex-info
-                    "a commit may only be checked out in a named Geschichte workspace branch"
-                    {:target target :requires :detached-head})))
-          (repo/checkout! conn ref {:force? true}))))))
-
 (defn- workspace-operations [filesystem cwd {:keys [fs conn]}]
   {:list #(worktree-records filesystem fs)
    :add (fn [{:keys [path] :as options}]
@@ -110,9 +76,12 @@
                               {:path path})))
             (ensure-directory! filesystem path)
             (try
-              (gfs/fork-and-mount-workspace!
-               filesystem path fs
-               {:prepare! #(prepare-worktree! % options)})
+              (let [target-commit (revision/require conn
+                                                    (or (:target options) "HEAD"))]
+                (gfs/fork-and-mount-workspace!
+                 filesystem path fs
+                 {:prepare! #(workspace/prepare-checkout!
+                              % target-commit options)}))
               (catch Throwable error
                 (when-not existed? (fs/delete filesystem path))
                 (throw error)))))
