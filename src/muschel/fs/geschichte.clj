@@ -158,6 +158,26 @@
   (when-let [close! (get-in geschichte-fs [:repository :close!])]
     (close!)))
 
+(defn canonical-connection
+  "Return the hidden publication connection for a mounted workspace."
+  [geschichte-fs]
+  (or (get-in geschichte-fs [:repository :canonical-conn])
+      (:conn geschichte-fs)))
+
+(defn publish!
+  "Publish the mounted workspace's current logical ref to its canonical state."
+  ([geschichte-fs] (publish! geschichte-fs {}))
+  ([geschichte-fs opts]
+   (workspace/publish! (canonical-connection geschichte-fs)
+                       (:conn geschichte-fs) opts)))
+
+(defn advance!
+  "Advance a clean mounted workspace from its hidden canonical state."
+  ([geschichte-fs] (advance! geschichte-fs {}))
+  ([geschichte-fs opts]
+   (workspace/advance! (canonical-connection geschichte-fs)
+                       (:conn geschichte-fs) opts)))
+
 (defn memory-repository!
   "Default ephemeral repository factory used by an in-memory agent sandbox."
   [{:keys [name] :or {name "repository"}}]
@@ -188,32 +208,77 @@
        (mount/mount! mount-fs root adapter {:allow-nested? allow-nested?})
        (assoc repository :root root :fs adapter)))))
 
+(defn- workspace-repository!
+  [source-conn canonical-repository {:keys [branch owner? prepare!]}]
+  (let [canonical-conn (:conn canonical-repository)
+        config (or (:config canonical-repository)
+                   (get-in @canonical-conn [:config]))
+        branch (or branch (workspace/branch-key (UUID/randomUUID)))
+        closed? (atom false)]
+    (workspace/fork! source-conn branch)
+    (let [conn (d/connect (assoc config :branch branch))
+          release-workspace!
+          (fn []
+            (when (compare-and-set! closed? false true)
+              (d/release conn)
+              (workspace/remove! canonical-conn branch)
+              true))
+          close!
+          (fn []
+            (when (release-workspace!)
+              (when owner?
+                (when-let [close! (:close! canonical-repository)]
+                  (close!)))))]
+      (try
+        (when prepare! (prepare! conn))
+        {:conn conn
+         :config config
+         :workspace-branch branch
+         :repository-id (get-in @conn [:config :store :id])
+         :canonical-conn canonical-conn
+         :canonical-repository canonical-repository
+         :workspace-owner? (boolean owner?)
+         :release-workspace! release-workspace!
+         :close! close!}
+        (catch Throwable error
+          (d/release conn)
+          (workspace/remove! canonical-conn branch)
+          (throw error))))))
+
+(defn mount-canonical-workspace!
+  "Fork and mount the initial visible workspace over a hidden canonical
+  repository. The mounted workspace owns canonical cleanup when closed."
+  [mount-fs root canonical-repository opts]
+  (let [repository (workspace-repository!
+                    (:conn canonical-repository) canonical-repository
+                    (assoc opts :owner? true))]
+    (try
+      ;; The fork has captured any imported/clone materialization. Canonical is
+      ;; publication authority, not a user-visible index or worktree.
+      (repo/materialize-bytes! (:conn canonical-repository) {} {:force? true})
+      (mount-repository! mount-fs root repository)
+      (catch Throwable error
+        ((:release-workspace! repository))
+        (throw error)))))
+
 (defn fork-and-mount-workspace!
   "Fork an existing Geschichte mount into an independent Datahike workspace,
   optionally prepare its logical HEAD, and mount it at `root`. The returned
   mount owns only the new branch connection; the source repository continues
   to own the shared store lifecycle."
   [mount-fs root source-fs {:keys [branch prepare!] :as _opts}]
-  (let [{source-conn :conn source-config :config :as source-repository}
-        (:repository source-fs)
-        source-conn (or source-conn (:conn source-fs))
-        source-config (or source-config (get-in @source-conn [:config]))
-        branch (or branch (workspace/branch-key (UUID/randomUUID)))]
-    (workspace/fork! source-conn branch)
-    (let [conn (d/connect (assoc source-config :branch branch))
-          repository {:conn conn
-                      :config source-config
-                      :workspace-branch branch
-                      :repository-id (get-in @conn [:config :store :id])
-                      :source-repository source-repository
-                      :close! #(d/release conn)}]
-      (try
-        (when prepare! (prepare! conn))
-        (mount-repository! mount-fs root repository {:allow-nested? true})
-        (catch Throwable error
-          (d/release conn)
-          (workspace/remove! source-conn branch)
-          (throw error))))))
+  (let [source-repository (:repository source-fs)
+        source-conn (or (:conn source-repository) (:conn source-fs))
+        canonical-repository (or (:canonical-repository source-repository)
+                                 source-repository)
+        repository (workspace-repository!
+                    source-conn canonical-repository
+                    {:branch branch :prepare! prepare!})]
+    (try
+      (mount-repository! mount-fs root repository {:allow-nested? true})
+      (catch Throwable error
+        ((:close! repository))
+        (throw error)))))
 
 (defn- import-entry! [source root conn relative entry]
   (let [source-path (if (str/blank? relative) root (str root "/" relative))]
@@ -266,8 +331,10 @@
                                           (last (remove str/blank?
                                                         (str/split root #"/"))))})]
        (try
-         (import-entry! mount-fs root conn "" (fs/stat mount-fs root))
-         (mount-repository! mount-fs root repository)
+         (mount-canonical-workspace!
+          mount-fs root repository
+          {:prepare! #(import-entry! mount-fs root % ""
+                                     (fs/stat mount-fs root))})
          (catch Throwable error
            (when close! (close!))
            (throw error)))))))

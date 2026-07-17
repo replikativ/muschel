@@ -132,7 +132,6 @@
                                    {:path path :status status}))))
                (mount/unmount! filesystem path)
                (gfs/close! child)
-               (workspace/remove! conn branch)
                (fs/delete filesystem path)
                path))
    :prune (fn [_] nil)})
@@ -176,7 +175,7 @@
                             :options (cond-> {}
                                        branch (assoc :branch branch)
                                        depth (assoc :depth (parse-long depth)))})
-        (gfs/mount-repository! filesystem root repository)
+        (gfs/mount-canonical-workspace! filesystem root repository {})
         {:stdout ""
          :stderr (if quiet? "" (str "Cloning into '" path "'...\n"))
          :exit 0}

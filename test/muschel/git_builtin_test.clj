@@ -5,6 +5,7 @@
             [muschel.builtins.posix :as posix]
             [muschel.core :as m]
             [muschel.fs :as fs]
+            [muschel.fs.geschichte :as gfs]
             [muschel.fs.mount :as mount]
             [muschel.fs.virtual :as vfs]
             [muschel.host.builtin :as builtin]
@@ -113,6 +114,11 @@
     (is (= 0 (:exit result)) (:stderr result))
     (is (= "Cloning into 'demo'...\n" (:stderr result)))
     (is (= ["/project/demo"] (mount/mount-points filesystem)))
+    (let [mounted (mount/mounted-at filesystem "/project/demo")
+          canonical (get-in mounted [:repository :canonical-conn])]
+      (is (not (identical? canonical (:conn mounted))))
+      (is (empty? (repo/files canonical)))
+      (is (some? (repo/head-commit canonical))))
     (is (= "from remote\n"
            (:stdout (run host "cat /project/demo/README.md"))))
     (is (str/includes?
@@ -153,6 +159,7 @@
     (is (zero? (:exit (run host "git init"))))
     (is (zero? (:exit (run host "git add ."))))
     (is (zero? (:exit (run host "git commit -m base"))))
+    (gfs/publish! (mount/mounted-at filesystem "/project"))
 
     (testing "the same logical branch can be mounted more than once"
       (is (= 0 (:exit (run host "git worktree add /agent-two main"))))
@@ -173,6 +180,17 @@
       (is (= 0 (:exit (run host "git worktree remove --force /agent-two"))))
       (is (= ["/project"] (mount/mount-points filesystem)))
       (is (not (fs/exists? filesystem "/agent-two"))))
+
+    (testing "publication and advance coordinate isolated mounts"
+      (is (= 0 (:exit (run host "git worktree add /publisher main"))))
+      (is (= 0 (:exit (run host "echo published > /publisher/README.md"))))
+      (is (= 0 (:exit (run host "git -C /publisher add README.md"))))
+      (is (= 0 (:exit (run host "git -C /publisher commit -m published"))))
+      (gfs/publish! (mount/mounted-at filesystem "/publisher"))
+      (is (= "base\n" (:stdout (run host "cat /project/README.md"))))
+      (gfs/advance! (mount/mounted-at filesystem "/project"))
+      (is (= "published\n" (:stdout (run host "cat /project/README.md"))))
+      (is (= 0 (:exit (run host "git worktree remove /publisher")))))
 
     (testing "new logical branches stay local to their physical workspace"
       (is (= 0 (:exit (run host
