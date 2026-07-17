@@ -169,6 +169,21 @@
        :config config
        :close! #(do (d/release conn) (d/delete-database config))})))
 
+(defn mount-repository!
+  "Publish an already-populated Geschichte repository at an empty Muschel
+  directory. Clone uses this after transport succeeds, keeping partial imports
+  invisible to the sandbox."
+  [mount-fs root {:keys [conn] :as repository}]
+  (let [root (fs/resolve mount-fs root)]
+    (when-not (= :dir (:type (fs/stat mount-fs root)))
+      (throw (ex-info "Geschichte mount target is not a directory" {:root root})))
+    (when-let [[owner _] (mount/owning-mount mount-fs root)]
+      (throw (ex-info "Path is already inside a Geschichte repository"
+                      {:root root :repository-root owner})))
+    (let [adapter (make conn {:repository repository})]
+      (mount/mount! mount-fs root adapter)
+      (assoc repository :root root :fs adapter))))
+
 (defn- import-entry! [source root conn relative entry]
   (let [source-path (if (str/blank? relative) root (str root "/" relative))]
     (case (:type entry)
@@ -221,9 +236,7 @@
                                                         (str/split root #"/"))))})]
        (try
          (import-entry! mount-fs root conn "" (fs/stat mount-fs root))
-         (let [adapter (make conn {:repository repository})]
-           (mount/mount! mount-fs root adapter)
-           (assoc repository :root root :fs adapter))
+         (mount-repository! mount-fs root repository)
          (catch Throwable error
            (when close! (close!))
            (throw error)))))))

@@ -1,8 +1,10 @@
 (ns muschel.git-builtin-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [geschichte.repo :as repo]
             [muschel.builtins.posix :as posix]
             [muschel.core :as m]
+            [muschel.fs :as fs]
             [muschel.fs.mount :as mount]
             [muschel.fs.virtual :as vfs]
             [muschel.host.builtin :as builtin]
@@ -89,3 +91,46 @@
     (testing "writes made after init are Geschichte worktree mutations"
       (is (= 0 (:exit (run host "echo more > more.txt"))))
       (is (= "?? more.txt\n" (:stdout (run host "git status --short")))))))
+
+(deftest agent-git-clone-creates-an-atomic-geschichte-mount
+  (let [calls (atom [])
+        clone! (fn [{:keys [conn] :as request}]
+                 (swap! calls conj (dissoc request :conn))
+                 (repo/write! conn "README.md" (.getBytes "from remote\n" "UTF-8"))
+                 (repo/stage-all! conn)
+                 (repo/commit! conn {:message "remote head" :author "Remote"}))
+        base (vfs/make {"/project" {:type :dir}})
+        filesystem (mount/make base {} {:cwd "/project"})
+        host (builtin/make {:fs filesystem
+                            :fallback-host (th/fallback-host)
+                            :builtins posix/standard
+                            :geschichte {:clone-repository! clone!}})
+        result (run host "git clone -b main https://example.test/demo.git")]
+    (is (= 0 (:exit result)) (:stderr result))
+    (is (= "Cloning into 'demo'...\n" (:stderr result)))
+    (is (= ["/project/demo"] (mount/mount-points filesystem)))
+    (is (= "from remote\n"
+           (:stdout (run host "cat /project/demo/README.md"))))
+    (is (str/includes?
+         (:stdout (run host "git -C /project/demo log --oneline"))
+         "remote head"))
+    (is (= "https://example.test/demo.git\n"
+           (:stdout (run host "git -C /project/demo remote get-url origin"))))
+    (is (= [{:remote "origin" :url "https://example.test/demo.git"
+             :options {:branch "main"}}]
+           @calls))
+    (let [failed-fs (mount/make (vfs/make {"/project" {:type :dir}}) {}
+                                {:cwd "/project"})
+          failed-host
+          (builtin/make
+           {:fs failed-fs
+            :fallback-host (th/fallback-host)
+            :builtins posix/standard
+            :geschichte {:clone-repository!
+                         (fn [_] (throw (ex-info "remote failed" {})))}})
+          failed (run failed-host
+                      "git clone https://example.test/broken.git")]
+      (is (= 128 (:exit failed)))
+      (is (str/includes? (:stderr failed) "remote failed"))
+      (is (= [] (mount/mount-points failed-fs)))
+      (is (not (fs/exists? failed-fs "/project/broken"))))))
