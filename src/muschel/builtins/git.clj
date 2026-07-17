@@ -2,7 +2,9 @@
   "Muschel mount adapter for Geschichte's shared Git command engine."
   (:require [clojure.string :as str]
             [geschichte.git.command :as command]
+            [geschichte.git.revision :as revision]
             [geschichte.repo :as repo]
+            [geschichte.workspace :as workspace]
             [muschel.builtins.posix :as posix]
             [muschel.fs :as fs]
             [muschel.fs.geschichte :as gfs]
@@ -44,6 +46,96 @@
     (when (or (= absolute root)
               (str/starts-with? absolute (str root "/")))
       (str/replace (subs absolute (count root)) #"^/+" ""))))
+
+(defn- repository-id [geschichte-fs]
+  (get-in @(:conn geschichte-fs) [:config :store :id]))
+
+(defn- worktree-records [filesystem source-fs]
+  (let [id (repository-id source-fs)]
+    (->> (mount/mount-points filesystem)
+         (keep (fn [path]
+                 (let [child (mount/mounted-at filesystem path)]
+                   (when (and (instance? muschel.fs.geschichte.GeschichteFS child)
+                              (= id (repository-id child)))
+                     {:path path
+                      :head (some-> (repo/head-commit (:conn child))
+                                    :geschichte.commit/id str)
+                      :branch (repo/current-ref (:conn child))}))))
+         vec)))
+
+(defn- prepare-worktree! [conn {:keys [target new-branch reset-branch?
+                                       detach?]}]
+  (when detach?
+    (throw (ex-info
+            "detached Geschichte workspaces are not implemented; use a named branch"
+            {:requires :detached-head})))
+  (let [target-commit (revision/require conn (or target "HEAD"))]
+    (if new-branch
+      (let [ref (str "refs/heads/" new-branch)
+            existing (get (repo/refs conn) ref)]
+        (cond
+          (and existing (not reset-branch?))
+          (throw (ex-info (str "a branch named '" new-branch
+                               "' already exists") {:branch new-branch}))
+
+          (= ref (repo/current-ref conn))
+          (repo/reset! conn target-commit {:mode :hard})
+
+          existing
+          (do (repo/set-ref! conn ref target-commit)
+              (repo/checkout! conn ref {:force? true}))
+
+          :else
+          (do (repo/create-ref! conn ref target-commit)
+              (repo/checkout! conn ref {:force? true}))))
+      (when target
+        (let [ref (if (str/starts-with? target "refs/")
+                    target (str "refs/heads/" target))]
+          (when-not (contains? (repo/refs conn) ref)
+            (throw (ex-info
+                    "a commit may only be checked out in a named Geschichte workspace branch"
+                    {:target target :requires :detached-head})))
+          (repo/checkout! conn ref {:force? true}))))))
+
+(defn- workspace-operations [filesystem cwd {:keys [fs conn]}]
+  {:list #(worktree-records filesystem fs)
+   :add (fn [{:keys [path] :as options}]
+          (let [path (or (resolve-path cwd path)
+                         (throw (ex-info "invalid worktree path" {:path path})))
+                existed? (fs/exists? filesystem path)]
+            (when (and existed?
+                       (or (not= :dir (:type (fs/stat filesystem path)))
+                           (seq (fs/list-dir filesystem path))))
+              (throw (ex-info "worktree path already exists and is not empty"
+                              {:path path})))
+            (ensure-directory! filesystem path)
+            (try
+              (gfs/fork-and-mount-workspace!
+               filesystem path fs
+               {:prepare! #(prepare-worktree! % options)})
+              (catch Throwable error
+                (when-not existed? (fs/delete filesystem path))
+                (throw error)))))
+   :remove (fn [{:keys [path force?]}]
+             (let [path (or (resolve-path cwd path)
+                            (throw (ex-info "invalid worktree path" {:path path})))
+                   child (mount/mounted-at filesystem path)
+                   branch (get-in child [:repository :workspace-branch])]
+               (when-not (and (instance? muschel.fs.geschichte.GeschichteFS child)
+                              (= (repository-id fs) (repository-id child))
+                              branch)
+                 (throw (ex-info "not a removable Geschichte worktree"
+                                 {:path path})))
+               (let [status (repo/status (:conn child))]
+                 (when (and (not force?) (not (:clean? status)))
+                   (throw (ex-info "worktree contains modified or untracked files"
+                                   {:path path :status status}))))
+               (mount/unmount! filesystem path)
+               (gfs/close! child)
+               (workspace/remove! conn branch)
+               (fs/delete filesystem path)
+               path))
+   :prune (fn [_] nil)})
 
 (defn- git-init [filesystem cwd create-repository! args]
   (let [{:keys [path quiet? branch]} (command/parse-init args)
@@ -142,6 +234,7 @@
                  :conn conn
                  :config (atom (merge @(:config-atom fs) config))
                  :remote-ops remote-ops
+                 :workspace-ops (workspace-operations filesystem cwd context)
                  :read-message
                  (fn [path]
                    (if (= path "-")

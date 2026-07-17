@@ -11,6 +11,7 @@
             [geschichte.bytes :as bytes]
             [geschichte.fs :as gfs]
             [geschichte.repo :as repo]
+            [geschichte.workspace :as workspace]
             [muschel.fs :as fs]
             [muschel.fs.mount :as mount])
   (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
@@ -173,16 +174,46 @@
   "Publish an already-populated Geschichte repository at an empty Muschel
   directory. Clone uses this after transport succeeds, keeping partial imports
   invisible to the sandbox."
-  [mount-fs root {:keys [conn] :as repository}]
-  (let [root (fs/resolve mount-fs root)]
-    (when-not (= :dir (:type (fs/stat mount-fs root)))
-      (throw (ex-info "Geschichte mount target is not a directory" {:root root})))
-    (when-let [[owner _] (mount/owning-mount mount-fs root)]
-      (throw (ex-info "Path is already inside a Geschichte repository"
-                      {:root root :repository-root owner})))
-    (let [adapter (make conn {:repository repository})]
-      (mount/mount! mount-fs root adapter)
-      (assoc repository :root root :fs adapter))))
+  ([mount-fs root repository]
+   (mount-repository! mount-fs root repository {}))
+  ([mount-fs root {:keys [conn] :as repository} {:keys [allow-nested?]}]
+   (let [root (fs/resolve mount-fs root)]
+     (when-not (= :dir (:type (fs/stat mount-fs root)))
+       (throw (ex-info "Geschichte mount target is not a directory" {:root root})))
+     (when-let [[owner _] (mount/owning-mount mount-fs root)]
+       (when-not allow-nested?
+         (throw (ex-info "Path is already inside a Geschichte repository"
+                         {:root root :repository-root owner}))))
+     (let [adapter (make conn {:repository repository})]
+       (mount/mount! mount-fs root adapter {:allow-nested? allow-nested?})
+       (assoc repository :root root :fs adapter)))))
+
+(defn fork-and-mount-workspace!
+  "Fork an existing Geschichte mount into an independent Datahike workspace,
+  optionally prepare its logical HEAD, and mount it at `root`. The returned
+  mount owns only the new branch connection; the source repository continues
+  to own the shared store lifecycle."
+  [mount-fs root source-fs {:keys [branch prepare!] :as _opts}]
+  (let [{source-conn :conn source-config :config :as source-repository}
+        (:repository source-fs)
+        source-conn (or source-conn (:conn source-fs))
+        source-config (or source-config (get-in @source-conn [:config]))
+        branch (or branch (workspace/branch-key (UUID/randomUUID)))]
+    (workspace/fork! source-conn branch)
+    (let [conn (d/connect (assoc source-config :branch branch))
+          repository {:conn conn
+                      :config source-config
+                      :workspace-branch branch
+                      :repository-id (get-in @conn [:config :store :id])
+                      :source-repository source-repository
+                      :close! #(d/release conn)}]
+      (try
+        (when prepare! (prepare! conn))
+        (mount-repository! mount-fs root repository {:allow-nested? true})
+        (catch Throwable error
+          (d/release conn)
+          (workspace/remove! source-conn branch)
+          (throw error))))))
 
 (defn- import-entry! [source root conn relative entry]
   (let [source-path (if (str/blank? relative) root (str root "/" relative))]

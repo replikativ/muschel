@@ -123,8 +123,8 @@
     (is (= 0 (:exit (run host "git -C /project/demo fetch origin"))))
     (is (= [[:clone {:remote "origin" :url "https://example.test/demo.git"
                      :options {:branch "main"}}]
-           [:fetch {:remote "origin" :url "https://example.test/demo.git"
-                    :options {:refspec nil :prune? false :tags nil}}]]
+            [:fetch {:remote "origin" :url "https://example.test/demo.git"
+                     :options {:refspec nil :prune? false :tags nil}}]]
            @calls))
     (let [failed-fs (mount/make (vfs/make {"/project" {:type :dir}}) {}
                                 {:cwd "/project"})
@@ -141,3 +141,44 @@
       (is (str/includes? (:stderr failed) "remote failed"))
       (is (= [] (mount/mount-points failed-fs)))
       (is (not (fs/exists? failed-fs "/project/broken"))))))
+
+(deftest git-worktrees-are-isolated-geschichte-workspaces
+  (let [base (vfs/make {"/project" {:type :dir}
+                        "/project/README.md" "base\n"})
+        filesystem (mount/make base {} {:cwd "/project"})
+        host (builtin/make {:fs filesystem
+                            :fallback-host (th/fallback-host)
+                            :builtins posix/standard
+                            :geschichte true})]
+    (is (zero? (:exit (run host "git init"))))
+    (is (zero? (:exit (run host "git add ."))))
+    (is (zero? (:exit (run host "git commit -m base"))))
+
+    (testing "the same logical branch can be mounted more than once"
+      (is (= 0 (:exit (run host "git worktree add /agent-two main"))))
+      (is (= ["/agent-two" "/project"] (mount/mount-points filesystem)))
+      (is (= "main\n"
+             (:stdout (run host "git -C /agent-two branch --show-current"))))
+      (is (= 0 (:exit (run host "echo isolated > /agent-two/README.md"))))
+      (is (= "base\n" (:stdout (run host "cat /project/README.md"))))
+      (is (= "isolated\n" (:stdout (run host "cat /agent-two/README.md"))))
+      (let [listing (:stdout (run host "git worktree list --porcelain"))]
+        (is (str/includes? listing "worktree /project"))
+        (is (str/includes? listing "worktree /agent-two"))))
+
+    (testing "remove protects dirty workspaces and force discards them"
+      (let [refused (run host "git worktree remove /agent-two")]
+        (is (= 128 (:exit refused)))
+        (is (str/includes? (:stderr refused) "modified or untracked")))
+      (is (= 0 (:exit (run host "git worktree remove --force /agent-two"))))
+      (is (= ["/project"] (mount/mount-points filesystem)))
+      (is (not (fs/exists? filesystem "/agent-two"))))
+
+    (testing "new logical branches stay local to their physical workspace"
+      (is (= 0 (:exit (run host
+                           "git worktree add -b feature /feature main"))))
+      (is (= "feature\n"
+             (:stdout (run host "git -C /feature branch --show-current"))))
+      (is (= "main\n"
+             (:stdout (run host "git -C /project branch --show-current"))))
+      (is (= 0 (:exit (run host "git worktree remove --force /feature")))))))
