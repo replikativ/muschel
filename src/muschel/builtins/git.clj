@@ -3,6 +3,7 @@
   (:require [clojure.string :as str]
             [geschichte.git.command :as command]
             [geschichte.repo :as repo]
+            [muschel.builtins.posix :as posix]
             [muschel.fs :as fs]
             [muschel.fs.geschichte :as gfs]
             [muschel.fs.mount :as mount]))
@@ -65,7 +66,7 @@
   (when-not clone-repository!
     (throw (ex-info "clone is unavailable; a permitted transport adapter is required"
                     {})))
-  (let [{:keys [url path origin branch quiet?]} (command/parse-clone args)
+  (let [{:keys [url path origin branch depth quiet?]} (command/parse-clone args)
         root (resolve-path cwd path)
         existed? (fs/exists? filesystem root)]
     (when (and existed?
@@ -81,7 +82,8 @@
         (repo/set-config! conn (str "remote." origin ".url") url)
         (clone-repository! {:conn conn :remote origin :url url
                             :options (cond-> {}
-                                       branch (assoc :branch branch))})
+                                       branch (assoc :branch branch)
+                                       depth (assoc :depth (parse-long depth)))})
         (gfs/mount-repository! filesystem root repository)
         {:stdout ""
          :stderr (if quiet? "" (str "Cloning into '" path "'...\n"))
@@ -106,7 +108,8 @@
          (when-not (instance? muschel.fs.mount.MountFS filesystem)
            (throw (ex-info "Git integration requires a dynamic mount filesystem"
                            {})))
-         (let [{:keys [args directories]} (command/parse-global (rest argv))
+         (let [{:keys [args directories config]}
+               (command/parse-global (rest argv))
                cwd (reduce (fn [cwd directory]
                              (or (resolve-path cwd directory)
                                  (throw (ex-info "invalid -C path"
@@ -127,13 +130,28 @@
                   (some #{"--global"} command-args))
              (command/execute {:config global-config} args)
 
+             (= command-name "ls-remote")
+             (command/execute {:config (atom (merge @global-config config))
+                               :remote-ops remote-ops}
+                              args)
+
              context
              (let [{:keys [root conn fs]} context]
                (command/execute
                 {:root root
                  :conn conn
-                 :config (:config-atom fs)
+                 :config (atom (merge @(:config-atom fs) config))
                  :remote-ops remote-ops
+                 :read-message
+                 (fn [path]
+                   (if (= path "-")
+                     (posix/read-stdin env)
+                     (let [absolute (or (resolve-path cwd path)
+                                        (throw (ex-info "invalid message path"
+                                                        {:path path})))]
+                       (or (fs/read-file filesystem absolute)
+                           (throw (ex-info "could not read commit message"
+                                           {:path path}))))))
                  :repo-relative #(repo-relative root cwd %)}
                 args))
 

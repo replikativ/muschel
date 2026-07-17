@@ -123,7 +123,8 @@
     (is (= 0 (:exit (run host "git -C /project/demo fetch origin"))))
     (is (= [[:clone {:remote "origin" :url "https://example.test/demo.git"
                      :options {:branch "main"}}]
-            [:fetch {:remote "origin" :url "https://example.test/demo.git"}]]
+           [:fetch {:remote "origin" :url "https://example.test/demo.git"
+                    :options {:refspec nil :prune? false :tags nil}}]]
            @calls))
     (let [failed-fs (mount/make (vfs/make {"/project" {:type :dir}}) {}
                                 {:cwd "/project"})
