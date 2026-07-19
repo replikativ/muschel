@@ -5,7 +5,24 @@
             [muschel.fs :as fs]
             [muschel.fs.geschichte :as geschichte]
             [muschel.fs.mount :as mount]
-            [muschel.fs.virtual :as vfs]))
+            [muschel.fs.virtual :as vfs]
+            [muschel.host :as host]
+            [muschel.host.builtin :as builtin-host]
+            [muschel.host.jvm :as jvm]))
+
+(deftest virtual-workspace-refuses-an-unprojected-native-command
+  (let [{:keys [close!] :as repository}
+        (geschichte/memory-repository! {:name "native-boundary"})
+        filesystem (geschichte/make-root repository)
+        h (builtin-host/make {:fs filesystem
+                              :fallback-host (jvm/make)
+                              :builtins {}
+                              :fallback-allowlist #{"true"}})]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"physical projection"
+           (host/spawn h {:cmd "true" :args [] :dir "/"})))
+      (finally (close!)))))
 
 (deftest init-imports-before-atomic-takeover
   (let [base (vfs/make {"/project" {:type :dir}

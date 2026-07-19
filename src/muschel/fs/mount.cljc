@@ -81,9 +81,9 @@
   [base mounts p]
   (let [mounts (mount-table mounts)]
     (if-let [m (->> (keys mounts)
-                  (filter #(under? p %))
-                  (sort-by count >)
-                  first)]
+                    (filter #(under? p %))
+                    (sort-by count >)
+                    first)]
       [(get mounts m) (rebase p m) m]
       [base p nil])))
 

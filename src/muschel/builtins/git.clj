@@ -16,10 +16,28 @@
 (defn- fail [message]
   {:stdout "" :stderr (str "fatal: " message "\n") :exit 128})
 
+(defn- mount-filesystem
+  "Find the dynamic MountFS beneath transparent FS decorators such as tracing.
+  Embedded hosts are allowed to wrap the filesystem passed to a builtin; Git's
+  repository lifecycle still needs the underlying mount table."
+  [filesystem]
+  (loop [candidate filesystem]
+    (cond
+      (instance? muschel.fs.mount.MountFS candidate) candidate
+      (and (map? candidate) (:inner candidate)) (recur (:inner candidate))
+      :else nil)))
+
 (defn- repository-context [filesystem cwd]
-  (when-let [[root child] (mount/owning-mount filesystem cwd)]
-    (when (instance? muschel.fs.geschichte.GeschichteFS child)
-      {:root root :fs child :conn (:conn child)})))
+  (or
+   (when-let [[root child] (mount/owning-mount filesystem cwd)]
+     (when (instance? muschel.fs.geschichte.GeschichteFS child)
+       {:root root :fs child :conn (:conn child)}))
+   ;; A fully virtual sandbox uses GeschichteFS as the MountFS base. There is
+   ;; no synthetic mount point at `/`, but it is still the repository owning
+   ;; every path not shadowed by a nested worktree mount.
+   (let [base (:base filesystem)]
+     (when (instance? muschel.fs.geschichte.GeschichteFS base)
+       {:root "/" :fs base :conn (:conn base)}))))
 
 (defn- resolve-path [cwd path]
   (let [path (if (str/starts-with? path "/") path (str cwd "/" path))]
@@ -43,7 +61,8 @@
 
 (defn- repo-relative [root cwd path]
   (let [absolute (resolve-path cwd path)]
-    (when (or (= absolute root)
+    (when (or (= root "/")
+              (= absolute root)
               (str/starts-with? absolute (str root "/")))
       (str/replace (subs absolute (count root)) #"^/+" ""))))
 
@@ -52,15 +71,20 @@
 
 (defn- worktree-records [filesystem source-fs]
   (let [id (repository-id source-fs)]
-    (->> (mount/mount-points filesystem)
-         (keep (fn [path]
-                 (let [child (mount/mounted-at filesystem path)]
-                   (when (and (instance? muschel.fs.geschichte.GeschichteFS child)
-                              (= id (repository-id child)))
-                     {:path path
-                      :head (some-> (repo/head-commit (:conn child))
-                                    :geschichte.commit/id str)
-                      :branch (repo/current-ref (:conn child))}))))
+    (->> (concat
+          (when (and (instance? muschel.fs.geschichte.GeschichteFS
+                                (:base filesystem))
+                     (= id (repository-id (:base filesystem))))
+            [["/" (:base filesystem)]])
+          (map (fn [path] [path (mount/mounted-at filesystem path)])
+               (mount/mount-points filesystem)))
+         (keep (fn [[path child]]
+                 (when (and (instance? muschel.fs.geschichte.GeschichteFS child)
+                            (= id (repository-id child)))
+                   {:path path
+                    :head (some-> (repo/head-commit (:conn child))
+                                  :geschichte.commit/id str)
+                    :branch (repo/current-ref (:conn child))})))
          vec)))
 
 (defn- workspace-operations [filesystem cwd {:keys [fs conn]}]
@@ -165,58 +189,59 @@
          clone-repository! (or clone-repository! (:clone remote-ops))]
      (fn [argv filesystem env]
        (try
-         (when-not (instance? muschel.fs.mount.MountFS filesystem)
-           (throw (ex-info "Git integration requires a dynamic mount filesystem"
-                           {})))
-         (let [{:keys [args directories config]}
-               (command/parse-global (rest argv))
-               cwd (reduce (fn [cwd directory]
-                             (or (resolve-path cwd directory)
-                                 (throw (ex-info "invalid -C path"
-                                                 {:path directory}))))
-                           (:cwd env) directories)
-               command-name (first args)
-               command-args (subvec args (min 1 (count args)))
-               context (repository-context filesystem cwd)]
-           (cond
-             (= command-name "init")
-             (git-init filesystem cwd create-repository! command-args)
+         (let [mount-fs (mount-filesystem filesystem)]
+           (when-not mount-fs
+             (throw (ex-info "Git integration requires a dynamic mount filesystem"
+                             {})))
+           (let [{:keys [args directories config]}
+                 (command/parse-global (rest argv))
+                 cwd (reduce (fn [cwd directory]
+                               (or (resolve-path cwd directory)
+                                   (throw (ex-info "invalid -C path"
+                                                   {:path directory}))))
+                             (:cwd env) directories)
+                 command-name (first args)
+                 command-args (subvec args (min 1 (count args)))
+                 context (repository-context mount-fs cwd)]
+             (cond
+               (= command-name "init")
+               (git-init mount-fs cwd create-repository! command-args)
 
-             (= command-name "clone")
-             (git-clone filesystem cwd create-repository! clone-repository!
-                        command-args)
+               (= command-name "clone")
+               (git-clone mount-fs cwd create-repository! clone-repository!
+                          command-args)
 
-             (and (= command-name "config")
-                  (some #{"--global"} command-args))
-             (command/execute {:config global-config} args)
+               (and (= command-name "config")
+                    (some #{"--global"} command-args))
+               (command/execute {:config global-config} args)
 
-             (= command-name "ls-remote")
-             (command/execute {:config (atom (merge @global-config config))
-                               :remote-ops remote-ops}
-                              args)
+               (= command-name "ls-remote")
+               (command/execute {:config (atom (merge @global-config config))
+                                 :remote-ops remote-ops}
+                                args)
 
-             context
-             (let [{:keys [root conn fs]} context]
-               (command/execute
-                {:root root
-                 :conn conn
-                 :config (atom (merge @(:config-atom fs) config))
-                 :remote-ops remote-ops
-                 :workspace-ops (workspace-operations filesystem cwd context)
-                 :read-message
-                 (fn [path]
-                   (if (= path "-")
-                     (posix/read-stdin env)
-                     (let [absolute (or (resolve-path cwd path)
-                                        (throw (ex-info "invalid message path"
-                                                        {:path path})))]
-                       (or (fs/read-file filesystem absolute)
-                           (throw (ex-info "could not read commit message"
-                                           {:path path}))))))
-                 :repo-relative #(repo-relative root cwd %)}
-                args))
+               context
+               (let [{:keys [root conn fs]} context]
+                 (command/execute
+                  {:root root
+                   :conn conn
+                   :config (atom (merge @(:config-atom fs) config))
+                   :remote-ops remote-ops
+                   :workspace-ops (workspace-operations mount-fs cwd context)
+                   :read-message
+                   (fn [path]
+                     (if (= path "-")
+                       (posix/read-stdin env)
+                       (let [absolute (or (resolve-path cwd path)
+                                          (throw (ex-info "invalid message path"
+                                                          {:path path})))]
+                         (or (fs/read-file filesystem absolute)
+                             (throw (ex-info "could not read commit message"
+                                             {:path path}))))))
+                   :repo-relative #(repo-relative root cwd %)}
+                  args))
 
-             :else
-             (fail "not a Geschichte repository (or any parent)")))
+               :else
+               (fail "not a Geschichte repository (or any parent)"))))
          (catch Throwable error
            (fail (or (ex-message error) (str error)))))))))

@@ -151,6 +151,23 @@
   ([conn {:keys [cwd repository config] :or {cwd "/" config {}}}]
    (->GeschichteFS conn (atom cwd) repository (atom config))))
 
+(defn make-root
+  "Create a dynamic Muschel mount filesystem whose authoritative root is an
+  existing Geschichte workspace. Nested Geschichte workspaces created by
+  `git worktree add` are installed into the returned MountFS, while every path
+  not owned by a nested mount is served directly by `repository`.
+
+  Unlike a DiskFS projection, this filesystem deliberately has no physical
+  path. It is the preferred agent-sandbox shape."
+  ([repository] (make-root repository {}))
+  ([{:keys [conn] :as repository} {:keys [cwd config]
+                                   :or {cwd "/" config {}}}]
+   (when-not conn
+     (throw (ex-info "Geschichte root requires a repository connection" {})))
+   (mount/make (make conn {:cwd cwd :repository repository :config config})
+               {}
+               {:cwd cwd})))
+
 (defn close!
   "Release resources owned by an adapter's repository factory. Persistent
    harnesses normally close all mounted repositories with their session."

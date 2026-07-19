@@ -14,7 +14,7 @@
 {:paths ["src" "resources"]
 
  :deps {org.clojure/clojure   {:mvn/version "1.12.0"}
-        org.replikativ/geschichte {:local/root "../geschichte"}
+        org.replikativ/geschichte {:mvn/version "0.1.9"}
         org.clojure/tools.cli {:mvn/version "1.1.230"}
         org.clojure/data.json {:mvn/version "2.5.2"}
         babashka/process      {:mvn/version "0.6.25"}
@@ -33,6 +33,10 @@
        :extra-deps {io.github.cognitect-labs/test-runner
                     {:git/sha "7284cda41fb9edc0f3bc6b6185cfb7138fc8a023"}}
        :main-opts ["-m" "cognitect.test-runner"]}
+
+  ;; Co-development: override geschichte with a sibling checkout.
+  ;; e.g. `clojure -M:local:test` runs the suite against ../geschichte.
+  :local {:extra-deps {org.replikativ/geschichte {:local/root "../geschichte"}}}
 
   ;; CLI entry — JVM-only. `clojure -M:cli --help`. Wraps `muschel.cli`
   ;; which implements bash-shaped invocation (-c, script.sh, -s, ...)

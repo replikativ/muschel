@@ -14,6 +14,37 @@
 (defn- run [host command]
   (m/run-and-capture (m/new-env :cwd "/project") command {:host host}))
 
+(defn- run-root [host command]
+  (m/run-and-capture (m/new-env :cwd "/") command {:host host}))
+
+(deftest existing-geschichte-workspace-can-be-the-virtual-root
+  (let [{:keys [conn close!] :as repository} (gfs/memory-repository! {:name "root"})
+        filesystem (gfs/make-root repository)
+        host (builtin/make {:fs filesystem
+                            :fallback-host (th/fallback-host)
+                            :builtins posix/standard
+                            :geschichte true})]
+    (try
+      (is (nil? (fs/physical-path filesystem "/")))
+      (is (= 0 (:exit (run-root host "echo virtual > README.md"))))
+      (is (= "?? README.md\n"
+             (:stdout (run-root host "git status --short"))))
+      (is (= 0 (:exit (run-root host "git add README.md"))))
+      (is (= 0 (:exit (run-root host "git commit -m virtual-root"))))
+      (is (str/includes? (:stdout (run-root host "git log --oneline"))
+                         "virtual-root"))
+      (is (= 0 (:exit (run-root host "git worktree add /agent-two main"))))
+      (is (= 0 (:exit (run-root host "echo child > /agent-two/README.md"))))
+      (is (= "virtual\n" (:stdout (run-root host "cat /README.md"))))
+      (is (= "child\n" (:stdout (run-root host "cat /agent-two/README.md"))))
+      (is (str/includes? (:stdout (run-root host "git worktree list --porcelain"))
+                         "worktree /"))
+      (finally
+        (doseq [path (reverse (mount/mount-points filesystem))]
+          (when-let [child (mount/unmount! filesystem path)]
+            (gfs/close! child)))
+        (close!)))))
+
 (deftest agent-git-init-takes-over-the-worktree
   (let [base (vfs/make {"/project" {:type :dir}
                         "/project/README.md" "hello\n"
