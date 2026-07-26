@@ -88,6 +88,11 @@
                          (nil? dir) nil
                          fs (fs/physical-path fs dir)
                          :else dir)
+          _ (when (and dir fs (nil? physical-dir))
+              (throw (ex-info
+                      "External command requires an explicit physical projection"
+                      {:command cmd :sandbox-dir dir
+                       :requires :physical-projection})))
           proc-opts (cond-> {:dir physical-dir
                              :extra-env extra-env}
                       in  (assoc :in  in)

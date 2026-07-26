@@ -59,6 +59,7 @@
             [clojure.tools.cli :as cli]
             [muschel.builtins.awk :as awk-impl]
             [muschel.builtins.awk-compat :as cc]
+            [muschel.diff :as diff-core]
             [muschel.fs :as fs]
             [muschel.host :as host]
             [muschel.runtime :as rt]))
@@ -1523,7 +1524,7 @@
           (usage-err "cut" (.getMessage t)))))))
 
 ;; ============================================================================
-;; diff — line-level edit script via diffit, rendered as unified diff
+;; diff — structured Myers edit script rendered as unified diff
 ;; ============================================================================
 
 (def ^:private diff-spec
@@ -1532,140 +1533,10 @@
    ["-i" "--ignore-case"]
    ["-w" "--ignore-all-space"]])
 
-(def ^:private diff-default-context 3)
-
 (defn- normalise-line [opts line]
   (cond-> line
     (:ignore-case opts)       str/lower-case
     (:ignore-all-space opts)  (str/replace #"\s+" "")))
-
-;; ---- LCS-based line diff ---------------------------------------------------
-;;
-;; We compute the standard O(n·m) LCS DP table, then trace back to emit a
-;; sequence of [:keep|:del|:add line] ops in source order. From those we
-;; build standard unified-diff hunks (with `@@ -a,A +b,B @@` headers and
-;; 3 lines of context around each change run). The output is patch(1) /
-;; git apply parseable.
-;;
-;; n, m are file lengths; our agent-facing files are small enough that
-;; O(n·m) memory (an int array of (n+1)·(m+1)) is acceptable.
-
-(defn- lcs-table
-  "Compute the LCS DP table for vectors `a` and `b`. Returns a
-   transient vector treated as a flat (n+1)·(m+1) row-major grid;
-   cross-platform (no int-array)."
-  [a b]
-  (let [n    (count a)
-        m    (count b)
-        cols (inc m)]
-    (loop [i 0
-           t (let [empty-row (vec (repeat (* (inc n) cols) 0))]
-               (transient empty-row))]
-      (if (= i n)
-        (persistent! t)
-        (recur (inc i)
-               (loop [j 0 t t]
-                 (if (= j m)
-                   t
-                   (let [idx (+ (* (inc i) cols) (inc j))
-                         up   (nth t (+ (* i cols) (inc j)))
-                         left (nth t (+ (* (inc i) cols) j))
-                         val  (if (= (nth a i) (nth b j))
-                                (inc (nth t (+ (* i cols) j)))
-                                (max up left))]
-                     (recur (inc j) (assoc! t idx val))))))))))
-
-(defn- diff-ops
-  "Return a vector of [op line] pairs (`:keep`/`:del`/`:add`) tracing
-   the LCS table for vectors `a` and `b`. Source order."
-  [a b]
-  (let [t    (lcs-table a b)
-        n    (count a)
-        m    (count b)
-        cols (inc m)
-        get-t (fn [i j] (nth t (+ (* i cols) j)))]
-    (loop [i n j m acc (transient [])]
-      (cond
-        (and (pos? i) (pos? j) (= (nth a (dec i)) (nth b (dec j))))
-        (recur (dec i) (dec j) (conj! acc [:keep (nth a (dec i))]))
-
-        (and (pos? j) (or (zero? i) (>= (get-t i (dec j)) (get-t (dec i) j))))
-        (recur i (dec j) (conj! acc [:add (nth b (dec j))]))
-
-        (pos? i)
-        (recur (dec i) j (conj! acc [:del (nth a (dec i))]))
-
-        :else (vec (reverse (persistent! acc)))))))
-
-(defn- group-hunks
-  "Bundle the linear op stream into unified-diff hunks: runs of
-   non-`:keep` ops with up to `ctx` lines of context above and below
-   each change run, merging adjacent runs whose context regions
-   overlap. Returns a vec of hunks; each hunk has `:a-start` /
-   `:a-len` / `:b-start` / `:b-len` (1-indexed, GNU semantics where a
-   zero-length range has start 0) and `:lines` (the [op line] pairs)."
-  [ops ctx]
-  (let [changed? (fn [[op _]] (not= op :keep))
-        consumes-a? (fn [[op _]] (or (= op :keep) (= op :del)))
-        consumes-b? (fn [[op _]] (or (= op :keep) (= op :add)))
-        n (count ops)
-        ;; Find every change-region — a contiguous run of :del/:add
-        ;; ops. Each region grows to absorb at most `ctx` :keep ops on
-        ;; either side. Overlapping windows merge.
-        regions
-        (loop [i 0 acc (transient [])]
-          (cond
-            (>= i n) (persistent! acc)
-            (changed? (nth ops i))
-            (let [start (loop [s i k 0]
-                          (cond
-                            (zero? s) 0
-                            (changed? (nth ops (dec s))) (recur (dec s) 0)
-                            (>= k ctx) s
-                            :else (recur (dec s) (inc k))))
-                  end (loop [e (inc i) k 0]
-                        (cond
-                          (>= e n) e
-                          (changed? (nth ops e)) (recur (inc e) 0)
-                          (>= k ctx) e
-                          :else (recur (inc e) (inc k))))]
-              (recur end (conj! acc [start end])))
-            :else (recur (inc i) acc)))
-        ;; Merge overlapping regions.
-        merged
-        (reduce (fn [acc [s e]]
-                  (if (and (seq acc) (<= s (peek (peek acc))))
-                    (conj (pop acc) [(first (peek acc)) (max e (peek (peek acc)))])
-                    (conj acc [s e])))
-                []
-                regions)]
-    (mapv (fn [[s e]]
-            (let [hunk-lines (subvec ops s e)
-                  a-prefix   (count (filter consumes-a? (subvec ops 0 s)))
-                  b-prefix   (count (filter consumes-b? (subvec ops 0 s)))
-                  a-len      (count (filter consumes-a? hunk-lines))
-                  b-len      (count (filter consumes-b? hunk-lines))]
-              {:a-start (if (zero? a-len) 0 (inc a-prefix))
-               :a-len   a-len
-               :b-start (if (zero? b-len) 0 (inc b-prefix))
-               :b-len   b-len
-               :lines   hunk-lines}))
-          merged)))
-
-(defn- render-unified
-  "Format hunks as unified-diff bytes. Empty hunks → empty string."
-  [a-name b-name hunks]
-  (if (empty? hunks)
-    ""
-    (let [sb (cc/sbuf)]
-      (.append sb (str "--- " a-name "\n+++ " b-name "\n"))
-      (doseq [{:keys [a-start a-len b-start b-len lines]} hunks]
-        (.append sb (cc/fmt-many "@@ -%d,%d +%d,%d @@\n" [a-start a-len b-start b-len]))
-        (doseq [[op line] lines]
-          (.append sb (case op :keep " " :del "-" :add "+"))
-          (.append sb ^String line)
-          (.append sb "\n")))
-      (.toString sb))))
 
 (defn diff
   "POSIX diff. Subset: -u (unified, the default), -q (brief),
@@ -1689,19 +1560,17 @@
           (nil? ca) (err (str "diff: " fa ": No such file or directory") 2)
           (nil? cb) (err (str "diff: " fb ": No such file or directory") 2)
           :else
-          (let [la (mapv (partial normalise-line opts) (str/split-lines ca))
-                lb (mapv (partial normalise-line opts) (str/split-lines cb))
-                ops (diff-ops la lb)
-                same? (every? (fn [[op _]] (= op :keep)) ops)]
+          (let [normalize (partial normalise-line opts)
+                result (diff-core/diff-text ca cb {:normalize normalize})
+                same? (every? #(= :equal (:op %)) (:edits result))]
             (cond
               same? {:stdout "" :stderr "" :exit 0}
               (:brief opts)
               {:stdout (str "Files " fa " and " fb " differ\n")
                :stderr "" :exit 1}
               :else
-              (let [hunks (group-hunks ops diff-default-context)]
-                {:stdout (render-unified fa fb hunks)
-                 :stderr "" :exit 1}))))))))
+              {:stdout (diff-core/unified result {:a-name fa :b-name fb})
+               :stderr "" :exit 1})))))))
 
 ;; ============================================================================
 ;; xargs — read stdin, dispatch CMD with substituted args via host

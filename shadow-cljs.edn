@@ -1,4 +1,4 @@
-{:source-paths ["src" "test"]
+{:source-paths ["src" "test" "dev"]
 
  :dependencies [[org.clojure/clojurescript "1.11.132"]]
 
@@ -9,7 +9,19 @@
  :dev-http {8888 ["docs/playground" "dist/playground"]}
 
  :builds
- {:node-tests
+ {:diff-lab
+  {:target :node-script
+   :output-to "out/diff-lab.js"
+   :main muschel.diff-lab/main
+   :compiler-options {:infer-externs true}}
+
+  :version-lab
+  {:target :node-script
+   :output-to "out/version-lab.js"
+   :main muschel.version-store-lab/main
+   :compiler-options {:infer-externs true}}
+
+  :node-tests
   {:target    :node-test
    :output-to "out/node-tests.js"
    :ns-regexp ".*-test"

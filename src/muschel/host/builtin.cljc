@@ -254,7 +254,9 @@
       (atom-sink? sink) (swap! (:acc sink) str s)
       :else             (host/-write-string! (:fallback-host this) sink s)))
   (-read-all-string  [this source] (host/-read-all-string  (:fallback-host this) source))
-  (-close!           [this io]     (host/-close!           (:fallback-host this) io))
+  (-close! [this io]
+    (when-not (fs/commit-sink! io)
+      (host/-close! (:fallback-host this) io)))
   (-string-sink      [this]        (host/-string-sink      (:fallback-host this)))
   (-sink->string [this sink]
     (cond
@@ -348,11 +350,15 @@
                            muschel.builtins.posix/standard-read-only)
      :fallback-allowlist   set of cmd-names the fallback host may run
                            (default: #{})"
-  [{:keys [fs fallback-host builtins fallback-allowlist]
+  [{:keys [fs fallback-host builtins fallback-allowlist geschichte]
     :or {fallback-allowlist #{}}}]
   {:pre [(some? fs) (some? fallback-host)]}
-  (->BuiltinHost
-   fallback-host
-   (or builtins posix/standard-read-only)
-   fs
-   fallback-allowlist))
+  (let [builtins (or builtins posix/standard-read-only)
+        builtins #?(:bb builtins
+                    :clj (if geschichte
+                           (assoc builtins "git"
+                                  ((requiring-resolve 'muschel.builtins.git/make)
+                                   (if (map? geschichte) geschichte {})))
+                           builtins)
+                    :cljs builtins)]
+    (->BuiltinHost fallback-host builtins fs fallback-allowlist)))
