@@ -44,6 +44,16 @@
        regex (`re-find` must match). Length must match exactly unless
        the last element is `:**`.
 
+   - `{:kind :argv-any :head [\"rm\"] :any #{\"/\" \"/etc\"}}`
+       Command is `:head`, and ANY argument after it matches `:any`
+       (set / string / regex — same element semantics as `:argv-shape`).
+       Position-INDEPENDENT: use it for \"does this command touch a value
+       we care about\", where `:argv-shape` would have to enumerate every
+       flag arrangement (`rm -rf /etc`, `rm -r -f /etc`, `rm -v -r /etc`)
+       and silently misses the ones you forget. Fails CLOSED: a dynamic
+       arg (`$TARGET`, unexpanded glob) counts as a match, so a DENY rule
+       refuses rather than guessing what it expands to.
+
    - `{:kind :argv-flags :head [\"rm\"] :any-of #{\"-r\" \"--recursive\"}}`
        Order-INSENSITIVE flag match. `:head` is an ordered prefix (same
        semantics as `:argv-vec`); the tail is normalised into a *set* of
@@ -163,8 +173,25 @@
 (defn- argv-matches-shape?
   "Exact-shape match. Last element `:**` makes the tail open-ended;
    otherwise lengths must agree. `:*` (or a string / set / regex) matches
-   one slot."
+   one slot.
+
+   Throws if `:**` appears anywhere but last. It is only meaningful there,
+   and a mid-shape `:**` used to fail SILENTLY: `shape-elt-matches?` has no
+   case for it, so the element never matched, the whole rule never fired, and
+   a rule that reads like a guard guarded nothing. The default ruleset shipped
+   exactly that bug for `rm` on critical paths — masked for as long as it was,
+   because a broader deny happened to sit in front of it. Failing loudly turns
+   a dead rule into a startup error."
   [argv shape]
+  (when-let [bad (seq (keep-indexed (fn [i el] (when (= :** el) i))
+                                    (butlast shape)))]
+    (throw (ex-info (str "`:**` may only be the LAST element of an :argv-shape "
+                         "(found at index " (first bad) "). It matches "
+                         "zero-or-more trailing args; elsewhere it matches "
+                         "nothing and silently disables the rule. Use `:*` for "
+                         "a single slot, or :argv-any / :ast-pred to match a "
+                         "value at any position.")
+                    {:shape shape :index (first bad)})))
   (let [open? (= :** (last shape))
         head  (if open? (butlast shape) shape)
         head-cnt (count head)
@@ -176,6 +203,26 @@
       :else (and (= head-cnt argv-cnt)
                  (every? true?
                          (map shape-elt-matches? head argv))))))
+
+(defn- argv-matches-any?
+  "True if the command is `head` and ANY argument after it matches `any`
+   (a set, string, or regex — same element semantics as :argv-shape).
+
+   Position-independent, which is what \"does this touch a path we protect?\"
+   actually needs: `rm -rf /etc`, `rm -r -f /etc` and `rm --one --two /etc` all
+   put the target in a different slot, and an :argv-shape has to enumerate every
+   arrangement (and gets it wrong when it misses one).
+
+   Fails CLOSED on non-literal args. A nil entry is a word muschel could not
+   resolve to a literal (`$TARGET`, an unexpanded glob); we cannot know what it
+   becomes, so for a DENY rule the safe reading is \"it might be the path we
+   protect\" — hence a match."
+  [argv {:keys [head any]}]
+  (let [head (if (string? head) [head] (vec head))]
+    (and (>= (count argv) (count head))
+         (every? true? (map shape-elt-matches? head (take (count head) argv)))
+         (boolean (some (fn [a] (or (nil? a) (shape-elt-matches? any a)))
+                        (drop (count head) argv))))))
 
 ;; ---- :argv-flags helpers ----------------------------------------------------
 
@@ -262,6 +309,7 @@
       :argv-glob  (argv-matches-glob? argv glob)
       :argv-vec   (argv-matches-vec? argv vec)
       :argv-shape (argv-matches-shape? argv shape)
+      :argv-any   (argv-matches-any? argv pattern)
       :argv-flags (argv-matches-flags? argv pattern)
       :ast-pred   (try (boolean (pred call)) (catch #?(:clj Throwable :cljs :default) _ false))
       false)))

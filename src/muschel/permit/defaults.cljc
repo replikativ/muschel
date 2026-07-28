@@ -129,9 +129,20 @@
       :action :deny :origin :default
       :reason "world-writable / world-readable octal"}
 
-      ;; rm -rf / on common dangerous paths.
-     {:tool :bash :pattern {:kind :argv-shape
-                            :shape ["rm" :** #{"/" "/*" "/home" "/usr" "/etc" "/var" "/bin" "/lib"}]}
+      ;; rm on common dangerous paths, with the target in ANY position.
+      ;;
+      ;; This was an :argv-shape with `:**` in the MIDDLE — which matches
+      ;; nothing, so the rule never fired. It looked fine only because the
+      ;; blanket recursive-delete deny above caught every `rm -rf` before this
+      ;; was consulted; an embedder that relaxed that broader rule (reasonably —
+      ;; a versioned, jailed workspace makes recursive delete recoverable) was
+      ;; left with `rm -rf /etc` permitted. `:argv-any` is position-independent,
+      ;; so every flag arrangement is covered, and `:argv-shape` now THROWS on a
+      ;; misplaced `:**` so this class of dead rule cannot come back quietly.
+     {:tool :bash :pattern {:kind :argv-any
+                            :head ["rm"]
+                            :any #{"/" "/*" "/home" "/usr" "/etc" "/var" "/bin"
+                                   "/lib" "/root" "/boot" "/sys" "/proc" "/dev"}}
       :action :deny :origin :default
       :reason "would delete a critical system path"}
 
